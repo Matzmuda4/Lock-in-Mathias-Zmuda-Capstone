@@ -43,6 +43,9 @@ Thumbs.db
 # ── Docker ────────────────────────────────────────────────────────────────────
 # (volumes are named, no local bind-mounts to ignore)
 
+# ── Uploaded files ────────────────────────────────────────────────────────────
+services/api/uploads/
+
 # ── Training artifacts ────────────────────────────────────────────────────────
 training/checkpoints/
 training/data/raw/

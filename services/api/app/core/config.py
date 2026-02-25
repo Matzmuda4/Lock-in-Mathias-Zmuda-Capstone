@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +22,9 @@ class Settings(BaseSettings):
     secret_key: str = "change-me-in-production"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24  # 24 hours
+
+    # File storage — relative to wherever the API process runs
+    upload_dir: Path = Path("uploads")
 
 
 settings = Settings()
