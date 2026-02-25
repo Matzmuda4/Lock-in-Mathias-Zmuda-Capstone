@@ -11,11 +11,17 @@ export function LoginPage() {
   const [tab, setTab] = useState<Tab>("login");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   // Shared field state
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+
+  // Password requirements (must match backend validators)
+  const pwRules = [
+    { label: "At least 8 characters", met: password.length >= 8 },
+  ];
 
   function switchTab(next: Tab) {
     setTab(next);
@@ -34,7 +40,9 @@ export function LoginPage() {
       }
       navigate("/", { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
+      const msg = err instanceof Error ? err.message : "Something went wrong";
+      // Give password errors a clearer prefix so the user knows where to look
+      setError(msg.toLowerCase().includes("password") ? `Invalid password — ${msg}` : msg);
     } finally {
       setIsSubmitting(false);
     }
@@ -100,15 +108,34 @@ export function LoginPage() {
 
           <div className="form-group">
             <label htmlFor="password">Password</label>
-            <input
-              id="password"
-              type="password"
-              autoComplete={tab === "login" ? "current-password" : "new-password"}
-              placeholder="••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-            />
+            <div className="pw-wrap">
+              <input
+                id="password"
+                type={showPassword ? "text" : "password"}
+                autoComplete={tab === "login" ? "current-password" : "new-password"}
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+              />
+              <button
+                type="button"
+                className="pw-toggle"
+                onClick={() => setShowPassword((v) => !v)}
+                aria-label={showPassword ? "Hide password" : "Show password"}
+              >
+                {showPassword ? "Hide" : "Show"}
+              </button>
+            </div>
+            {tab === "register" && password.length > 0 && (
+              <ul className="pw-rules">
+                {pwRules.map((r) => (
+                  <li key={r.label} className={r.met ? "pw-rule--met" : "pw-rule--unmet"}>
+                    {r.met ? "✓" : "✗"} {r.label}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
 
           {error && <p className="error-banner">{error}</p>}
@@ -209,6 +236,44 @@ export function LoginPage() {
           flex-direction: column;
           gap: 16px;
         }
+
+        .pw-wrap {
+          position: relative;
+          display: flex;
+          align-items: center;
+        }
+
+        .pw-wrap input {
+          padding-right: 60px;
+        }
+
+        .pw-toggle {
+          position: absolute;
+          right: 10px;
+          background: none;
+          border: none;
+          color: var(--text-muted);
+          font-size: 12px;
+          font-weight: 500;
+          cursor: pointer;
+          padding: 2px 4px;
+        }
+        .pw-toggle:hover { color: var(--text); }
+
+        .pw-rules {
+          list-style: none;
+          margin-top: 6px;
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+        }
+
+        .pw-rules li {
+          font-size: 12px;
+        }
+
+        .pw-rule--met   { color: var(--success); }
+        .pw-rule--unmet { color: var(--error); }
       `}</style>
     </div>
   );
