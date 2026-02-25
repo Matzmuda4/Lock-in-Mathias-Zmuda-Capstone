@@ -1,0 +1,19 @@
+{
+  "name": "lock-in",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI-powered reading environment for students with ADHD",
+  "scripts": {
+    "dev:api": "cd services/api && uvicorn app.main:app --reload --port 8000",
+    "dev:desktop": "pnpm --filter @lock-in/desktop tauri dev",
+    "build:desktop": "pnpm --filter @lock-in/desktop tauri build",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f db",
+    "db:shell": "docker exec -it lockin-db psql -U lockin -d lockin"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}
