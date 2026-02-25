@@ -1,0 +1,22 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: lockin-db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lockin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lockin}
+      POSTGRES_DB: ${POSTGRES_DB:-lockin}
+    volumes:
+      - lockin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lockin} -d ${POSTGRES_DB:-lockin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  lockin_pgdata:
+    name: lockin_pgdata
