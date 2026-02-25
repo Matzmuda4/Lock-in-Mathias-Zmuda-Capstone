@@ -157,6 +157,63 @@ class TestEndSession:
         assert resp.status_code == 400
 
 
+class TestCompleteSession:
+    @pytest.fixture()
+    async def active_session_id(
+        self, api_client: AsyncClient, auth_headers: dict, doc_id: int
+    ) -> int:
+        resp = await api_client.post(
+            "/sessions/start",
+            json={"document_id": doc_id, "name": "Complete Test", "mode": "baseline"},
+            headers=auth_headers,
+        )
+        return resp.json()["id"]
+
+    async def test_complete_session(
+        self, api_client: AsyncClient, auth_headers: dict, active_session_id: int
+    ):
+        resp = await api_client.post(
+            f"/sessions/{active_session_id}/complete", headers=auth_headers
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "completed"
+        assert body["ended_at"] is not None
+        assert body["duration_seconds"] is not None
+        assert body["duration_seconds"] >= 0
+
+    async def test_complete_already_completed_fails(
+        self, api_client: AsyncClient, auth_headers: dict, active_session_id: int
+    ):
+        await api_client.post(
+            f"/sessions/{active_session_id}/complete", headers=auth_headers
+        )
+        resp = await api_client.post(
+            f"/sessions/{active_session_id}/complete", headers=auth_headers
+        )
+        assert resp.status_code == 400
+
+    async def test_complete_already_ended_fails(
+        self, api_client: AsyncClient, auth_headers: dict, active_session_id: int
+    ):
+        await api_client.post(f"/sessions/{active_session_id}/end", headers=auth_headers)
+        resp = await api_client.post(
+            f"/sessions/{active_session_id}/complete", headers=auth_headers
+        )
+        assert resp.status_code == 400
+
+    async def test_end_already_completed_fails(
+        self, api_client: AsyncClient, auth_headers: dict, active_session_id: int
+    ):
+        await api_client.post(
+            f"/sessions/{active_session_id}/complete", headers=auth_headers
+        )
+        resp = await api_client.post(
+            f"/sessions/{active_session_id}/end", headers=auth_headers
+        )
+        assert resp.status_code == 400
+
+
 class TestListAndGet:
     async def test_list_sessions_empty(self, api_client: AsyncClient, auth_headers: dict):
         resp = await api_client.get("/sessions", headers=auth_headers)

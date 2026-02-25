@@ -86,22 +86,51 @@ async def resume_session(
     return SessionResponse.model_validate(session)
 
 
+_TERMINAL_STATUSES = frozenset({"ended", "completed"})
+
+
+def _close_session(session: Session, final_status: str) -> None:
+    """Shared logic for both /end and /complete."""
+    now = datetime.now(timezone.utc)
+    session.status = final_status
+    session.ended_at = now
+    session.duration_seconds = max(0, int((now - session.started_at).total_seconds()))
+
+
 @router.post("/{session_id}/end", response_model=SessionResponse)
 async def end_session(
     session_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> SessionResponse:
+    """Stop a session early (abandoned / timed-out)."""
     session = await _get_owned_session(session_id, current_user.id, db)
-    if session.status == "ended":
+    if session.status in _TERMINAL_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Session has already ended",
+            detail=f"Session is already terminal (status='{session.status}')",
         )
-    now = datetime.now(timezone.utc)
-    session.status = "ended"
-    session.ended_at = now
-    session.duration_seconds = max(0, int((now - session.started_at).total_seconds()))
+    _close_session(session, "ended")
+    await db.commit()
+    await db.refresh(session)
+    return SessionResponse.model_validate(session)
+
+
+@router.post("/{session_id}/complete", response_model=SessionResponse)
+async def complete_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionResponse:
+    """Mark a session as completed — the user finished reading intentionally.
+    Tracked separately from /end to measure completion rates in the thesis."""
+    session = await _get_owned_session(session_id, current_user.id, db)
+    if session.status in _TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Session is already terminal (status='{session.status}')",
+        )
+    _close_session(session, "completed")
     await db.commit()
     await db.refresh(session)
     return SessionResponse.model_validate(session)
