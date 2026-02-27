@@ -11,27 +11,33 @@ const API_BASE = "http://localhost:8000";
 function useElapsedTimer(session: Session | null) {
   const [seconds, setSeconds] = useState(0);
   const running = session?.status === "active";
-
-  // When the session changes (e.g. you navigate away and back), seed the timer
-  // from the server-reported duration so it doesn't reset to 00:00.
-  useEffect(() => {
-    if (!session) {
-      setSeconds(0);
-      return;
-    }
-    const base = session.duration_seconds ?? 0;
-    setSeconds(base);
-  }, [session?.id, session?.duration_seconds]);
-
   useEffect(() => {
     if (!running) return;
     const id = setInterval(() => setSeconds((s) => s + 1), 1000);
     return () => clearInterval(id);
   }, [running]);
-
   const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
   const ss = String(seconds % 60).padStart(2, "0");
   return `${mm}:${ss}`;
+}
+
+// ─── Open PDF with auth ──────────────────────────────────────────────────────
+
+async function openPdfWithAuth(docId: number, token: string) {
+  try {
+    const resp = await fetch(`${API_BASE}/documents/${docId}/file`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) throw new Error(`${resp.status}`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const tab = window.open(url, "_blank");
+    // Keep the blob URL alive long enough for the browser to load it
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    if (!tab) alert("Pop-up blocked — allow pop-ups for this page.");
+  } catch (e) {
+    alert(`Could not open PDF: ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 // ─── Chunk components ────────────────────────────────────────────────────────
@@ -53,46 +59,16 @@ function TextChunk({ chunk }: { chunk: Chunk }) {
   );
 }
 
-function ImageChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string }) {
+function ImageChunk({ chunk, docId }: { chunk: Chunk; docId: number }) {
   const assetId = chunk.meta?.asset_id as number | undefined;
   const caption = chunk.meta?.caption as string | undefined;
 
-  const [url, setUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!assetId || !token) {
-      setUrl(null);
-      return;
-    }
-    let cancelled = false
-    let objectUrl: string | null = null
-
-    (async () => {
-      try {
-        const resp = await fetch(`${API_BASE}/documents/${docId}/assets/${assetId}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!resp.ok) throw new Error(String(resp.status));
-        const blob = await resp.blob();
-        objectUrl = URL.createObjectURL(blob);
-        if (!cancelled) setUrl(objectUrl);
-      } catch {
-        if (!cancelled) setUrl(null);
-      }
-    })();
-
-    return () => {
-      cancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [assetId, docId, token]);
-
-  if (!assetId || !url) return null;
+  if (!assetId) return null;
 
   return (
     <div className="chunk chunk--figure">
       <img
-        src={url}
+        src={`${API_BASE}/documents/${docId}/assets/${assetId}`}
         alt={caption ?? "Figure"}
         className="chunk__img"
         loading="lazy"
@@ -106,45 +82,15 @@ function ImageChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   );
 }
 
-function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string }) {
+function TableChunk({ chunk, docId }: { chunk: Chunk; docId: number }) {
   const assetId = chunk.meta?.asset_id as number | undefined;
   const caption = chunk.meta?.caption as string | undefined;
 
-  const [url, setUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!assetId || !token) {
-      setUrl(null);
-      return;
-    }
-    let cancelled = false
-    let objectUrl: string | null = null
-
-    (async () => {
-      try {
-        const resp = await fetch(`${API_BASE}/documents/${docId}/assets/${assetId}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!resp.ok) throw new Error(String(resp.status));
-        const blob = await resp.blob();
-        objectUrl = URL.createObjectURL(blob);
-        if (!cancelled) setUrl(objectUrl);
-      } catch {
-        if (!cancelled) setUrl(null);
-      }
-    })();
-
-    return () => {
-      cancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [assetId, docId, token]);
-
   return (
     <div className="chunk chunk--table">
-      {assetId && url ? (
+      {assetId ? (
         <img
-          src={url}
+          src={`${API_BASE}/documents/${docId}/assets/${assetId}`}
           alt={caption ?? "Table"}
           className="chunk__img"
           loading="lazy"
@@ -158,7 +104,7 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
       {chunk.text && (
         <pre
           className="chunk__table-md"
-          style={assetId && url ? { display: "none" } : undefined}
+          style={assetId ? { display: "none" } : undefined}
         >
           {chunk.text}
         </pre>
@@ -168,10 +114,10 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   );
 }
 
-function ChunkCard({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string }) {
+function ChunkCard({ chunk, docId }: { chunk: Chunk; docId: number }) {
   const ct = (chunk.meta?.chunk_type as string | undefined) ?? "text";
-  if (ct === "image") return <ImageChunk chunk={chunk} docId={docId} token={token} />;
-  if (ct === "table") return <TableChunk chunk={chunk} docId={docId} token={token} />;
+  if (ct === "image") return <ImageChunk chunk={chunk} docId={docId} />;
+  if (ct === "table") return <TableChunk chunk={chunk} docId={docId} />;
   return <TextChunk chunk={chunk} />;
 }
 
@@ -309,7 +255,7 @@ export function ReaderPage() {
           <button
             className="btn btn--ghost btn--sm"
             type="button"
-            onClick={() => navigate(`/documents/${document_id}/pdf`)}
+            onClick={() => openPdfWithAuth(document_id, token!)}
           >
             View PDF ↗
           </button>
@@ -334,7 +280,7 @@ export function ReaderPage() {
         )}
 
         {chunks.map((chunk) => (
-          <ChunkCard key={chunk.id} chunk={chunk} docId={document_id} token={token!} />
+          <ChunkCard key={chunk.id} chunk={chunk} docId={document_id} />
         ))}
 
         {!allLoaded && !isParsing && (

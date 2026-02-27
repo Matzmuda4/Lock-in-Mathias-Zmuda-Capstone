@@ -4,7 +4,6 @@ import { ProtectedRoute } from "./components/ProtectedRoute";
 import { LoginPage } from "./pages/LoginPage";
 import { HomePage } from "./pages/HomePage";
 import { ReaderPage } from "./pages/ReaderPage";
-import { PdfViewerPage } from "./pages/PdfViewerPage";
 
 export function App() {
   return (
@@ -25,14 +24,6 @@ export function App() {
             element={
               <ProtectedRoute>
                 <ReaderPage />
-              </ProtectedRoute>
-            }
-          />
-          <Route
-            path="/documents/:id/pdf"
-            element={
-              <ProtectedRoute>
-                <PdfViewerPage />
               </ProtectedRoute>
             }
           />
