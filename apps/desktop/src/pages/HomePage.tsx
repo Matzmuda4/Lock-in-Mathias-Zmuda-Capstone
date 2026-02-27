@@ -1,6 +1,7 @@
-import { ChangeEvent, FormEvent, useCallback, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
-import { Document, documentService } from "../services/documentService";
+import { Document, documentService, type ParseJobStatus } from "../services/documentService";
 import { Session, SessionMode, sessionService } from "../services/sessionService";
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -14,16 +15,58 @@ function StatCard({ label, value }: { label: string; value: string | number }) {
   );
 }
 
+function ParseBadge({
+  status,
+  token,
+  docId,
+  onReparse,
+}: {
+  status: ParseJobStatus["status"] | undefined;
+  token: string;
+  docId: number;
+  onReparse: (docId: number) => void;
+}) {
+  if (!status || status === "succeeded") return null;
+
+  if (status === "pending" || status === "running") {
+    return (
+      <span className="parse-badge parse-badge--running">
+        <span className="spinner" style={{ width: 10, height: 10, borderWidth: 1.5 }} />
+        Parsing…
+      </span>
+    );
+  }
+
+  if (status === "failed") {
+    return (
+      <button
+        className="parse-badge parse-badge--failed"
+        onClick={() => onReparse(docId)}
+        type="button"
+        title="Click to retry parsing"
+      >
+        Parse failed — retry
+      </button>
+    );
+  }
+
+  return null;
+}
+
 function DocumentRow({
   doc,
   token,
+  parseStatus,
   onDelete,
   onStartSession,
+  onReparse,
 }: {
   doc: Document;
   token: string;
+  parseStatus: ParseJobStatus["status"] | undefined;
   onDelete: (id: number) => void;
   onStartSession: (doc: Document) => void;
+  onReparse: (docId: number) => void;
 }) {
   const [deleting, setDeleting] = useState(false);
   const sizeKb = Math.round(doc.file_size / 1024);
@@ -45,7 +88,15 @@ function DocumentRow({
       <div className="doc-row__info">
         <span className="doc-row__icon">📄</span>
         <div>
-          <p className="doc-row__title">{doc.title}</p>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <p className="doc-row__title">{doc.title}</p>
+            <ParseBadge
+              status={parseStatus}
+              token={token}
+              docId={doc.id}
+              onReparse={onReparse}
+            />
+          </div>
           <p className="doc-row__meta">
             {doc.filename} · {sizeKb} KB ·{" "}
             {new Date(doc.uploaded_at).toLocaleDateString()}
@@ -74,6 +125,7 @@ function DocumentRow({
 }
 
 function SessionCard({ session }: { session: Session }) {
+  const navigate = useNavigate();
   const duration =
     session.duration_seconds != null
       ? `${Math.floor(session.duration_seconds / 60)}m ${session.duration_seconds % 60}s`
@@ -87,7 +139,13 @@ function SessionCard({ session }: { session: Session }) {
   });
 
   return (
-    <div className="session-card card">
+    <div
+      className="session-card card session-card--clickable"
+      onClick={() => navigate(`/sessions/${session.id}/reader`)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => e.key === "Enter" && navigate(`/sessions/${session.id}/reader`)}
+    >
       <div className="session-card__header">
         <span className="session-card__name">{session.name}</span>
         <span className={`badge badge--${session.status}`}>{session.status}</span>
@@ -201,6 +259,7 @@ function StartSessionModal({
   onClose: () => void;
   onStarted: (session: Session) => void;
 }) {
+  const navigate = useNavigate();
   const [name, setName] = useState(`${doc.title} — ${new Date().toLocaleDateString()}`);
   const [mode, setMode] = useState<SessionMode>("baseline");
   const [error, setError] = useState<string | null>(null);
@@ -213,9 +272,9 @@ function StartSessionModal({
     try {
       const session = await sessionService.start(token, doc.id, name, mode);
       onStarted(session);
+      navigate(`/sessions/${session.id}/reader`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start session");
-    } finally {
       setStarting(false);
     }
   }
@@ -317,18 +376,71 @@ export function HomePage() {
   const [loadingDocs, setLoadingDocs] = useState(true);
   const [loadingSessions, setLoadingSessions] = useState(true);
 
+  // parse_status keyed by document_id
+  const [parseStatuses, setParseStatuses] = useState<
+    Record<number, ParseJobStatus["status"]>
+  >({});
+  // IDs currently being polled (pending or running)
+  const pollingIds = useRef<Set<number>>(new Set());
+
   const [showUpload, setShowUpload] = useState(false);
   const [sessionTarget, setSessionTarget] = useState<Document | null>(null);
+
+  // ── Poll parse status for a single document until it reaches a terminal state
+  const pollParseStatus = useCallback(
+    (docId: number) => {
+      if (!token || pollingIds.current.has(docId)) return;
+      pollingIds.current.add(docId);
+
+      let delay = 1000;
+      let handle: ReturnType<typeof setTimeout>;
+
+      const tick = async () => {
+        try {
+          const status = await documentService.getParseStatus(token, docId);
+          setParseStatuses((prev) => ({ ...prev, [docId]: status.status }));
+          if (status.status === "pending" || status.status === "running") {
+            delay = Math.min(delay * 1.5, 5000); // backoff up to 5 s
+            handle = setTimeout(tick, delay);
+          } else {
+            pollingIds.current.delete(docId);
+          }
+        } catch {
+          pollingIds.current.delete(docId);
+        }
+      };
+
+      handle = setTimeout(tick, delay);
+      // Return a cleanup so the effect can cancel the loop on unmount
+      return () => {
+        clearTimeout(handle);
+        pollingIds.current.delete(docId);
+      };
+    },
+    [token],
+  );
 
   const loadDocuments = useCallback(async () => {
     if (!token) return;
     try {
       const data = await documentService.list(token);
       setDocuments(data.documents);
+      // Fetch initial parse status for each document
+      data.documents.forEach(async (doc) => {
+        try {
+          const s = await documentService.getParseStatus(token, doc.id);
+          setParseStatuses((prev) => ({ ...prev, [doc.id]: s.status }));
+          if (s.status === "pending" || s.status === "running") {
+            pollParseStatus(doc.id);
+          }
+        } catch {
+          // document pre-dates Phase 4 — no parse job yet
+        }
+      });
     } finally {
       setLoadingDocs(false);
     }
-  }, [token]);
+  }, [token, pollParseStatus]);
 
   const loadSessions = useCallback(async () => {
     if (!token) return;
@@ -354,11 +466,26 @@ export function HomePage() {
   // ── Handlers ──
   function handleDocDeleted(id: number) {
     setDocuments((prev) => prev.filter((d) => d.id !== id));
+    setParseStatuses((prev) => { const n = { ...prev }; delete n[id]; return n; });
+    pollingIds.current.delete(id);
   }
 
   function handleUploaded(doc: Document) {
     setDocuments((prev) => [doc, ...prev]);
+    setParseStatuses((prev) => ({ ...prev, [doc.id]: "pending" }));
+    pollParseStatus(doc.id);
     setShowUpload(false);
+  }
+
+  async function handleReparse(docId: number) {
+    if (!token) return;
+    try {
+      await documentService.reparse(token, docId);
+      setParseStatuses((prev) => ({ ...prev, [docId]: "pending" }));
+      pollParseStatus(docId);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Reparse failed");
+    }
   }
 
   function handleSessionStarted(session: Session) {
@@ -424,8 +551,10 @@ export function HomePage() {
                   key={doc.id}
                   doc={doc}
                   token={token!}
+                  parseStatus={parseStatuses[doc.id]}
                   onDelete={handleDocDeleted}
                   onStartSession={setSessionTarget}
+                  onReparse={handleReparse}
                 />
               ))}
             </div>
@@ -649,6 +778,44 @@ export function HomePage() {
         }
 
         .session-card__dot { color: var(--text-faint); }
+
+        .session-card--clickable {
+          cursor: pointer;
+          transition: border-color 0.15s, background 0.15s;
+        }
+        .session-card--clickable:hover {
+          background: var(--bg-hover);
+          border-color: var(--accent);
+        }
+        .session-card--clickable:focus-visible {
+          outline: 2px solid var(--accent);
+          outline-offset: 2px;
+        }
+
+        /* Parse status badges */
+        .parse-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          border-radius: 20px;
+          font-size: 11px;
+          font-weight: 500;
+          padding: 2px 8px;
+          white-space: nowrap;
+        }
+
+        .parse-badge--running {
+          background: rgba(99,102,241,0.12);
+          color: var(--accent);
+        }
+
+        .parse-badge--failed {
+          background: rgba(239,68,68,0.1);
+          color: var(--error);
+          border: none;
+          cursor: pointer;
+        }
+        .parse-badge--failed:hover { background: rgba(239,68,68,0.2); }
 
         /* Empty state */
         .empty-state {

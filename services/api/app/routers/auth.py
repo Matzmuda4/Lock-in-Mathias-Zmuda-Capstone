@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
@@ -45,7 +45,12 @@ async def login(
     Authenticate with username + password (form-encoded).
     Compatible with Swagger UI's Authorize button.
     """
-    result = await db.execute(select(User).where(User.username == form.username))
+    # Accept either username or email in the username field (common UX pattern)
+    result = await db.execute(
+        select(User).where(
+            or_(User.username == form.username, User.email == form.username)
+        )
+    )
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(form.password, user.password_hash):

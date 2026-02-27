@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
-from app.db.models import Document, Session, User
+from app.db.models import Document, DocumentAsset, DocumentChunk, DocumentParseJob, Session, User
 from app.db.session import get_db
+from app.schemas.parsing import AssetSummary, ChunkResponse, SessionReaderResponse
 from app.schemas.sessions import SessionCreate, SessionListResponse, SessionResponse
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -159,3 +160,59 @@ async def get_session(
 ) -> SessionResponse:
     session = await _get_owned_session(session_id, current_user.id, db)
     return SessionResponse.model_validate(session)
+
+
+@router.get("/{session_id}/reader", response_model=SessionReaderResponse)
+async def get_session_reader(
+    session_id: int,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=30, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionReaderResponse:
+    """
+    Return everything the reader page needs in one call:
+    session metadata, parse status, first page of chunks, and asset list.
+    """
+    session = await _get_owned_session(session_id, current_user.id, db)
+    doc_id = session.document_id
+
+    # Parse job status (may not exist if doc was uploaded before Phase 4)
+    job_result = await db.execute(
+        select(DocumentParseJob).where(DocumentParseJob.document_id == doc_id)
+    )
+    job = job_result.scalar_one_or_none()
+    parse_status = job.status if job else "unknown"
+
+    # Chunk count
+    count_result = await db.execute(
+        select(func.count()).where(DocumentChunk.document_id == doc_id)
+    )
+    total_chunks = count_result.scalar_one()
+
+    # Paginated chunks
+    chunks_result = await db.execute(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == doc_id)
+        .order_by(DocumentChunk.chunk_index)
+        .offset(offset)
+        .limit(limit)
+    )
+    chunks = chunks_result.scalars().all()
+
+    # All assets
+    assets_result = await db.execute(
+        select(DocumentAsset)
+        .where(DocumentAsset.document_id == doc_id)
+        .order_by(DocumentAsset.id)
+    )
+    assets = assets_result.scalars().all()
+
+    return SessionReaderResponse(
+        session=SessionResponse.model_validate(session),
+        document_id=doc_id,
+        parse_status=parse_status,
+        chunks=[ChunkResponse.model_validate(c) for c in chunks],
+        assets=[AssetSummary.model_validate(a) for a in assets],
+        total_chunks=total_chunks,
+    )

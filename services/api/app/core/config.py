@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     # File storage — relative to wherever the API process runs
     upload_dir: Path = Path("uploads")
+    # Extracted images and docling artifacts (git-ignored)
+    parsed_cache_dir: Path = Path("parsed_cache")
 
 
 settings = Settings()

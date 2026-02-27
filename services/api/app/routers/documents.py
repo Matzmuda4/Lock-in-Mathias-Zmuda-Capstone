@@ -2,16 +2,17 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiofiles
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_current_user
-from app.db.models import Document, User
+from app.db.models import Document, DocumentParseJob, User
 from app.db.session import get_db
 from app.schemas.documents import DocumentListResponse, DocumentResponse
+from app.services.parsing.parser import run_parse_job
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -31,6 +32,7 @@ async def _get_owned_document(doc_id: int, user_id: int, db: AsyncSession) -> Do
 
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     title: str = Form(...),
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
@@ -70,6 +72,14 @@ async def upload_document(
     db.add(doc)
     await db.commit()
     await db.refresh(doc)
+
+    # Create parse job record (status=pending) then schedule background parse
+    parse_job = DocumentParseJob(document_id=doc.id, status="pending")
+    db.add(parse_job)
+    await db.commit()
+
+    background_tasks.add_task(run_parse_job, doc.id, doc.file_path)
+
     return DocumentResponse.model_validate(doc)
 
 
