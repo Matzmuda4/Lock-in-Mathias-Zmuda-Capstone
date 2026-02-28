@@ -17,12 +17,10 @@ function StatCard({ label, value }: { label: string; value: string | number }) {
 
 function ParseBadge({
   status,
-  token,
   docId,
   onReparse,
 }: {
   status: ParseJobStatus["status"] | undefined;
-  token: string;
   docId: number;
   onReparse: (docId: number) => void;
 }) {
@@ -92,7 +90,6 @@ function DocumentRow({
             <p className="doc-row__title">{doc.title}</p>
             <ParseBadge
               status={parseStatus}
-              token={token}
               docId={doc.id}
               onReparse={onReparse}
             />

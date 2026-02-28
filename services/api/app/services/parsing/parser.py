@@ -140,6 +140,22 @@ def _label_value(item: Any) -> str | None:
     return label_raw.value if hasattr(label_raw, "value") else str(label_raw)
 
 
+import re as _re
+
+# Patterns produced by broken font encodings in some PDFs:
+#   /uniBF0  /uniXXXX  /uniXXXXXX  (PostScript glyph names)
+#   \ufffd   (Unicode replacement character)
+_GLYPH_NOISE_RE = _re.compile(r"/uni[0-9A-Fa-f]{4,6}|\ufffd")
+
+
+def _clean_text(text: str) -> str:
+    """Strip unresolved PDF glyph names and unicode replacement characters."""
+    cleaned = _GLYPH_NOISE_RE.sub("", text)
+    # Collapse any double-spaces that result from removal
+    cleaned = _re.sub(r"  +", " ", cleaned)
+    return cleaned.strip()
+
+
 # ─── Sync parse (runs in thread-pool) ─────────────────────────────────────────
 
 def _sync_parse(file_path: Path, cache_dir: Path) -> ParseResult:
@@ -217,6 +233,10 @@ def _sync_parse(file_path: Path, cache_dir: Path) -> ParseResult:
         if not text or not text.strip():
             continue
 
+        text = _clean_text(text)
+        if not text:
+            continue
+
         prov = item.prov[0] if getattr(item, "prov", None) else None
         page = getattr(prov, "page_no", None) if prov else None
         bbox = _extract_bbox(prov) if prov else None
@@ -224,7 +244,7 @@ def _sync_parse(file_path: Path, cache_dir: Path) -> ParseResult:
 
         raw_items.append({
             "item_type": "text",
-            "text": text.strip(),
+            "text": text,
             "page": page,
             "bbox": bbox,
             "label": label,

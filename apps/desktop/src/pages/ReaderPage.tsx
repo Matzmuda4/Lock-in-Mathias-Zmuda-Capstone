@@ -6,7 +6,7 @@ import { sessionService, type Session, type SessionReaderData } from "../service
 
 const API_BASE = "http://localhost:8000";
 
-// ─── Elapsed timer ──────────────────────────────────────────────────────────
+// ─── Elapsed timer ───────────────────────────────────────────────────────────
 
 function useElapsedTimer(session: Session | null) {
   const [seconds, setSeconds] = useState(0);
@@ -32,12 +32,64 @@ async function openPdfWithAuth(docId: number, token: string) {
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const tab = window.open(url, "_blank");
-    // Keep the blob URL alive long enough for the browser to load it
     setTimeout(() => URL.revokeObjectURL(url), 30_000);
     if (!tab) alert("Pop-up blocked — allow pop-ups for this page.");
   } catch (e) {
     alert(`Could not open PDF: ${e instanceof Error ? e.message : e}`);
   }
+}
+
+// ─── Auth-aware asset data URL loader ────────────────────────────────────────
+// The asset endpoint requires JWT, so plain <img src="..."> would get a 401.
+// We fetch with the Authorization header, convert the bytes to a base64 data
+// URL, and use that as <img src>. Data URLs are universally compatible across
+// browsers and WebViews (unlike blob: URLs which can silently fail in some
+// contexts).
+
+// Module-level cache — keyed by "docId:assetId" — so each asset is fetched
+// only once per page lifetime even when multiple components reference it.
+const _dataUrlCache = new Map<string, string>();
+
+function useAssetDataUrl(docId: number, assetId: number, token: string | null) {
+  const [url, setUrl] = useState<string | null>(() => {
+    const key = `${docId}:${assetId}`;
+    return assetId && token ? (_dataUrlCache.get(key) ?? null) : null;
+  });
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token || !docId || !assetId) return;
+    const key = `${docId}:${assetId}`;
+    const cached = _dataUrlCache.get(key);
+    if (cached) { setUrl(cached); return; }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/documents/${docId}/assets/${assetId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!resp.ok) {
+          if (!cancelled) setFetchError(`HTTP ${resp.status}`);
+          return;
+        }
+        // Convert binary response to a base64 data URL — works everywhere.
+        const buf = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        const contentType = resp.headers.get("content-type") ?? "image/png";
+        const dataUrl = `data:${contentType};base64,${btoa(binary)}`;
+        _dataUrlCache.set(key, dataUrl);
+        if (!cancelled) setUrl(dataUrl);
+      } catch (e) {
+        if (!cancelled) setFetchError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [docId, assetId, token]);
+
+  return { url, fetchError };
 }
 
 // ─── Chunk components ────────────────────────────────────────────────────────
@@ -51,73 +103,82 @@ function Caption({ text }: { text: string }) {
 function TextChunk({ chunk }: { chunk: Chunk }) {
   const label = (chunk.meta?.label as string | undefined) ?? "";
   const isHeading = HEADING_LABELS.has(label);
-
   return (
     <div className={`chunk chunk--text${isHeading ? " chunk--heading" : ""}`}>
-      {isHeading ? <h2 className="chunk__h">{chunk.text}</h2> : <p className="chunk__p">{chunk.text}</p>}
+      {isHeading
+        ? <h2 className="chunk__h">{chunk.text}</h2>
+        : <p className="chunk__p">{chunk.text}</p>}
     </div>
   );
 }
 
-function ImageChunk({ chunk, docId }: { chunk: Chunk; docId: number }) {
+function ImageChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string | null }) {
   const assetId = chunk.meta?.asset_id as number | undefined;
   const caption = chunk.meta?.caption as string | undefined;
 
-  if (!assetId) return null;
+  // Only show figures that have a recognisable caption (e.g. "Fig. 1. …").
+  // This hides logos, decorative icons, and other non-figure images.
+  const hasFigCaption = !!caption && /fig\./i.test(caption);
+
+  // Hooks must be called unconditionally — guards come after.
+  const { url, fetchError } = useAssetDataUrl(docId, assetId ?? 0, token);
+
+  if (!assetId || !hasFigCaption) return null;
+
+  if (fetchError) {
+    return (
+      <div className="chunk chunk--figure">
+        <p className="chunk__image-error">Image unavailable ({fetchError})</p>
+        {caption && <Caption text={caption} />}
+      </div>
+    );
+  }
 
   return (
     <div className="chunk chunk--figure">
-      <img
-        src={`${API_BASE}/documents/${docId}/assets/${assetId}`}
-        alt={caption ?? "Figure"}
-        className="chunk__img"
-        loading="lazy"
-        onError={(e) => {
-          const el = (e.target as HTMLElement).closest(".chunk--figure");
-          if (el) (el as HTMLElement).style.display = "none";
-        }}
-      />
+      {url
+        ? <img src={url} alt={caption} className="chunk__img" />
+        : <p className="chunk__image-loading">Loading figure…</p>
+      }
       {caption && <Caption text={caption} />}
     </div>
   );
 }
 
-function TableChunk({ chunk, docId }: { chunk: Chunk; docId: number }) {
+function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string | null }) {
   const assetId = chunk.meta?.asset_id as number | undefined;
   const caption = chunk.meta?.caption as string | undefined;
 
+  // Always call hooks unconditionally
+  const { url, fetchError } = useAssetDataUrl(docId, assetId ?? 0, token);
+  const [renderError, setRenderError] = useState(false);
+
+  const imageOk = assetId && url && !fetchError && !renderError;
+
   return (
     <div className="chunk chunk--table">
-      {assetId ? (
+      {imageOk && (
         <img
-          src={`${API_BASE}/documents/${docId}/assets/${assetId}`}
+          src={url}
           alt={caption ?? "Table"}
           className="chunk__img"
           loading="lazy"
-          onError={(e) => {
-            const el = e.target as HTMLImageElement;
-            el.style.display = "none";
-            el.nextElementSibling?.removeAttribute("style");
-          }}
+          onError={() => setRenderError(true)}
         />
-      ) : null}
-      {chunk.text && (
-        <pre
-          className="chunk__table-md"
-          style={assetId ? { display: "none" } : undefined}
-        >
-          {chunk.text}
-        </pre>
+      )}
+      {/* Markdown shown when there's no working image */}
+      {!imageOk && chunk.text && (
+        <pre className="chunk__table-md">{chunk.text}</pre>
       )}
       {caption && <Caption text={caption} />}
     </div>
   );
 }
 
-function ChunkCard({ chunk, docId }: { chunk: Chunk; docId: number }) {
+function ChunkCard({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string | null }) {
   const ct = (chunk.meta?.chunk_type as string | undefined) ?? "text";
-  if (ct === "image") return <ImageChunk chunk={chunk} docId={docId} />;
-  if (ct === "table") return <TableChunk chunk={chunk} docId={docId} />;
+  if (ct === "image") return <ImageChunk chunk={chunk} docId={docId} token={token} />;
+  if (ct === "table") return <TableChunk chunk={chunk} docId={docId} token={token} />;
   return <TextChunk chunk={chunk} />;
 }
 
@@ -280,7 +341,7 @@ export function ReaderPage() {
         )}
 
         {chunks.map((chunk) => (
-          <ChunkCard key={chunk.id} chunk={chunk} docId={document_id} />
+          <ChunkCard key={chunk.id} chunk={chunk} docId={document_id} token={token} />
         ))}
 
         {!allLoaded && !isParsing && (
@@ -332,23 +393,10 @@ export function ReaderPage() {
           padding: 40px 24px 80px;
         }
 
-        /* ── Chunk base — no box, just spacing ── */
-        .chunk {
-          margin-bottom: 22px;
-        }
-
-        /* Page indicator */
-        .chunk__page {
-          display:block;
-          font-size:10px;
-          color:var(--text-faint);
-          text-transform:uppercase;
-          letter-spacing:0.07em;
-          margin-bottom:4px;
-        }
+        /* ── Chunk base ── */
+        .chunk { margin-bottom: 22px; }
 
         /* Text */
-        .chunk--text {}
         .chunk__p {
           font-size:15px;
           line-height:1.8;
@@ -384,6 +432,16 @@ export function ReaderPage() {
           margin:0 auto;
           border-radius:var(--radius-sm, 4px);
         }
+        .chunk__image-loading {
+          font-size:12px;
+          color:var(--text-muted);
+          margin:8px 0;
+        }
+        .chunk__image-error {
+          font-size:12px;
+          color:var(--error, #ef4444);
+          margin:8px 0;
+        }
 
         /* Table */
         .chunk--table {
@@ -403,7 +461,7 @@ export function ReaderPage() {
           font-family:var(--font-mono, monospace);
         }
 
-        /* Caption (figure / table label) */
+        /* Caption */
         .chunk__caption {
           font-size:13px;
           color:var(--text-muted);
