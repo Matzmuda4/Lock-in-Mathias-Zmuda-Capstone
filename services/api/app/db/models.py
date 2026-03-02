@@ -93,6 +93,9 @@ class Session(Base):
     )
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Seconds accumulated across all completed active intervals (used for accurate
+    # timer display when sessions are paused and resumed multiple times).
+    elapsed_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

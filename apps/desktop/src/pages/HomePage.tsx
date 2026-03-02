@@ -67,6 +67,7 @@ function DocumentRow({
   onReparse: (docId: number) => void;
 }) {
   const [deleting, setDeleting] = useState(false);
+  const [opening, setOpening] = useState(false);
   const sizeKb = Math.round(doc.file_size / 1024);
 
   async function handleDelete() {
@@ -83,7 +84,26 @@ function DocumentRow({
 
   return (
     <div className="doc-row">
-      <div className="doc-row__info">
+      <div
+        className="doc-row__info doc-row__info--clickable"
+        onClick={async () => {
+          if (opening) return;
+          setOpening(true);
+          try {
+            const r = await fetch(`http://localhost:8000/documents/${doc.id}/file`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const blob = await r.blob();
+            const url = URL.createObjectURL(blob);
+            window.open(url, "_blank");
+          } finally {
+            setOpening(false);
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        title={opening ? "Opening…" : "View PDF"}
+      >
         <span className="doc-row__icon">📄</span>
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -128,7 +148,8 @@ function SessionCard({ session }: { session: Session }) {
       ? `${Math.floor(session.duration_seconds / 60)}m ${session.duration_seconds % 60}s`
       : "—";
 
-  const startDate = new Date(session.started_at).toLocaleDateString(undefined, {
+  // Use created_at for display — started_at changes on each resume
+  const startDate = new Date(session.created_at).toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -161,6 +182,7 @@ function SessionCard({ session }: { session: Session }) {
     </div>
   );
 }
+
 
 // ─── Upload modal ─────────────────────────────────────────────────────────────
 
@@ -726,6 +748,19 @@ export function HomePage() {
           gap: 12px;
         }
 
+        .doc-row__info--clickable {
+          cursor: pointer;
+          border-radius: var(--radius-sm);
+          padding: 4px 6px;
+          margin: -4px -6px;
+          transition: background 0.12s;
+        }
+        .doc-row__info--clickable:hover { background: var(--bg-hover); }
+        .doc-row__info--clickable:focus-visible {
+          outline: 2px solid var(--accent);
+          outline-offset: 2px;
+        }
+
         .doc-row__icon { font-size: 18px; }
 
         .doc-row__title {
@@ -833,6 +868,7 @@ export function HomePage() {
         @media (max-width: 640px) {
           .stats-row { grid-template-columns: repeat(2, 1fr); }
           .doc-row { flex-direction: column; align-items: flex-start; gap: 10px; }
+          .pdf-modal { width: 100vw; height: 100vh; border-radius: 0; }
         }
       `}</style>
     </div>

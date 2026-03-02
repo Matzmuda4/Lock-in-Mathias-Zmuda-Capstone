@@ -11,9 +11,13 @@ export interface Session {
   name: string;
   mode: SessionMode;
   status: SessionStatus;
+  // "last resumed at" — updated on each resume so intervals are tracked correctly
   started_at: string;
   ended_at: string | null;
   duration_seconds: number | null;
+  // Seconds accumulated across all completed active intervals
+  elapsed_seconds: number;
+  // Original creation timestamp (used for display; started_at changes on resume)
   created_at: string;
 }
 

@@ -1,14 +1,17 @@
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
+from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_current_user
+from app.core.security import decode_access_token
 from app.db.models import Document, DocumentParseJob, User
 from app.db.session import get_db
 from app.schemas.documents import DocumentListResponse, DocumentResponse
@@ -101,11 +104,40 @@ async def list_documents(
 @router.get("/{doc_id}/file")
 async def get_document_file(
     doc_id: int,
-    current_user: User = Depends(get_current_user),
+    request: Request,
+    token_param: Optional[str] = Query(None, alias="token"),
     db: AsyncSession = Depends(get_db),
 ) -> FileResponse:
-    """Stream the PDF file back to the client."""
-    doc = await _get_owned_document(doc_id, current_user.id, db)
+    """Stream the PDF file back to the client.
+
+    Accepts authentication via the standard Authorization header **or** a
+    ``?token=<jwt>`` query parameter so the file can be embedded in an
+    ``<iframe>`` without custom request headers.
+    """
+    # Try Authorization header first, then fall back to ?token= query param
+    raw_token: Optional[str] = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        raw_token = auth_header[len("Bearer "):]
+    elif token_param:
+        raw_token = token_param
+
+    if not raw_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    try:
+        payload = decode_access_token(raw_token)
+        user_id_str: Optional[str] = payload.get("sub")
+        if not user_id_str:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        result = await db.execute(select(User).where(User.id == int(user_id_str)))
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    doc = await _get_owned_document(doc_id, user.id, db)
     if not Path(doc.file_path).exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -115,6 +147,7 @@ async def get_document_file(
         path=doc.file_path,
         media_type="application/pdf",
         filename=doc.filename,
+        headers={"Content-Disposition": "inline"},
     )
 
 

@@ -7,36 +7,49 @@ import { sessionService, type Session, type SessionReaderData } from "../service
 const API_BASE = "http://localhost:8000";
 
 // ─── Elapsed timer ───────────────────────────────────────────────────────────
+// The timer must survive navigation away and back.
+//
+// How time is tracked:
+//  • elapsed_seconds: accumulated from all completed active intervals (set by backend on pause)
+//  • started_at:      "last resumed at" (reset by backend on each resume)
+//
+// Display logic:
+//  • active    → elapsed_seconds + (now − started_at)   [counts live]
+//  • paused    → elapsed_seconds                         [frozen]
+//  • ended/completed → duration_seconds                  [final value]
+
+function calcInitialSeconds(session: Session): number {
+  if (session.status === "ended" || session.status === "completed") {
+    return session.duration_seconds ?? session.elapsed_seconds;
+  }
+  if (session.status === "paused") {
+    return session.elapsed_seconds;
+  }
+  // active: accumulated + current interval since last resume
+  const intervalMs = Date.now() - new Date(session.started_at).getTime();
+  return session.elapsed_seconds + Math.max(0, Math.floor(intervalMs / 1000));
+}
 
 function useElapsedTimer(session: Session | null) {
-  const [seconds, setSeconds] = useState(0);
+  const [seconds, setSeconds] = useState(() =>
+    session ? calcInitialSeconds(session) : 0,
+  );
+
+  // Re-sync when the session object changes (e.g. after pause/resume action)
+  useEffect(() => {
+    if (session) setSeconds(calcInitialSeconds(session));
+  }, [session?.status, session?.elapsed_seconds, session?.started_at]);
+
   const running = session?.status === "active";
   useEffect(() => {
     if (!running) return;
     const id = setInterval(() => setSeconds((s) => s + 1), 1000);
     return () => clearInterval(id);
   }, [running]);
+
   const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
   const ss = String(seconds % 60).padStart(2, "0");
   return `${mm}:${ss}`;
-}
-
-// ─── Open PDF with auth ──────────────────────────────────────────────────────
-
-async function openPdfWithAuth(docId: number, token: string) {
-  try {
-    const resp = await fetch(`${API_BASE}/documents/${docId}/file`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!resp.ok) throw new Error(`${resp.status}`);
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const tab = window.open(url, "_blank");
-    setTimeout(() => URL.revokeObjectURL(url), 30_000);
-    if (!tab) alert("Pop-up blocked — allow pop-ups for this page.");
-  } catch (e) {
-    alert(`Could not open PDF: ${e instanceof Error ? e.message : e}`);
-  }
 }
 
 // ─── Auth-aware asset data URL loader ────────────────────────────────────────
@@ -313,13 +326,6 @@ export function ReaderPage() {
         <div className="reader-bar__right">
           <span className="reader-bar__timer">{timerDisplay}</span>
           <SessionControls session={session} onAction={handleSessionAction} busy={actionBusy} />
-          <button
-            className="btn btn--ghost btn--sm"
-            type="button"
-            onClick={() => openPdfWithAuth(document_id, token!)}
-          >
-            View PDF ↗
-          </button>
         </div>
       </header>
 

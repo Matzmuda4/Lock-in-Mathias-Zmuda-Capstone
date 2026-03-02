@@ -22,6 +22,7 @@ class SessionResponse(BaseModel):
     started_at: datetime
     ended_at: Optional[datetime]
     duration_seconds: Optional[int]
+    elapsed_seconds: int
     created_at: datetime
 
 

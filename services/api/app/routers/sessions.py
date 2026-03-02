@@ -63,6 +63,12 @@ async def pause_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot pause a session with status '{session.status}'",
         )
+    now = datetime.now(timezone.utc)
+    # Accumulate the seconds from this active interval into elapsed_seconds.
+    # started_at here means "last resumed at" (set on creation and on each resume).
+    session.elapsed_seconds = (session.elapsed_seconds or 0) + max(
+        0, int((now - session.started_at).total_seconds())
+    )
     session.status = "paused"
     await db.commit()
     await db.refresh(session)
@@ -82,6 +88,8 @@ async def resume_session(
             detail=f"Cannot resume a session with status '{session.status}'",
         )
     session.status = "active"
+    # Reset the interval start time so elapsed counting is correct next pause/close.
+    session.started_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(session)
     return SessionResponse.model_validate(session)
@@ -93,9 +101,13 @@ _TERMINAL_STATUSES = frozenset({"ended", "completed"})
 def _close_session(session: Session, final_status: str) -> None:
     """Shared logic for both /end and /complete."""
     now = datetime.now(timezone.utc)
+    # If the session is currently active, add the current interval first.
+    current_interval = 0
+    if session.status == "active":
+        current_interval = max(0, int((now - session.started_at).total_seconds()))
     session.status = final_status
     session.ended_at = now
-    session.duration_seconds = max(0, int((now - session.started_at).total_seconds()))
+    session.duration_seconds = (session.elapsed_seconds or 0) + current_interval
 
 
 @router.post("/{session_id}/end", response_model=SessionResponse)

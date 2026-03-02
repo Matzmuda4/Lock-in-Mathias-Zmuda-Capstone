@@ -27,7 +27,6 @@ export function App() {
               </ProtectedRoute>
             }
           />
-          {/* Catch-all → home (ProtectedRoute will redirect to /login if unauthed) */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AuthProvider>
