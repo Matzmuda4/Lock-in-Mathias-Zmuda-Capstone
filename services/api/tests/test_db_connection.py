@@ -16,9 +16,9 @@ class TestDatabaseConnectivity:
         assert result == 1, "Expected SELECT 1 to return 1"
 
     async def test_correct_database(self, db_conn):
-        """Verify we are connected to the 'lockin' database."""
+        """Verify we are connected to the test database (lockin_test)."""
         dbname = await db_conn.fetchval("SELECT current_database()")
-        assert dbname == "lockin", f"Expected database 'lockin', got '{dbname}'"
+        assert dbname == "lockin_test", f"Expected database 'lockin_test', got '{dbname}'"
 
     async def test_correct_user(self, db_conn):
         """Verify we are authenticated as the 'lockin' role."""

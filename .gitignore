@@ -46,6 +46,12 @@ Thumbs.db
 # ── Uploaded files ────────────────────────────────────────────────────────────
 services/api/uploads/
 
+# ── Parsed PDF cache (extracted images + docling artifacts) ───────────────────
+services/api/parsed_cache/
+
+# ── Test PDFs (local dev only) ────────────────────────────────────────────────
+pdfs/
+
 # ── Training artifacts ────────────────────────────────────────────────────────
 training/checkpoints/
 training/data/raw/

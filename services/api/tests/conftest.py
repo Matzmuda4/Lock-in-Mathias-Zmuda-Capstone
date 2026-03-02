@@ -1,29 +1,35 @@
 """
 Shared fixtures for the entire test suite.
 
-Design decisions
-----------------
-* init_test_db is SYNCHRONOUS (scope="session") — it calls asyncio.run() so
-  it gets its own temporary event loop for schema setup.  This avoids having a
-  session-scoped async fixture fight with per-test (function-scoped) event loops.
+Tests use the dedicated "lockin_test" database so the autouse clean_tables
+fixture never touches production data.  DATABASE_URL is set at module level
+(before any app module is imported) so pydantic-settings picks it up from
+the environment rather than from .env.
 
-* clean_tables is SYNCHRONOUS for the same reason — teardown needs its own
-  loop so it doesn't conflict with whatever loop the just-finished test used.
-
-* db_conn / api_client / auth_headers are async + function-scoped, each
-  running inside the test's own event loop.  NullPool on the SQLAlchemy engine
-  means no connections are cached between tests, so there is no "attached to
-  a different loop" error.
+Design notes
+------------
+* init_test_db is SYNCHRONOUS (scope="session") -- it calls asyncio.run() so
+  it gets its own temporary event loop for schema setup.
+* clean_tables is SYNCHRONOUS for the same reason.
+* db_conn / api_client / auth_headers are async + function-scoped; NullPool
+  ensures no connections are shared between tests.
 """
 
 import asyncio
+import os
+
+# Must happen BEFORE any app import so the SQLAlchemy engine and pydantic
+# Settings are created with the test URL, not the live URL from .env.
+os.environ["DATABASE_URL"] = "postgresql+asyncpg://lockin:lockin@localhost:5433/lockin_test"
 
 import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-_ASYNCPG_DSN = "postgresql://lockin:lockin@localhost:5433/lockin"
-_SQLALCHEMY_DSN = "postgresql+asyncpg://lockin:lockin@localhost:5433/lockin"
+# Tests use a dedicated database — never the live "lockin" database.
+# This prevents the autouse clean_tables fixture from wiping production data.
+_ASYNCPG_DSN = "postgresql://lockin:lockin@localhost:5433/lockin_test"
+_SQLALCHEMY_DSN = "postgresql+asyncpg://lockin:lockin@localhost:5433/lockin_test"
 
 
 # ── Schema bootstrap — once per session, synchronous ─────────────────────────
@@ -84,6 +90,10 @@ def clean_tables() -> None:
             await conn.execute("DELETE FROM model_outputs")
             await conn.execute("DELETE FROM interventions")
             await conn.execute("DELETE FROM sessions")
+            # Phase 4 tables (FK → documents)
+            await conn.execute("DELETE FROM document_assets")
+            await conn.execute("DELETE FROM document_chunks")
+            await conn.execute("DELETE FROM document_parse_jobs")
             await conn.execute("DELETE FROM documents")
             await conn.execute("DELETE FROM users")
         finally:

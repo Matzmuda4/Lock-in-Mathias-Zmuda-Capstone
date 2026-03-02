@@ -12,9 +12,12 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     PrimaryKeyConstraint,
     String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -61,6 +64,15 @@ class Document(Base):
     sessions: Mapped[list["Session"]] = relationship(
         back_populates="document", passive_deletes=True
     )
+    parse_job: Mapped[Optional["DocumentParseJob"]] = relationship(
+        back_populates="document", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+    )
+    chunks: Mapped[list["DocumentChunk"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", passive_deletes=True
+    )
+    assets: Mapped[list["DocumentAsset"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class Session(Base):
@@ -81,6 +93,9 @@ class Session(Base):
     )
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Seconds accumulated across all completed active intervals (used for accurate
+    # timer display when sessions are paused and resumed multiple times).
+    elapsed_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -143,6 +158,87 @@ class ModelOutput(Base):
     )
 
     session: Mapped["Session"] = relationship(back_populates="model_outputs")
+
+
+# ─── Phase 4 — Parsing tables ─────────────────────────────────────────────────
+
+
+class DocumentParseJob(Base):
+    """One-to-one with Document. Tracks the lifecycle of a docling parse run."""
+
+    __tablename__ = "document_parse_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    # pending → running → succeeded | failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="parse_job")
+
+
+class DocumentChunk(Base):
+    """A single text block extracted from a document by the parsing pipeline."""
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        UniqueConstraint("document_id", "chunk_index", name="uq_document_chunk"),
+        Index("ix_document_chunks_document_id", "document_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    page_end: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Stores bbox list, label, char offsets — flexible for future LLM use
+    meta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+class DocumentAsset(Base):
+    """An extracted image (or future: table) from a document."""
+
+    __tablename__ = "document_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    asset_type: Mapped[str] = mapped_column(String(20), nullable=False, default="image")
+    page: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    bbox: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Path under services/api/parsed_cache/{document_id}/
+    file_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    meta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="assets")
+
+
+# ─── End Phase 4 ──────────────────────────────────────────────────────────────
 
 
 class Intervention(Base):

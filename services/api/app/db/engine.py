@@ -32,8 +32,9 @@ async def init_db() -> None:
     3. create_hypertable — convert activity_events; if_not_exists makes it safe
        to call on an already-converted table.
     """
-    # Ensure upload directory exists
+    # Ensure storage directories exist
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
+    settings.parsed_cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1 — TimescaleDB extension (needs DDL outside a transaction block)
     raw_dsn = settings.database_url.replace("postgresql+asyncpg", "postgresql")

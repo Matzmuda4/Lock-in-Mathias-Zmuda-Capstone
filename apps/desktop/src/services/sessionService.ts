@@ -1,4 +1,5 @@
 import { apiRequest } from "./apiClient";
+import type { AssetSummary, Chunk } from "./documentService";
 
 export type SessionMode = "baseline" | "adaptive";
 export type SessionStatus = "active" | "paused" | "ended" | "completed";
@@ -10,15 +11,28 @@ export interface Session {
   name: string;
   mode: SessionMode;
   status: SessionStatus;
+  // "last resumed at" — updated on each resume so intervals are tracked correctly
   started_at: string;
   ended_at: string | null;
   duration_seconds: number | null;
+  // Seconds accumulated across all completed active intervals
+  elapsed_seconds: number;
+  // Original creation timestamp (used for display; started_at changes on resume)
   created_at: string;
 }
 
 export interface SessionList {
   sessions: Session[];
   total: number;
+}
+
+export interface SessionReaderData {
+  session: Session;
+  document_id: number;
+  parse_status: string;
+  chunks: Chunk[];
+  assets: AssetSummary[];
+  total_chunks: number;
 }
 
 export const sessionService = {
@@ -39,6 +53,20 @@ export const sessionService = {
     });
   },
 
+  async pause(token: string, sessionId: number): Promise<Session> {
+    return apiRequest<Session>(`/sessions/${sessionId}/pause`, {
+      method: "POST",
+      token,
+    });
+  },
+
+  async resume(token: string, sessionId: number): Promise<Session> {
+    return apiRequest<Session>(`/sessions/${sessionId}/resume`, {
+      method: "POST",
+      token,
+    });
+  },
+
   async end(token: string, sessionId: number): Promise<Session> {
     return apiRequest<Session>(`/sessions/${sessionId}/end`, {
       method: "POST",
@@ -51,5 +79,17 @@ export const sessionService = {
       method: "POST",
       token,
     });
+  },
+
+  async getReader(
+    token: string,
+    sessionId: number,
+    offset = 0,
+    limit = 30,
+  ): Promise<SessionReaderData> {
+    return apiRequest<SessionReaderData>(
+      `/sessions/${sessionId}/reader?offset=${offset}&limit=${limit}`,
+      { token },
+    );
   },
 };
