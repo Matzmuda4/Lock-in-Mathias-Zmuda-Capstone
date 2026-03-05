@@ -59,6 +59,14 @@ def init_test_db() -> None:
         eng = create_async_engine(_SQLALCHEMY_DSN, poolclass=NullPool)
         async with eng.begin() as c:
             await c.run_sync(Base.metadata.create_all)
+        # Idempotent column additions for existing DBs (mirrors engine.py init_db)
+        async with eng.begin() as c:
+            await c.execute(
+                text(
+                    "ALTER TABLE documents "
+                    "ADD COLUMN IF NOT EXISTS is_calibration BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
         async with eng.begin() as c:
             await c.execute(
                 text(
@@ -95,6 +103,8 @@ def clean_tables() -> None:
             await conn.execute("DELETE FROM document_chunks")
             await conn.execute("DELETE FROM document_parse_jobs")
             await conn.execute("DELETE FROM documents")
+            # Phase B tables (FK → users)
+            await conn.execute("DELETE FROM user_baselines")
             await conn.execute("DELETE FROM users")
         finally:
             await conn.close()

@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import activity, auth, documents, parsing, sessions
+from app.routers import activity, auth, calibration, documents, parsing, sessions
 
 
 @asynccontextmanager
@@ -42,6 +42,7 @@ app.include_router(documents.router)
 app.include_router(sessions.router)
 app.include_router(activity.router)
 app.include_router(parsing.router)
+app.include_router(calibration.router)
 
 
 @app.get("/health", tags=["meta"])

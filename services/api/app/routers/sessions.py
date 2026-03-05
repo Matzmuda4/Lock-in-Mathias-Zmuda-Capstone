@@ -1,11 +1,15 @@
+import csv
+import io
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.deps import get_current_user
-from app.db.models import Document, DocumentAsset, DocumentChunk, DocumentParseJob, Session, User
+from app.db.models import ActivityEvent, Document, DocumentAsset, DocumentChunk, DocumentParseJob, Session, User
 from app.db.session import get_db
 from app.schemas.parsing import AssetSummary, ChunkResponse, SessionReaderResponse
 from app.schemas.sessions import SessionCreate, SessionListResponse, SessionResponse
@@ -189,12 +193,20 @@ async def get_session_reader(
     session = await _get_owned_session(session_id, current_user.id, db)
     doc_id = session.document_id
 
-    # Parse job status (may not exist if doc was uploaded before Phase 4)
+    # Parse job status. Calibration (and legacy txt-based) documents have no
+    # parse job — if chunks already exist we treat that as "succeeded".
     job_result = await db.execute(
         select(DocumentParseJob).where(DocumentParseJob.document_id == doc_id)
     )
     job = job_result.scalar_one_or_none()
-    parse_status = job.status if job else "unknown"
+    if job:
+        parse_status = job.status
+    else:
+        # No parse job: succeeded if chunks exist, pending otherwise
+        has_chunks_result = await db.execute(
+            select(func.count()).where(DocumentChunk.document_id == doc_id)
+        )
+        parse_status = "succeeded" if (has_chunks_result.scalar_one() or 0) > 0 else "pending"
 
     # Chunk count
     count_result = await db.execute(
@@ -227,4 +239,71 @@ async def get_session_reader(
         chunks=[ChunkResponse.model_validate(c) for c in chunks],
         assets=[AssetSummary.model_validate(a) for a in assets],
         total_chunks=total_chunks,
+    )
+
+
+_CSV_FIELDS = [
+    "created_at",
+    "scroll_delta_sum",
+    "scroll_delta_abs_sum",
+    "scroll_event_count",
+    "scroll_direction_changes",
+    "scroll_pause_seconds",
+    "idle_seconds",
+    "mouse_path_px",
+    "mouse_net_px",
+    "window_focus_state",
+    "current_paragraph_id",
+    "current_chunk_index",
+    "viewport_progress_ratio",
+]
+
+
+@router.get("/{session_id}/export.csv")
+async def export_session_csv(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Export all telemetry_batch events for a session as CSV.
+
+    The file is also written to exports/user_{id}/session_{id}.csv on disk
+    (gitignored) for offline analysis.
+    """
+    session = await _get_owned_session(session_id, current_user.id, db)
+
+    ev_result = await db.execute(
+        select(ActivityEvent).where(
+            ActivityEvent.session_id == session_id,
+            ActivityEvent.event_type == "telemetry_batch",
+        ).order_by(ActivityEvent.created_at)
+    )
+    events = ev_result.scalars().all()
+
+    # Build CSV in memory
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for event in events:
+        row = {k: event.payload.get(k, "") for k in _CSV_FIELDS}
+        row["created_at"] = event.created_at.isoformat()
+        writer.writerow(row)
+
+    csv_content = buf.getvalue()
+
+    # Persist to disk (best-effort; failure must not break the response)
+    try:
+        export_path = settings.exports_dir / f"user_{current_user.id}" / f"session_{session_id}.csv"
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        export_path.write_text(csv_content, encoding="utf-8")
+    except Exception:
+        pass
+
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="session_{session_id}.csv"'
+        },
     )

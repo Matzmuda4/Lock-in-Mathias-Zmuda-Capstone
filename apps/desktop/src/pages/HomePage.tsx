@@ -1,6 +1,7 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
+import { calibrationService } from "../services/calibrationService";
 import { Document, documentService, type ParseJobStatus } from "../services/documentService";
 import { Session, SessionMode, sessionService } from "../services/sessionService";
 
@@ -389,6 +390,19 @@ function StartSessionModal({
 
 export function HomePage() {
   const { user, token, logout } = useAuth();
+  const navigate = useNavigate();
+
+  // ── Calibration gate: redirect if user has no baseline yet ────────────────
+  useEffect(() => {
+    if (!token) return;
+    calibrationService.getStatus(token).then((s) => {
+      if (!s.has_baseline && s.calib_available) {
+        navigate("/calibration", { replace: true });
+      }
+    }).catch(() => {
+      // Non-fatal: if calibration status check fails, let the user proceed
+    });
+  }, [token, navigate]);
 
   const [documents, setDocuments] = useState<Document[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);

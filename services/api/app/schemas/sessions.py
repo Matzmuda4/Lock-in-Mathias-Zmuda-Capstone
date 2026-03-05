@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 class SessionCreate(BaseModel):
     document_id: int
     name: str
-    mode: Literal["baseline", "adaptive"]
+    mode: Literal["baseline", "adaptive", "calibration"]
 
 
 class SessionResponse(BaseModel):

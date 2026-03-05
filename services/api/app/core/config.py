@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("uploads")
     # Extracted images and docling artifacts (git-ignored)
     parsed_cache_dir: Path = Path("parsed_cache")
+    # Telemetry CSV exports (git-ignored)
+    exports_dir: Path = Path("exports")
 
 
 settings = Settings()

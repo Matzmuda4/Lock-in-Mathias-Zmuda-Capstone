@@ -10,6 +10,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -43,6 +44,9 @@ class User(Base):
     sessions: Mapped[list["Session"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
+    baseline: Mapped[Optional["UserBaseline"]] = relationship(
+        back_populates="user", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class Document(Base):
@@ -56,6 +60,8 @@ class Document(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # True for the shared calibration document; hides it from normal document lists.
+    is_calibration: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -239,6 +245,41 @@ class DocumentAsset(Base):
 
 
 # ─── End Phase 4 ──────────────────────────────────────────────────────────────
+
+
+# ─── Phase B — Calibration baseline ──────────────────────────────────────────
+
+
+class UserBaseline(Base):
+    """
+    One row per user, upserted at the end of a successful calibration session.
+
+    baseline_json shape (v1):
+      wpm_mean, wpm_std, scroll_velocity_mean, scroll_velocity_std,
+      scroll_jitter_mean, idle_ratio_mean, regress_rate_mean,
+      paragraph_dwell_mean, calibration_duration_seconds
+    """
+
+    __tablename__ = "user_baselines"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    baseline_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="baseline")
+
+
+# ─── End Phase B ───────────────────────────────────────────────────────────────
 
 
 class Intervention(Base):

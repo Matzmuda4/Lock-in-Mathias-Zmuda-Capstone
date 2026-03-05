@@ -35,6 +35,7 @@ async def init_db() -> None:
     # Ensure storage directories exist
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     settings.parsed_cache_dir.mkdir(parents=True, exist_ok=True)
+    settings.exports_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1 — TimescaleDB extension (needs DDL outside a transaction block)
     raw_dsn = settings.database_url.replace("postgresql+asyncpg", "postgresql")
@@ -50,6 +51,15 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Step 3a — Add is_calibration column to documents (idempotent for existing DBs)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "ALTER TABLE documents "
+                "ADD COLUMN IF NOT EXISTS is_calibration BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
 
     # Step 3 — Convert activity_events to a TimescaleDB hypertable
     async with engine.begin() as conn:

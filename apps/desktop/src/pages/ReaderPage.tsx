@@ -1,22 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
+import { useTelemetry } from "../hooks/useTelemetry";
+import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { documentService, type Chunk } from "../services/documentService";
 import { sessionService, type Session, type SessionReaderData } from "../services/sessionService";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE_URL = "http://localhost:8000";
+
+const DEV = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV ?? false;
+
+// Minimum calibration reading time before "Finish" is enabled
+// Minimum seconds before the finish button is enabled (prevents instant accidental clicks)
+const CALIB_MIN_SECONDS = 10;
 
 // ─── Elapsed timer ───────────────────────────────────────────────────────────
-// The timer must survive navigation away and back.
-//
-// How time is tracked:
-//  • elapsed_seconds: accumulated from all completed active intervals (set by backend on pause)
-//  • started_at:      "last resumed at" (reset by backend on each resume)
-//
-// Display logic:
-//  • active    → elapsed_seconds + (now − started_at)   [counts live]
-//  • paused    → elapsed_seconds                         [frozen]
-//  • ended/completed → duration_seconds                  [final value]
 
 function calcInitialSeconds(session: Session): number {
   if (session.status === "ended" || session.status === "completed") {
@@ -25,7 +23,6 @@ function calcInitialSeconds(session: Session): number {
   if (session.status === "paused") {
     return session.elapsed_seconds;
   }
-  // active: accumulated + current interval since last resume
   const intervalMs = Date.now() - new Date(session.started_at).getTime();
   return session.elapsed_seconds + Math.max(0, Math.floor(intervalMs / 1000));
 }
@@ -35,7 +32,6 @@ function useElapsedTimer(session: Session | null) {
     session ? calcInitialSeconds(session) : 0,
   );
 
-  // Re-sync when the session object changes (e.g. after pause/resume action)
   useEffect(() => {
     if (session) setSeconds(calcInitialSeconds(session));
   }, [session?.status, session?.elapsed_seconds, session?.started_at]);
@@ -53,14 +49,7 @@ function useElapsedTimer(session: Session | null) {
 }
 
 // ─── Auth-aware asset data URL loader ────────────────────────────────────────
-// The asset endpoint requires JWT, so plain <img src="..."> would get a 401.
-// We fetch with the Authorization header, convert the bytes to a base64 data
-// URL, and use that as <img src>. Data URLs are universally compatible across
-// browsers and WebViews (unlike blob: URLs which can silently fail in some
-// contexts).
 
-// Module-level cache — keyed by "docId:assetId" — so each asset is fetched
-// only once per page lifetime even when multiple components reference it.
 const _dataUrlCache = new Map<string, string>();
 
 function useAssetDataUrl(docId: number, assetId: number, token: string | null) {
@@ -79,14 +68,13 @@ function useAssetDataUrl(docId: number, assetId: number, token: string | null) {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/documents/${docId}/assets/${assetId}`, {
+        const resp = await fetch(`${API_BASE_URL}/documents/${docId}/assets/${assetId}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!resp.ok) {
           if (!cancelled) setFetchError(`HTTP ${resp.status}`);
           return;
         }
-        // Convert binary response to a base64 data URL — works everywhere.
         const buf = await resp.arrayBuffer();
         const bytes = new Uint8Array(buf);
         let binary = "";
@@ -113,11 +101,22 @@ function Caption({ text }: { text: string }) {
   return <p className="chunk__caption">{text}</p>;
 }
 
-function TextChunk({ chunk }: { chunk: Chunk }) {
+/**
+ * Text/heading chunk — rendered with data-paragraph-id and data-word-count so
+ * the IntersectionObserver in useTelemetry can track the visible paragraph.
+ */
+function TextChunk({ chunk, chunkIndex }: { chunk: Chunk; chunkIndex: number }) {
   const label = (chunk.meta?.label as string | undefined) ?? "";
   const isHeading = HEADING_LABELS.has(label);
+  const wordCount = chunk.text.split(/\s+/).filter(Boolean).length;
+
   return (
-    <div className={`chunk chunk--text${isHeading ? " chunk--heading" : ""}`}>
+    <div
+      className={`chunk chunk--text${isHeading ? " chunk--heading" : ""}`}
+      data-paragraph-id={`chunk-${chunk.id}`}
+      data-word-count={wordCount}
+      data-chunk-index={chunkIndex}
+    >
       {isHeading
         ? <h2 className="chunk__h">{chunk.text}</h2>
         : <p className="chunk__p">{chunk.text}</p>}
@@ -129,11 +128,8 @@ function ImageChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   const assetId = chunk.meta?.asset_id as number | undefined;
   const caption = chunk.meta?.caption as string | undefined;
 
-  // Only show figures that have a recognisable caption (e.g. "Fig. 1. …").
-  // This hides logos, decorative icons, and other non-figure images.
   const hasFigCaption = !!caption && /fig\./i.test(caption);
 
-  // Hooks must be called unconditionally — guards come after.
   const { url, fetchError } = useAssetDataUrl(docId, assetId ?? 0, token);
 
   if (!assetId || !hasFigCaption) return null;
@@ -162,7 +158,6 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   const assetId = chunk.meta?.asset_id as number | undefined;
   const caption = chunk.meta?.caption as string | undefined;
 
-  // Always call hooks unconditionally
   const { url, fetchError } = useAssetDataUrl(docId, assetId ?? 0, token);
   const [renderError, setRenderError] = useState(false);
 
@@ -179,7 +174,6 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
           onError={() => setRenderError(true)}
         />
       )}
-      {/* Markdown shown when there's no working image */}
       {!imageOk && chunk.text && (
         <pre className="chunk__table-md">{chunk.text}</pre>
       )}
@@ -188,11 +182,21 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   );
 }
 
-function ChunkCard({ chunk, docId, token }: { chunk: Chunk; docId: number; token: string | null }) {
+function ChunkCard({
+  chunk,
+  chunkIndex,
+  docId,
+  token,
+}: {
+  chunk: Chunk;
+  chunkIndex: number;
+  docId: number;
+  token: string | null;
+}) {
   const ct = (chunk.meta?.chunk_type as string | undefined) ?? "text";
   if (ct === "image") return <ImageChunk chunk={chunk} docId={docId} token={token} />;
   if (ct === "table") return <TableChunk chunk={chunk} docId={docId} token={token} />;
-  return <TextChunk chunk={chunk} />;
+  return <TextChunk chunk={chunk} chunkIndex={chunkIndex} />;
 }
 
 // ─── Session controls ────────────────────────────────────────────────────────
@@ -228,6 +232,178 @@ function SessionControls({
   );
 }
 
+// ─── Calibration finish button ───────────────────────────────────────────────
+
+function CalibrationControls({
+  elapsedSeconds,
+  onFinish,
+  busy,
+}: {
+  elapsedSeconds: number;
+  onFinish: () => void;
+  busy: boolean;
+}) {
+  // Only block for a few seconds to prevent accidental instant clicks
+  const canFinish = elapsedSeconds >= CALIB_MIN_SECONDS;
+
+  return (
+    <div className="calib-controls">
+      <button
+        className="btn btn--sm btn--accent"
+        type="button"
+        onClick={onFinish}
+        disabled={!canFinish || busy}
+        title="Finish calibration when you're done reading"
+      >
+        {busy ? <span className="spinner" /> : "Done"}
+      </button>
+    </div>
+  );
+}
+
+// ─── Calibration baseline summary ────────────────────────────────────────────
+
+function BaselineSummary({
+  baseline,
+  sessionId,
+  token,
+  onDone,
+}: {
+  baseline: BaselineData;
+  sessionId: number;
+  token: string | null;
+  onDone: () => void;
+}) {
+  const [exporting, setExporting] = useState(false);
+
+  const exportCsv = async () => {
+    if (!token) return;
+    setExporting(true);
+    try {
+      const resp = await fetch(
+        `${API_BASE_URL}/sessions/${sessionId}/export.csv`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!resp.ok) return;
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `session_${sessionId}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  return (
+    <div className="baseline-summary">
+      <div className="baseline-summary__header">
+        <span className="baseline-summary__icon">✓</span>
+        <div>
+          <h2 className="baseline-summary__title">Calibration complete!</h2>
+          <p className="baseline-summary__sub">Your reading baseline has been saved.</p>
+        </div>
+      </div>
+
+      <div className="baseline-summary__grid">
+        <div className="baseline-stat">
+          <span className="baseline-stat__value">{baseline.wpm_mean.toFixed(0)}</span>
+          <span className="baseline-stat__label">WPM estimate</span>
+        </div>
+        <div className="baseline-stat">
+          <span className="baseline-stat__value">{baseline.scroll_velocity_mean.toFixed(0)}</span>
+          <span className="baseline-stat__label">Scroll velocity (px/s)</span>
+        </div>
+        <div className="baseline-stat">
+          <span className="baseline-stat__value">{(baseline.idle_ratio_mean * 100).toFixed(0)}%</span>
+          <span className="baseline-stat__label">Idle ratio</span>
+        </div>
+        <div className="baseline-stat">
+          <span className="baseline-stat__value">{Math.floor(baseline.calibration_duration_seconds / 60)}m {baseline.calibration_duration_seconds % 60}s</span>
+          <span className="baseline-stat__label">Session duration</span>
+        </div>
+      </div>
+
+      <div className="baseline-summary__actions">
+        <button
+          className="btn btn--ghost btn--sm"
+          type="button"
+          onClick={exportCsv}
+          disabled={exporting}
+        >
+          {exporting ? "Exporting…" : "Export CSV"}
+        </button>
+        <button className="btn btn--accent" type="button" onClick={onDone}>
+          Go to Dashboard
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Export CSV button ───────────────────────────────────────────────────────
+
+function ExportCsvButton({ sessionId, token }: { sessionId: number; token: string | null }) {
+  const [busy, setBusy] = useState(false);
+
+  const handleExport = async () => {
+    if (!token) return;
+    setBusy(true);
+    try {
+      const resp = await fetch(
+        `${API_BASE_URL}/sessions/${sessionId}/export.csv`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!resp.ok) return;
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `session_${sessionId}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      className="btn btn--ghost btn--sm export-btn"
+      type="button"
+      onClick={handleExport}
+      disabled={busy}
+    >
+      {busy ? "Exporting…" : "⬇ Export CSV"}
+    </button>
+  );
+}
+
+// ─── Dev-only debug panel ────────────────────────────────────────────────────
+
+function DebugPanel({ batch }: { batch: object | null }) {
+  const [open, setOpen] = useState(false);
+  if (!DEV) return null;
+  return (
+    <div className="debug-panel">
+      <button
+        className="debug-panel__toggle"
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+      >
+        {open ? "▾" : "▸"} Last telemetry batch
+      </button>
+      {open && (
+        <pre className="debug-panel__json">
+          {batch ? JSON.stringify(batch, null, 2) : "—"}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 // ─── ReaderPage ──────────────────────────────────────────────────────────────
 
 export function ReaderPage() {
@@ -242,7 +418,40 @@ export function ReaderPage() {
   const [allLoaded, setAllLoaded] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
 
+  // Calibration-specific state
+  const [calibBaseline, setCalibBaseline] = useState<BaselineData | null>(null);
+  const [calibDone, setCalibDone] = useState(false);
+
   const timerDisplay = useElapsedTimer(data?.session ?? null);
+  // Raw seconds for calibration finish-condition logic
+  const [timerSeconds, setTimerSeconds] = useState(0);
+  useEffect(() => {
+    const session = data?.session;
+    if (!session) return;
+    const calc = () => {
+      if (session.status === "ended" || session.status === "completed")
+        return session.duration_seconds ?? session.elapsed_seconds;
+      if (session.status === "paused") return session.elapsed_seconds;
+      const ms = Date.now() - new Date(session.started_at).getTime();
+      return session.elapsed_seconds + Math.max(0, Math.floor(ms / 1000));
+    };
+    setTimerSeconds(calc());
+    if (session.status !== "active") return;
+    const id = setInterval(() => setTimerSeconds(calc()), 1000);
+    return () => clearInterval(id);
+  }, [data?.session?.status, data?.session?.elapsed_seconds, data?.session?.started_at]);
+
+  // Ref for the scrollable content area — passed to useTelemetry
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  // Telemetry — active only while the session is in "active" status
+  const isActive = data?.session?.status === "active";
+  const { lastBatch, collecting } = useTelemetry({
+    sessionId,
+    token,
+    active: isActive,
+    containerRef: contentRef,
+  });
 
   useEffect(() => {
     if (!token) return;
@@ -269,6 +478,27 @@ export function ReaderPage() {
       setLoadingMore(false);
     }
   }, [token, data]);
+
+  const handleCalibrationFinish = useCallback(async () => {
+    if (!token || !data) return;
+    setActionBusy(true);
+    try {
+      const result = await calibrationService.complete(token, sessionId);
+      setCalibBaseline(result.baseline);
+      setCalibDone(true);
+      // Update local session state to "completed" so telemetry stops
+      const updatedSession: Session = {
+        ...data.session,
+        status: "completed",
+        duration_seconds: result.baseline.calibration_duration_seconds,
+      };
+      setData((prev) => prev && { ...prev, session: updatedSession });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Calibration completion failed");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [token, sessionId, data]);
 
   const handleSessionAction = useCallback(
     async (action: "pause" | "resume" | "complete" | "end") => {
@@ -306,11 +536,40 @@ export function ReaderPage() {
   }
 
   const { session, parse_status, chunks, document_id } = data;
-  const isParsing = parse_status === "pending" || parse_status === "running";
-  const parseFailed = parse_status === "failed";
+  // "unknown" can occur for calibration docs (no parse job) — treat as succeeded
+  // if chunks were actually returned.
+  const effectiveParseStatus =
+    parse_status === "unknown" && chunks.length > 0 ? "succeeded" : parse_status;
+  const isParsing = effectiveParseStatus === "pending" || effectiveParseStatus === "running";
+  const parseFailed = effectiveParseStatus === "failed";
+  const isCalibration = session.mode === "calibration";
+
+  // Show baseline summary overlay once calibration is complete
+  if (isCalibration && calibDone && calibBaseline) {
+    return (
+      <div className="reader">
+        <main className="reader-content" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <BaselineSummary
+            baseline={calibBaseline}
+            sessionId={sessionId}
+            token={token}
+            onDone={() => navigate("/")}
+          />
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="reader">
+      {/* Calibration banner */}
+      {isCalibration && (
+        <div className="calib-banner">
+          <span className="calib-banner__icon">⊙</span>
+          Read at your natural pace — we are measuring your baseline.
+        </div>
+      )}
+
       {/* Top bar */}
       <header className="reader-bar">
         <button className="btn btn--ghost btn--sm" onClick={() => navigate("/")} type="button">
@@ -320,17 +579,33 @@ export function ReaderPage() {
         <div className="reader-bar__center">
           <span className="reader-bar__title">{session.name}</span>
           <span className={`badge badge--${session.status}`}>{session.status}</span>
-          <span className="reader-bar__mode">{session.mode}</span>
+          {!isCalibration && <span className="reader-bar__mode">{session.mode}</span>}
         </div>
 
         <div className="reader-bar__right">
           <span className="reader-bar__timer">{timerDisplay}</span>
-          <SessionControls session={session} onAction={handleSessionAction} busy={actionBusy} />
+          {DEV && (
+            <span className={`telemetry-badge${collecting ? " telemetry-badge--on" : ""}`}>
+              ⊙ Telemetry: {collecting ? "ON" : "OFF"}
+            </span>
+          )}
+          {isCalibration
+            ? (
+              <CalibrationControls
+                elapsedSeconds={timerSeconds}
+                onFinish={handleCalibrationFinish}
+                busy={actionBusy}
+              />
+            )
+            : (
+              <SessionControls session={session} onAction={handleSessionAction} busy={actionBusy} />
+            )
+          }
         </div>
       </header>
 
       {/* Content */}
-      <main className="reader-content">
+      <main className="reader-content" ref={contentRef}>
         {isParsing && (
           <div className="reader-notice">
             <span className="spinner" />
@@ -346,8 +621,14 @@ export function ReaderPage() {
           <div className="reader-notice">No content was extracted from this document.</div>
         )}
 
-        {chunks.map((chunk) => (
-          <ChunkCard key={chunk.id} chunk={chunk} docId={document_id} token={token} />
+        {chunks.map((chunk, idx) => (
+          <ChunkCard
+            key={chunk.id}
+            chunk={chunk}
+            chunkIndex={idx}
+            docId={document_id}
+            token={token}
+          />
         ))}
 
         {!allLoaded && !isParsing && (
@@ -355,7 +636,15 @@ export function ReaderPage() {
             {loadingMore ? <span className="spinner" /> : "Load more"}
           </button>
         )}
+
+        {/* Export CSV — always visible in calibration, dev-only otherwise */}
+        {(isCalibration || DEV) && (
+          <ExportCsvButton sessionId={sessionId} token={token} />
+        )}
       </main>
+
+      {/* Dev debug panel */}
+      {DEV && <DebugPanel batch={lastBatch} />}
 
       <style>{`
         /* ── Layout ── */
@@ -386,6 +675,21 @@ export function ReaderPage() {
         .reader-bar__right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
         .reader-bar__timer { font-family:var(--font-mono); font-size:14px; color:var(--accent); min-width:48px; }
 
+        /* ── Telemetry indicator (dev-only) ── */
+        .telemetry-badge {
+          font-size:11px;
+          color:var(--text-muted);
+          padding:2px 7px;
+          border-radius:9999px;
+          border:1px solid var(--border);
+          white-space:nowrap;
+        }
+        .telemetry-badge--on {
+          color:#22c55e;
+          border-color:#22c55e44;
+          background:#22c55e11;
+        }
+
         .session-controls { display:flex; align-items:center; gap:6px; }
         .session-controls__done { font-size:12px; color:var(--text-muted); font-style:italic; text-transform:capitalize; }
         .btn--accent { background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -393,101 +697,235 @@ export function ReaderPage() {
 
         /* ── Content column ── */
         .reader-content {
-          max-width: 740px;
+          max-width: 90ch;
           width: 100%;
           margin: 0 auto;
-          padding: 40px 24px 80px;
+          padding: 48px 24px 100px;
+          overflow-y: auto;
+          height: calc(100vh - 56px);
         }
 
         /* ── Chunk base ── */
-        .chunk { margin-bottom: 22px; }
+        .chunk { margin-bottom: 28px; }
 
-        /* Text */
+        /* Text — larger, more readable */
         .chunk__p {
-          font-size:15px;
-          line-height:1.8;
-          color:var(--text);
-          margin:0;
+          font-size: 18px;
+          line-height: 1.75;
+          color: var(--text);
+          margin: 0;
+          max-width: 75ch;
         }
 
         /* Headings */
         .chunk--heading {
-          margin-top:36px;
-          margin-bottom:10px;
-          padding-bottom:6px;
-          border-bottom:1px solid var(--border);
+          margin-top: 44px;
+          margin-bottom: 12px;
+          padding-bottom: 6px;
+          border-bottom: 1px solid var(--border);
         }
         .chunk__h {
-          font-size:18px;
-          font-weight:700;
-          color:var(--text);
-          margin:0;
-          line-height:1.4;
+          font-size: 20px;
+          font-weight: 700;
+          color: var(--text);
+          margin: 0;
+          line-height: 1.35;
         }
 
         /* Figure / image */
         .chunk--figure {
-          margin-top:28px;
-          margin-bottom:28px;
-          text-align:center;
+          margin-top: 36px;
+          margin-bottom: 36px;
+          text-align: center;
         }
         .chunk__img {
-          max-width:100%;
-          height:auto;
-          display:block;
-          margin:0 auto;
-          border-radius:var(--radius-sm, 4px);
+          max-width: 100%;
+          height: auto;
+          display: block;
+          margin: 0 auto;
+          border-radius: var(--radius-sm, 4px);
         }
         .chunk__image-loading {
-          font-size:12px;
-          color:var(--text-muted);
-          margin:8px 0;
+          font-size: 13px;
+          color: var(--text-muted);
+          margin: 8px 0;
         }
         .chunk__image-error {
-          font-size:12px;
-          color:var(--error, #ef4444);
-          margin:8px 0;
+          font-size: 13px;
+          color: var(--error, #ef4444);
+          margin: 8px 0;
         }
 
         /* Table */
         .chunk--table {
-          margin-top:28px;
-          margin-bottom:28px;
+          margin-top: 36px;
+          margin-bottom: 36px;
         }
         .chunk__table-md {
-          font-size:13px;
-          line-height:1.6;
-          color:var(--text);
-          background:var(--bg-surface);
-          border:1px solid var(--border);
-          border-radius:var(--radius);
-          padding:14px 16px;
-          overflow-x:auto;
-          white-space:pre;
-          font-family:var(--font-mono, monospace);
+          font-size: 14px;
+          line-height: 1.6;
+          color: var(--text);
+          background: var(--bg-surface);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          padding: 14px 16px;
+          overflow-x: auto;
+          white-space: pre;
+          font-family: var(--font-mono, monospace);
         }
 
         /* Caption */
         .chunk__caption {
-          font-size:13px;
-          color:var(--text-muted);
-          font-style:italic;
-          text-align:center;
-          margin:6px 0;
+          font-size: 14px;
+          color: var(--text-muted);
+          font-style: italic;
+          text-align: center;
+          margin: 8px 0;
         }
 
         /* Notices */
         .reader-notice {
-          display:flex; align-items:center; gap:10px;
-          color:var(--text-muted); font-size:14px;
-          padding:20px; margin-bottom:24px;
-          border-radius:var(--radius);
-          border:1px dashed var(--border);
+          display: flex; align-items: center; gap: 10px;
+          color: var(--text-muted); font-size: 14px;
+          padding: 20px; margin-bottom: 24px;
+          border-radius: var(--radius);
+          border: 1px dashed var(--border);
         }
-        .reader-notice--error { color:var(--error); border-color:rgba(239,68,68,0.4); }
+        .reader-notice--error { color: var(--error); border-color: rgba(239,68,68,0.4); }
 
         /* Load more */
-        .btn--load-more { width:100%; margin-top:8px; }
+        .btn--load-more { width: 100%; margin-top: 8px; }
+
+        /* ── Calibration banner ── */
+        .calib-banner {
+          background: linear-gradient(90deg, var(--accent) 0%, #7c3aed 100%);
+          color: #fff;
+          font-size: 13px;
+          font-weight: 500;
+          padding: 8px 20px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          letter-spacing: 0.01em;
+        }
+        .calib-banner__icon { font-size: 15px; }
+
+        /* ── Calibration controls ── */
+        .calib-controls {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .calib-controls__hint {
+          font-size: 11px;
+          color: var(--text-muted);
+          white-space: nowrap;
+        }
+
+        /* ── Baseline summary ── */
+        .baseline-summary {
+          background: var(--bg-surface);
+          border: 1px solid var(--border);
+          border-radius: var(--radius-lg, 12px);
+          max-width: 480px;
+          width: 100%;
+          padding: 32px;
+        }
+        .baseline-summary__header {
+          display: flex;
+          align-items: flex-start;
+          gap: 16px;
+          margin-bottom: 24px;
+        }
+        .baseline-summary__icon {
+          font-size: 28px;
+          color: #22c55e;
+          line-height: 1;
+        }
+        .baseline-summary__title {
+          font-size: 20px;
+          font-weight: 700;
+          color: var(--text);
+          margin: 0 0 4px;
+        }
+        .baseline-summary__sub {
+          font-size: 13px;
+          color: var(--text-muted);
+          margin: 0;
+        }
+        .baseline-summary__grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+          margin-bottom: 24px;
+        }
+        .baseline-stat {
+          background: var(--bg);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          padding: 12px 16px;
+        }
+        .baseline-stat__value {
+          display: block;
+          font-size: 22px;
+          font-weight: 700;
+          color: var(--accent);
+          font-family: var(--font-mono, monospace);
+        }
+        .baseline-stat__label {
+          font-size: 11px;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+        }
+        .baseline-summary__actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 10px;
+        }
+
+        /* ── Export button ── */
+        .export-btn {
+          margin-top: 16px;
+          display: block;
+        }
+
+        /* ── Dev debug panel ── */
+        .debug-panel {
+          position: fixed;
+          bottom: 16px;
+          right: 16px;
+          z-index: 100;
+          background: var(--bg-surface);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          font-size: 12px;
+          max-width: 420px;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+        }
+        .debug-panel__toggle {
+          background: none;
+          border: none;
+          color: var(--text-muted);
+          padding: 8px 12px;
+          cursor: pointer;
+          width: 100%;
+          text-align: left;
+          font-size: 12px;
+        }
+        .debug-panel__toggle:hover { color: var(--text); }
+        .debug-panel__json {
+          margin: 0;
+          padding: 0 12px 12px;
+          color: var(--text);
+          font-family: var(--font-mono, monospace);
+          font-size: 11px;
+          line-height: 1.5;
+          max-height: 300px;
+          overflow-y: auto;
+          white-space: pre-wrap;
+          word-break: break-all;
+        }
       `}</style>
     </div>
   );
