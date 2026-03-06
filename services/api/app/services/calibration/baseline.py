@@ -55,23 +55,35 @@ def estimate_wpm(
     batches: list[dict[str, Any]],
     chunk_word_counts: dict[int, int],
     duration_seconds: int,
+    total_words_override: int | None = None,
 ) -> float:
     """
-    WPM estimate using paragraph dwell tracking.
+    WPM estimate.
 
-    A paragraph is counted as "read" when it appears as current_paragraph_id
-    in at least one 2-second batch (≥2 s dwell).  Its word count is looked up
-    from the document chunks.
+    When ``total_words_override`` is provided (calibration case where all text
+    was read), WPM = total_words / duration_minutes.
+
+    Otherwise falls back to paragraph-dwell tracking (normal sessions), parsing
+    ``chunk-N`` or ``calib-N`` paragraph IDs to look up word counts.
     """
+    duration_min = max(duration_seconds / 60.0, 0.1)
+
+    if total_words_override is not None and total_words_override > 0:
+        return total_words_override / duration_min
+
+    # Dwell-based estimate: accumulate words from visited paragraphs
     seen_ids = set(paragraph_dwells(batches).keys())
     total_words = 0
     for pid in seen_ids:
-        try:
-            chunk_id = int(pid.replace("chunk-", ""))
-            total_words += chunk_word_counts.get(chunk_id, 0)
-        except (ValueError, AttributeError):
-            pass
-    duration_min = max(duration_seconds / 60.0, 0.1)
+        # Accept "chunk-N" and "calib-N" formats
+        for prefix in ("chunk-", "calib-"):
+            if pid.startswith(prefix):
+                try:
+                    chunk_id = int(pid[len(prefix):])
+                    total_words += chunk_word_counts.get(chunk_id, 0)
+                except (ValueError, AttributeError):
+                    pass
+                break
     return total_words / duration_min
 
 
@@ -81,6 +93,7 @@ def compute_baseline(
     batches: list[dict[str, Any]],
     chunk_word_counts: dict[int, int],
     duration_seconds: int,
+    total_words: int | None = None,
 ) -> dict[str, Any]:
     """
     Compute the full reading baseline from a list of telemetry_batch payloads.
@@ -131,7 +144,10 @@ def compute_baseline(
     dwell_mean = round(mean(dwell_seconds) if dwell_seconds else 0.0, 2)
 
     # ── WPM ───────────────────────────────────────────────────────────────────
-    wpm = round(estimate_wpm(batches, chunk_word_counts, duration_seconds), 1)
+    wpm = round(
+        estimate_wpm(batches, chunk_word_counts, duration_seconds, total_words),
+        1,
+    )
 
     return {
         "wpm_mean": wpm,

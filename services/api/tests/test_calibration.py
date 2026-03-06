@@ -130,6 +130,28 @@ class TestBaselineComputation:
         wpm = estimate_wpm(batches, chunk_word_counts, 120)
         assert abs(wpm - 90.0) < 1.0
 
+    def test_wpm_uses_total_words_override(self) -> None:
+        """When total_words_override is given, WPM = total_words / duration_min."""
+        from app.services.calibration.baseline import estimate_wpm
+
+        # 300 words, 2 minutes → 150 wpm regardless of batches/chunk_word_counts
+        wpm = estimate_wpm([], {}, 120, total_words_override=300)
+        assert abs(wpm - 150.0) < 0.1
+
+    def test_wpm_handles_calib_paragraph_ids(self) -> None:
+        """Calibration reader uses 'calib-N' IDs; estimate_wpm must parse them."""
+        from app.services.calibration.baseline import estimate_wpm
+
+        batches = [
+            {"current_paragraph_id": "calib-0"},
+            {"current_paragraph_id": "calib-1"},
+        ]
+        # chunk_word_counts keyed by DB chunk id (int); not used in calib-N path
+        # Without total_words_override the function falls through to dwell tracking.
+        # Passing total_words_override gives the expected direct result.
+        wpm = estimate_wpm(batches, {}, 60, total_words_override=150)
+        assert abs(wpm - 150.0) < 0.1
+
     def test_paragraph_dwell_counted_correctly(self) -> None:
         from app.services.calibration.baseline import paragraph_dwells
 

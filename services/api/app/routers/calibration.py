@@ -249,15 +249,21 @@ async def calibration_complete(
     events = ev_result.scalars().all()
     batches = [e.payload for e in events]
 
-    # Build chunk word counts — include the known total for WPM estimation
+    # Fetch all chunks for the calibration document
     ch_result = await db.execute(
         select(DocumentChunk).where(DocumentChunk.document_id == session.document_id)
     )
     chunks = ch_result.scalars().all()
     chunk_word_counts = {c.id: len(c.text.split()) for c in chunks if c.text}
 
-    # Compute baseline
-    baseline_data = compute_baseline(batches, chunk_word_counts, duration)
+    # Total words = entire calibration text (user reads all of it).
+    # Prefer DB chunk word counts; fall back to reading the txt file directly.
+    total_words: int = sum(chunk_word_counts.values())
+    if total_words == 0 and _CALIB_TXT.exists():
+        total_words = len(_CALIB_TXT.read_text(encoding="utf-8").split())
+
+    # Compute baseline — pass total_words so WPM = total_words / duration_min
+    baseline_data = compute_baseline(batches, chunk_word_counts, duration, total_words)
 
     # Upsert UserBaseline
     now = datetime.now(timezone.utc)

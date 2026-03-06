@@ -4,18 +4,15 @@ import { useAuth } from "../contexts/AuthContext";
 import { useTelemetry } from "../hooks/useTelemetry";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { sessionService, type Session } from "../services/sessionService";
+import { apiRequest } from "../services/apiClient";
 
 const DEV = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV ?? false;
 const CALIB_MIN_SECONDS = 10;
 
-// The calibration text — hardcoded so it always renders regardless of any API state.
-const CALIB_PARAGRAPHS = [
-  `When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors. These take the shape of a long round arch, with its path high above, and its two ends apparently beyond the horizon. There is, according to legend, a boiling pot of gold at one end. People look, but no one ever finds it. When a man looks for something beyond his reach, his friends say he is looking for the pot of gold at the end of the rainbow.`,
-
-  `Throughout the centuries people have explained the rainbow in various ways. Some have accepted it as a miracle without physical explanation. To the Hebrews it was a token that there would be no more universal floods. The Greeks used to imagine that it was a sign from the gods to foretell war or heavy rain. The Norsemen considered the rainbow as a bridge over which the gods passed from earth to their home in the sky. Others have tried to explain the phenomenon physically. Aristotle thought that the rainbow was caused by reflection of the sun's rays by the rain. Since then physicists have found that it is not reflection, but refraction by the raindrops which causes the rainbows. Many complicated ideas about the rainbow have been formed.`,
-
-  `The difference in the rainbow depends considerably upon the size of the drops, and the width of the colored band increases as the size of the drops increases. The actual primary rainbow observed is said to be the effect of super-imposition of a number of bows. If the red of the second bow falls upon the green of the first, the result is to give a bow with an abnormally wide yellow band, since red and green light when mixed form yellow. This is a very common type of bow, one showing mainly red and yellow, with little or no green or blue.`,
-];
+interface CalibrationContent {
+  paragraphs: string[];
+  total_words: number;
+}
 
 // ─── Timer ────────────────────────────────────────────────────────────────────
 
@@ -57,15 +54,18 @@ export function CalibrationReaderPage() {
   const navigate = useNavigate();
 
   const [session, setSession] = useState<Session | null>(null);
+  const [paragraphs, setParagraphs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [calibDone, setCalibDone] = useState(false);
   const [baseline, setBaseline] = useState<BaselineData | null>(null);
   const contentRef = useRef<HTMLElement>(null);
 
-  // Fetch session info (for timer start time & status only)
+  // Fetch session info (for timer) and text content (from the .txt file via backend)
   useEffect(() => {
     if (!token || !sessionId) return;
+
+    // Session info for timer
     sessionService
       .list(token)
       .then(({ sessions }) => {
@@ -74,6 +74,15 @@ export function CalibrationReaderPage() {
         else setError("Session not found.");
       })
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load session"));
+
+    // Calibration text — read live from callibration.txt via the backend
+    apiRequest<CalibrationContent>(`/calibration/session/${sessionId}`, { token })
+      .then(({ paragraphs: ps }) => {
+        if (ps && ps.length > 0) setParagraphs(ps);
+      })
+      .catch(() => {
+        // Silently ignore — paragraphs stay empty (no text shown, error banner already handled above)
+      });
   }, [token, sessionId]);
 
   const isActive = !calibDone && session?.status === "active";
@@ -141,17 +150,21 @@ export function CalibrationReaderPage() {
       {/* Scrollable reading area */}
       <main style={s.content} ref={contentRef}>
         <div style={s.doc}>
-          {CALIB_PARAGRAPHS.map((para, i) => (
-            <p
-              key={i}
-              style={s.para}
-              data-paragraph-id={`calib-${i}`}
-              data-word-count={para.split(" ").length}
-              data-chunk-index={i}
-            >
-              {para}
-            </p>
-          ))}
+          {paragraphs.length === 0 ? (
+            <p style={{ color: "#888", fontSize: 14 }}>Loading text…</p>
+          ) : (
+            paragraphs.map((para, i) => (
+              <p
+                key={i}
+                style={s.para}
+                data-paragraph-id={`calib-${i}`}
+                data-word-count={para.split(" ").length}
+                data-chunk-index={i}
+              >
+                {para}
+              </p>
+            ))
+          )}
         </div>
       </main>
 
