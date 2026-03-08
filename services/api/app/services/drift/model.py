@@ -1,25 +1,54 @@
 """
-Pure drift-score mathematics — Phase 7.
+Hybrid drift model — Phase 7 (stabilized, bidirectional beta).
 
-All functions are side-effect-free and unit-testable.
+Mathematical foundation
+-----------------------
+Attention follows an exponential decay:
 
-Model summary
--------------
-1. Z-score normalise window features against the user's calibration baseline.
-   Each z_pos is capped at 2.0 to prevent any single signal from dominating.
-2. Compute beta_raw as a weighted sum of positive deviations.
-3. Apply beta EMA: beta_ema = 0.20 * beta_raw + 0.80 * prev_beta_ema
-   (smooths transient spikes).
-4. Apply confidence gating: beta_gated = lerp(beta0, beta_ema, confidence)
-   (near beta0 during warm-up; full beta once window is saturated).
-5. A(t) = exp(-beta_gated * t_minutes)
-6. drift_score = 1 - A(t)
-7. drift_ema = 0.25 * drift_score + 0.75 * prev_ema
+    A(t) = exp(-beta_effective * t)
+    drift_score = 1 - A(t)
 
-Calibrated expected drift curves (beta0 = 0.03):
-  Perfect focus:          beta ≈ 0.03–0.07  → drift_ema < 0.25 at 5 min
-  Mild distraction:       beta ≈ 0.10–0.20  → drift_ema ≈ 0.40 at 5 min
-  Heavy distraction:      beta ≈ 0.30–0.60  → drift_ema ≈ 0.70+ at 5 min
+This guarantees:
+- drift is NEVER permanently at 0 (it grows naturally with time-on-task)
+- drift can DECREASE if beta drops below the current value (re-engagement)
+- drift grows faster when beta_effective is higher (distraction/instability)
+
+Beta modulation
+---------------
+beta_effective is computed every window cycle:
+
+    beta_raw = beta0
+             + confidence * W_DISRUPT * disruption_score
+             - confidence * W_ENGAGE  * engagement_score
+
+    beta_effective = clamp(beta_raw, BETA_MIN, BETA_MAX)
+    beta_ema       = BETA_EMA_ALPHA * beta_effective + (1 - BETA_EMA_ALPHA) * prev_beta_ema
+
+Then:
+    drift_score = 1 - exp(-beta_ema * elapsed_minutes)
+    drift_ema   = EMA_ALPHA * drift_score + (1 - EMA_ALPHA) * prev_ema
+
+Disruption/engagement scoring
+------------------------------
+disruption_score ∈ [0,1]  — sigmoid of weighted z-score sum
+    rises when: idle spikes, focus lost, stagnation, regress, jitter, skimming
+engagement_score ∈ [0,1]  — multiplicative calm × pace-alignment
+    rises when: calm (low idle + focus), pace near baseline, progress markers
+
+Skimming detection
+------------------
+Skimming (pace_ratio > SKIM_THRESHOLD) fires two signals simultaneously:
+  z_pace  — symmetric too-fast/too-slow deviation
+  z_skim  — asymmetric extra boost for pace_ratio > 1.3 (reading too fast)
+This ensures fast scrolling through many paragraphs is always detected,
+even when other metrics (idle, focus) look normal.
+
+Expected drift curves (typical calibrated user)
+-----------------------------------------------
+Focused reading:    beta ≈ 0.03 → drift 21% at 3 min, 26% at 10 min
+Mild distraction:   beta ≈ 0.12 → drift 30% at 3 min, 70% at 10 min
+Heavy distraction:  beta ≈ 0.48 → drift 62% at 2 min, 78% at 3 min
+Skimming (1.7×):    beta ≈ 0.19 → drift 43% at 3 min, 61% at 5 min
 """
 
 from __future__ import annotations
@@ -29,40 +58,41 @@ from typing import Any
 
 from app.services.drift.types import DriftResult, WindowFeatures, ZScores
 
-# ── Tunable model constants ───────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-# Natural decay rate when the reader is perfectly focused.
-# At beta0=0.03 and t=10 min: A = exp(-0.30) = 0.74 → drift ≈ 26 %.
+# Natural time-on-task decay rate (drift at baseline is ~3% at 1 min, ~21% at 8 min)
 BETA0: float = 0.03
+BETA_MIN: float = 0.02    # floor: even perfect engagement can't eliminate decay
+BETA_MAX: float = 0.65    # ceiling: extreme distraction
+BETA_EMA_ALPHA: float = 0.10   # slow EMA for stable beta; 90% there in ~1 min
 
-# Weights — each term contributes at most W * 2.0 to beta
-# (z_pos is capped at 2.0).  Max possible addition per term shown in comment.
-W_IDLE: float = 0.10        # max +0.20
-W_FOCUS_LOSS: float = 0.15  # max +0.30
-W_JITTER: float = 0.05      # max +0.10
-W_REGRESS: float = 0.04     # max +0.08
-W_PAUSE: float = 0.04       # max +0.08
-W_STAGNATION: float = 0.05  # max +0.10
-W_MOUSE: float = 0.03       # max +0.06 (only when mouse is active)
-W_PACE: float = 0.10        # max +0.20 (only when pace_available)
+# Beta modulation weights
+W_DISRUPT: float = 0.50   # disruption_score × this → added to beta (max +0.50)
+W_ENGAGE: float = 0.18    # engagement_score × this → subtracted from beta (max -0.18)
 
-# Max raw beta before clamping (sum of beta0 + all max contributions):
-# 0.03 + 0.20 + 0.30 + 0.10 + 0.08 + 0.08 + 0.10 + 0.06 + 0.20 = 1.15
-BETA_MIN: float = 0.02
-BETA_MAX: float = 0.60      # conservative cap; prevents runaway at high t
-
-# Beta EMA — smooths transient spikes (5-window time constant)
-BETA_EMA_ALPHA: float = 0.20
-
-# Drift score EMA
+# Drift display smoothing
 EMA_ALPHA: float = 0.25
 
-# Pace z-score scale: 0.35 nats ≈ 1.4× speed deviation → z = 1.0
-# A 2× deviation (log(2)≈0.693) → z ≈ 2.0 (capped)
-PACE_SCALE: float = 0.35
+# Z-score cap per signal term
+Z_POS_CAP: float = 3.0
 
-# Cap for all z_pos terms — prevents any single signal from overwhelming beta
-Z_POS_CAP: float = 2.0
+# Disruption sigmoid parameters: sigmoid((raw - CENTER) / SCALE)
+DISRUPT_CENTER: float = 0.35
+DISRUPT_SCALE: float = 0.25
+
+# Skimming thresholds
+SKIM_THRESHOLD: float = 1.3   # pace_ratio > this triggers asymmetric skimming signal
+SKIM_SCALE: float = 0.5       # (pace_ratio - 1) / this → z_skim
+
+# Disruption component weights (W_D_X × z_X → disruption_raw)
+W_D_IDLE: float = 0.10
+W_D_FOCUS: float = 0.12
+W_D_STAGNATION: float = 0.08
+W_D_JITTER: float = 0.06
+W_D_REGRESS: float = 0.07
+W_D_PACE: float = 0.15
+W_D_SKIM: float = 0.18    # asymmetric: only fires when pace_ratio > SKIM_THRESHOLD
+W_D_BURSTINESS: float = 0.05
 
 _EPS: float = 1e-5
 
@@ -71,7 +101,6 @@ _EPS: float = 1e-5
 
 
 def z_score(value: float, mean: float, std: float, clip: float = Z_POS_CAP) -> float:
-    """Standard z-score clamped to [-clip, +clip]."""
     z = (value - mean) / (std + _EPS)
     return max(-clip, min(clip, z))
 
@@ -81,20 +110,22 @@ def z_pos(value: float, mean: float, std: float) -> float:
     return max(0.0, z_score(value, mean, std))
 
 
+def _sigmoid(raw: float, center: float, scale: float) -> float:
+    x = max(-50.0, min(50.0, (raw - center) / (scale + _EPS)))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 # ── Z-score bundle ────────────────────────────────────────────────────────────
 
 
-def compute_z_scores(
-    features: WindowFeatures,
-    baseline: dict[str, Any],
-) -> ZScores:
+def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZScores:
     """
-    Map window features → normalized deviations using the user baseline.
+    Normalize window features against the user's calibration baseline.
 
-    Signal-specific notes:
-    - z_mouse is 0 when mouse_path_px_mean < threshold (stationary = not applicable).
-    - z_pace is 0 when pace_available is False (insufficient evidence).
-    - z_stagnation fires only when a single paragraph dominates >80 % of the window.
+    Key behaviour:
+    - z_mouse is 0 when mouse is stationary (< 10 px path) — not a distraction signal.
+    - z_pace and z_skim are 0 when pace_available is False.
+    - z_stagnation uses a personalized expected mean from para_dwell_median_s.
     """
     b = baseline
 
@@ -104,11 +135,7 @@ def compute_z_scores(
         max(b.get("idle_ratio_std", 0.08), 0.04),
     )
 
-    z_focus = z_pos(
-        features.focus_loss_rate,
-        0.0,
-        0.08,  # small std: any blur is above mean
-    )
+    z_focus = z_pos(features.focus_loss_rate, 0.0, 0.08)
 
     z_jitter = z_pos(
         features.scroll_jitter_mean,
@@ -128,29 +155,39 @@ def compute_z_scores(
         max(b.get("idle_seconds_std", 1.0), 0.5),
     )
 
-    z_stagnation = z_pos(
-        features.paragraph_stagnation,
-        0.0,
-        0.15,
+    # Stagnation: personalized expected fraction from para_dwell_median_s
+    stagnation_mu = min(max(b.get("para_dwell_median_s", 10.0) / 30.0, 0.05), 0.80)
+    z_stagnation = z_pos(features.stagnation_ratio, stagnation_mu, 0.15)
+
+    # Mouse: skip when stationary
+    z_mouse_val = (
+        0.0
+        if features.mouse_path_px_mean < 10.0
+        else z_pos(0.70 - features.mouse_efficiency_mean, 0.0, 0.15)
     )
 
-    # Mouse efficiency: skip entirely when mouse is not moving.
-    # An inactive mouse during reading is normal and carries no drift signal.
-    if features.mouse_path_px_mean < 10.0:
-        z_mouse_val = 0.0
-    else:
-        baseline_mouse_eff = 0.70
-        z_mouse_val = z_pos(
-            baseline_mouse_eff - features.mouse_efficiency_mean,
-            0.0,
-            0.15,
-        )
-
-    # Pace: only when pace_available (>= 2 paragraphs, >= 10 s effective).
+    # Pace: gated
     if not features.pace_available:
         z_pace_val = 0.0
     else:
-        z_pace_val = min(Z_POS_CAP, features.pace_dev / (PACE_SCALE + _EPS))
+        pace_scale = min(
+            max(
+                b.get("para_dwell_iqr_s", 5.0)
+                / max(b.get("para_dwell_median_s", 10.0), _EPS),
+                0.15,
+            ),
+            0.60,
+        )
+        z_pace_val = min(Z_POS_CAP, features.pace_dev / (pace_scale + _EPS))
+
+    # Skimming asymmetric signal
+    z_skim_val = (
+        min(Z_POS_CAP, (features.pace_ratio - 1.0) / SKIM_SCALE)
+        if features.pace_available and features.pace_ratio > SKIM_THRESHOLD
+        else 0.0
+    )
+
+    z_burstiness = z_pos(features.scroll_burstiness, 1.0, 0.5)
 
     return ZScores(
         z_idle=z_idle,
@@ -161,86 +198,160 @@ def compute_z_scores(
         z_stagnation=z_stagnation,
         z_mouse=z_mouse_val,
         z_pace=z_pace_val,
+        z_skim=z_skim_val,
+        z_burstiness=z_burstiness,
     )
 
 
-# ── Beta effective ────────────────────────────────────────────────────────────
+# ── Disruption score ──────────────────────────────────────────────────────────
 
 
-def compute_beta_raw(z: ZScores) -> tuple[float, dict[str, float]]:
+def compute_disruption_score(
+    z: ZScores,
+    baseline: dict[str, Any],
+) -> tuple[float, dict[str, float]]:
     """
-    Weighted sum of normalised deviations → raw decay rate.
+    Compute disruption_score ∈ [0,1] via sigmoid of weighted z-score sum.
+    Returns (score, per-term breakdown dict).
 
-    Returns (beta_raw, components) where components documents each term's
-    contribution for the debug endpoint.
+    Higher-variance baseline signals get slightly down-weighted (the user is
+    naturally variable, so we're less surprised by deviations).
     """
-    components = {
-        "beta0": BETA0,
-        "idle":       W_IDLE       * z.z_idle,
-        "focus_loss": W_FOCUS_LOSS * z.z_focus_loss,
-        "jitter":     W_JITTER     * z.z_jitter,
-        "regress":    W_REGRESS    * z.z_regress,
-        "pause":      W_PAUSE      * z.z_pause,
-        "stagnation": W_STAGNATION * z.z_stagnation,
-        "mouse":      W_MOUSE      * z.z_mouse,
-        "pace":       W_PACE       * z.z_pace,
+
+    def _adj(base_w: float, std_key: str, mean_key: str) -> float:
+        std = baseline.get(std_key, 0.0)
+        mu = max(abs(baseline.get(mean_key, 0.01)), 0.01)
+        return base_w / (1.0 + min(std / mu, 2.0))
+
+    w_idle = _adj(W_D_IDLE, "idle_ratio_std", "idle_ratio_mean")
+    w_jitter = _adj(W_D_JITTER, "scroll_jitter_std", "scroll_jitter_mean")
+    w_regress = _adj(W_D_REGRESS, "regress_rate_std", "regress_rate_mean")
+
+    components: dict[str, float] = {
+        "idle":        w_idle         * z.z_idle,
+        "focus_loss":  W_D_FOCUS      * z.z_focus_loss,
+        "stagnation":  W_D_STAGNATION * z.z_stagnation,
+        "jitter":      w_jitter       * z.z_jitter,
+        "regress":     w_regress      * z.z_regress,
+        "pace":        W_D_PACE       * z.z_pace,
+        "skim":        W_D_SKIM       * z.z_skim,
+        "burstiness":  W_D_BURSTINESS * z.z_burstiness,
     }
-    beta = sum(components.values())
-    return max(BETA_MIN, min(BETA_MAX, beta)), components
+    disruption_raw = sum(components.values())
+    score = _sigmoid(disruption_raw, DISRUPT_CENTER, DISRUPT_SCALE)
+    components["disruption_raw"] = disruption_raw
+    components["disruption_score"] = score
+    return score, components
 
 
-def apply_beta_ema(beta_raw: float, prev_beta_ema: float) -> float:
+# ── Engagement score ──────────────────────────────────────────────────────────
+
+
+def compute_engagement_score(z: ZScores, features: WindowFeatures) -> float:
     """
-    Smooth beta over time: beta_ema = alpha * raw + (1 - alpha) * prev.
-    This prevents large single-window spikes from immediately inflating drift.
+    Compute engagement_score ∈ [0,1] using a multiplicative model.
+
+    engagement = calm × (0.80 × pace_align + marker_boost)
+
+    calm       = (1 - z_idle/CAP) × (1 - z_focus_loss/CAP)
+    pace_align = 1 - max(z_pace, z_skim)/CAP   if pace_available else 0.5 (neutral)
+
+    The multiplicative design ensures:
+    - Skimming (bad pace_align) → engagement reduced even when calm is high
+    - Distracted (calm → 0) → engagement → 0 regardless of pace
+    - Focused steady reading → engagement ≈ 0.4 (moderate: no pace available yet)
+    - Focused + on-pace → engagement ≈ 0.7
     """
-    return BETA_EMA_ALPHA * beta_raw + (1.0 - BETA_EMA_ALPHA) * prev_beta_ema
+    calm = (
+        (1.0 - min(z.z_idle / Z_POS_CAP, 1.0))
+        * (1.0 - min(z.z_focus_loss / Z_POS_CAP, 1.0))
+    )
+
+    if features.pace_available:
+        worst_pace_z = max(z.z_pace, z.z_skim)
+        pace_align = 1.0 - min(worst_pace_z / Z_POS_CAP, 1.0)
+    else:
+        pace_align = 0.5  # neutral when no evidence yet
+
+    progress_boost = min(1.0, features.progress_markers_count / 2.0)
+    score = calm * (0.80 * pace_align + 0.20 * progress_boost)
+    return min(1.0, max(0.0, score))
 
 
-def apply_confidence_gating(beta_ema: float, confidence: float) -> float:
+# ── Beta computation ──────────────────────────────────────────────────────────
+
+
+def compute_beta_raw(
+    disruption_score: float,
+    engagement_score: float,
+    confidence: float,
+) -> float:
     """
-    Linearly interpolate between beta0 (low confidence) and beta_ema (full confidence).
+    Compute beta_raw from disruption, engagement, and confidence gating.
 
-    During warm-up (first ~30 s of data) beta stays near beta0 regardless of signals.
+    beta_raw = beta0
+             + confidence * W_DISRUPT * disruption_score
+             - confidence * W_ENGAGE  * engagement_score
     """
-    return BETA0 * (1.0 - confidence) + beta_ema * confidence
+    beta = BETA0 + confidence * W_DISRUPT * disruption_score - confidence * W_ENGAGE * engagement_score
+    return min(max(beta, BETA_MIN), BETA_MAX)
 
 
-# ── Attention and drift ───────────────────────────────────────────────────────
+def apply_beta_ema(beta_effective: float, prev_beta_ema: float) -> float:
+    """Exponential moving average for beta to smooth transient spikes."""
+    return BETA_EMA_ALPHA * beta_effective + (1.0 - BETA_EMA_ALPHA) * prev_beta_ema
 
 
-def compute_attention(beta: float, elapsed_minutes: float) -> float:
-    """A(t) = exp(-beta * t).  Always in (0, 1]."""
-    return math.exp(-beta * max(0.0, elapsed_minutes))
+def compute_attention(beta: float, t_minutes: float) -> float:
+    return math.exp(-beta * max(t_minutes, 0.0))
 
 
 def compute_drift(attention: float) -> float:
-    """drift_score = 1 - A(t), always in [0, 1)."""
     return 1.0 - attention
-
-
-def update_ema(drift_score: float, prev_ema: float, alpha: float = EMA_ALPHA) -> float:
-    """drift_ema = alpha * drift + (1 - alpha) * prev_ema."""
-    return alpha * drift_score + (1.0 - alpha) * prev_ema
 
 
 # ── Confidence ────────────────────────────────────────────────────────────────
 
 
 def compute_confidence(n_batches: int, full_window: int = 15) -> float:
-    """min(1.0, n_batches / full_window).  30 s window at 2 s/batch = 15 batches."""
     return min(1.0, n_batches / max(full_window, 1))
+
+
+# ── EMA helpers ───────────────────────────────────────────────────────────────
+
+
+def update_ema(value: float, prev_ema: float, alpha: float = EMA_ALPHA) -> float:
+    return alpha * value + (1.0 - alpha) * prev_ema
 
 
 # ── Elapsed time helper ───────────────────────────────────────────────────────
 
 
 def elapsed_minutes_from_seconds(elapsed_seconds: float) -> float:
-    """Deterministic helper: seconds → minutes, asserted unit conversion."""
     return elapsed_seconds / 60.0
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Personalized rate helper (kept for test compat, not used in main model) ───
+
+
+def personalized_rates(baseline: dict[str, Any]) -> tuple[float, float]:
+    """
+    Returns (up_rate, down_rate) adjusted for user variability.
+    Kept for backward compatibility; the main model uses W_DISRUPT/W_ENGAGE.
+    """
+    from app.services.drift.model import W_DISRUPT, W_ENGAGE
+    var_factor = min(max(
+        baseline.get("idle_ratio_std", 0.05)
+        + baseline.get("scroll_jitter_std", 0.05)
+        + baseline.get("regress_rate_std", 0.03),
+        0.01,
+    ), 0.50)
+    up_rate = W_DISRUPT * max(0.50, 1.0 - var_factor)
+    down_rate = W_ENGAGE * max(0.70, 1.0 - 0.5 * var_factor)
+    return up_rate, down_rate
+
+
+# ── Main entry point ─────────────────────────────────────────────────────────
 
 
 def compute_drift_result(
@@ -251,44 +362,68 @@ def compute_drift_result(
     prev_beta_ema: float = BETA0,
 ) -> DriftResult:
     """
-    Full pipeline: features → z-scores → beta → EMA → gating → attention → drift.
+    Full drift pipeline: exponential decay model with disruption/engagement
+    modulating the decay rate.
 
     Parameters
     ----------
-    features:
-        Extracted from the current rolling window.
-    baseline:
-        User's baseline_json (may be {} if calibration not done yet).
-    elapsed_minutes:
-        Session elapsed time in MINUTES (wall clock from started_at).
-    prev_ema:
-        Previous drift_ema value (0.0 at session start).
-    prev_beta_ema:
-        Previous smoothed beta (defaults to BETA0 at session start).
+    features:       Extracted from the current 30-second rolling window.
+    baseline:       User's baseline_json (may be {} if uncalibrated).
+    elapsed_minutes: Session elapsed time (from started_at); drives the exp decay.
+    prev_ema:       Previous drift_ema (0.0 at session start).
+    prev_beta_ema:  Previous smoothed beta (BETA0 at session start).
+
+    Returns
+    -------
+    DriftResult with:
+    - drift_level  = 1 - exp(-beta_ema * t)   [primary, always > 0 for t > 0]
+    - drift_ema    = EMA(drift_level, prev_ema) [smoothed for UI]
+    - beta_ema     = smoothed beta (pass back as prev_beta_ema next cycle)
+    - disruption_score, engagement_score       [informational, debug]
     """
     z = compute_z_scores(features, baseline)
-    beta_raw, components = compute_beta_raw(z)
-    beta_ema = apply_beta_ema(beta_raw, prev_beta_ema)
+    disruption_score, components = compute_disruption_score(z, baseline)
+    engagement_score = compute_engagement_score(z, features)
     confidence = compute_confidence(features.n_batches)
-    beta_gated = apply_confidence_gating(beta_ema, confidence)
 
-    attention = compute_attention(beta_gated, elapsed_minutes)
-    drift = compute_drift(attention)
-    ema = update_ema(drift, prev_ema)
+    # Beta: baseline decay + disruption boost - engagement dampening
+    beta_effective = compute_beta_raw(disruption_score, engagement_score, confidence)
 
-    # Add summary fields to components for debug readability
-    components["beta_raw"] = beta_raw
-    components["beta_ema"] = beta_ema
-    components["confidence"] = confidence
-    components["beta_gated"] = beta_gated
+    # Smooth beta with slow EMA (prevents single-window spikes from over-driving drift)
+    beta_ema = apply_beta_ema(beta_effective, prev_beta_ema)
+
+    # Exponential attention decay
+    attention = compute_attention(beta_ema, elapsed_minutes)
+    drift_level = compute_drift(attention)
+
+    # EMA-smooth drift for stable UI display
+    drift_ema = update_ema(drift_level, prev_ema)
+
+    # Build debug component dict
+    components.update({
+        "beta0": BETA0,
+        "beta_effective": beta_effective,
+        "beta_ema": beta_ema,
+        "W_DISRUPT_x_disruption": W_DISRUPT * confidence * disruption_score,
+        "W_ENGAGE_x_engagement": W_ENGAGE * confidence * engagement_score,
+        "engagement_score": engagement_score,
+        "confidence": confidence,
+        "elapsed_minutes": elapsed_minutes,
+    })
 
     return DriftResult(
-        beta_effective=beta_gated,
+        drift_level=drift_level,
+        drift_ema=drift_ema,
+        disruption_score=disruption_score,
+        engagement_score=engagement_score,
+        confidence=confidence,
+        pace_ratio=features.pace_ratio if features.pace_available else None,
+        pace_available=features.pace_available,
+        # Legacy compat fields
+        beta_effective=beta_effective,
         beta_ema=beta_ema,
         attention_score=attention,
-        drift_score=drift,
-        drift_ema=ema,
-        confidence=confidence,
+        drift_score=drift_level,
         beta_components=components,
         features=features,
         z_scores=z,

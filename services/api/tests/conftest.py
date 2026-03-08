@@ -67,13 +67,16 @@ def init_test_db() -> None:
                     "ADD COLUMN IF NOT EXISTS is_calibration BOOLEAN NOT NULL DEFAULT FALSE"
                 )
             )
-        async with eng.begin() as c:
-            await c.execute(
-                text(
-                    "ALTER TABLE session_drift_states "
-                    "ADD COLUMN IF NOT EXISTS beta_ema DOUBLE PRECISION NOT NULL DEFAULT 0.03"
+        for col_sql in [
+            "ADD COLUMN IF NOT EXISTS beta_ema DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS drift_level DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS disruption_score DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS engagement_score DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        ]:
+            async with eng.begin() as c:
+                await c.execute(
+                    text(f"ALTER TABLE session_drift_states {col_sql}")
                 )
-            )
         async with eng.begin() as c:
             await c.execute(
                 text(

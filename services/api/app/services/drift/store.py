@@ -32,22 +32,28 @@ async def upsert_drift_state(
     if row is None:
         row = SessionDriftState(
             session_id=session_id,
+            drift_level=result.drift_level,
+            drift_ema=result.drift_ema,
+            disruption_score=result.disruption_score,
+            engagement_score=result.engagement_score,
             beta_effective=result.beta_effective,
             beta_ema=result.beta_ema,
             attention_score=result.attention_score,
             drift_score=result.drift_score,
-            drift_ema=result.drift_ema,
             confidence=result.confidence,
             last_window_ends_at=now,
             updated_at=now,
         )
         db.add(row)
     else:
+        row.drift_level = result.drift_level
+        row.drift_ema = result.drift_ema
+        row.disruption_score = result.disruption_score
+        row.engagement_score = result.engagement_score
         row.beta_effective = result.beta_effective
         row.beta_ema = result.beta_ema
         row.attention_score = result.attention_score
         row.drift_score = result.drift_score
-        row.drift_ema = result.drift_ema
         row.confidence = result.confidence
         row.last_window_ends_at = now
         row.updated_at = now

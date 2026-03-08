@@ -54,78 +54,117 @@ _BATCH = {
 class TestDriftModel:
     def test_pace_dev_symmetric(self) -> None:
         """pace_ratio 0.5 and 2.0 should produce the same pace_dev (|log|)."""
-        from app.services.drift.model import compute_drift_result
         from app.services.drift.types import WindowFeatures
 
         f_slow = WindowFeatures(n_batches=10, pace_ratio=0.5, pace_dev=abs(math.log(0.5)))
         f_fast = WindowFeatures(n_batches=10, pace_ratio=2.0, pace_dev=abs(math.log(2.0)))
         assert abs(f_slow.pace_dev - f_fast.pace_dev) < 1e-9
 
-    def test_beta_increases_with_high_idle(self) -> None:
-        """Higher idle_ratio → higher beta."""
-        from app.services.drift.model import compute_z_scores, compute_beta_raw
+    def test_disruption_increases_with_high_idle(self) -> None:
+        """Higher idle_ratio → higher disruption_score."""
+        from app.services.drift.model import compute_disruption_score, compute_z_scores
         from app.services.drift.types import WindowFeatures
 
         baseline = {"idle_ratio_mean": 0.05, "idle_ratio_std": 0.05}
-        f_low  = WindowFeatures(n_batches=10, idle_ratio_mean=0.05)
+        f_low = WindowFeatures(n_batches=10, idle_ratio_mean=0.05)
         f_high = WindowFeatures(n_batches=10, idle_ratio_mean=0.80)
-        beta_low,  _ = compute_beta_raw(compute_z_scores(f_low, baseline))
-        beta_high, _ = compute_beta_raw(compute_z_scores(f_high, baseline))
-        assert beta_high > beta_low
+        d_low, _ = compute_disruption_score(compute_z_scores(f_low, baseline), baseline)
+        d_high, _ = compute_disruption_score(compute_z_scores(f_high, baseline), baseline)
+        assert d_high > d_low
 
-    def test_beta_increases_with_high_jitter(self) -> None:
-        from app.services.drift.model import compute_z_scores, compute_beta_raw
+    def test_disruption_increases_with_high_jitter(self) -> None:
+        from app.services.drift.model import compute_disruption_score, compute_z_scores
         from app.services.drift.types import WindowFeatures
 
         baseline = {"scroll_jitter_mean": 0.10, "scroll_jitter_std": 0.05}
-        b_low,  _ = compute_beta_raw(compute_z_scores(WindowFeatures(n_batches=5, scroll_jitter_mean=0.10), baseline))
-        b_high, _ = compute_beta_raw(compute_z_scores(WindowFeatures(n_batches=5, scroll_jitter_mean=0.80), baseline))
-        assert b_high > b_low
+        d_low, _ = compute_disruption_score(
+            compute_z_scores(WindowFeatures(n_batches=5, scroll_jitter_mean=0.10), baseline),
+            baseline,
+        )
+        d_high, _ = compute_disruption_score(
+            compute_z_scores(WindowFeatures(n_batches=5, scroll_jitter_mean=0.80), baseline),
+            baseline,
+        )
+        assert d_high > d_low
 
-    def test_beta_increases_with_high_focus_loss(self) -> None:
-        from app.services.drift.model import compute_z_scores, compute_beta_raw
+    def test_disruption_increases_with_focus_loss(self) -> None:
+        from app.services.drift.model import compute_disruption_score, compute_z_scores
         from app.services.drift.types import WindowFeatures
 
-        b_low,  _ = compute_beta_raw(compute_z_scores(WindowFeatures(n_batches=5, focus_loss_rate=0.0), {}))
-        b_high, _ = compute_beta_raw(compute_z_scores(WindowFeatures(n_batches=5, focus_loss_rate=1.0), {}))
-        assert b_high > b_low
+        d_low, _ = compute_disruption_score(
+            compute_z_scores(WindowFeatures(n_batches=5, focus_loss_rate=0.0), {}), {}
+        )
+        d_high, _ = compute_disruption_score(
+            compute_z_scores(WindowFeatures(n_batches=5, focus_loss_rate=1.0), {}), {}
+        )
+        assert d_high > d_low
 
-    def test_beta_increases_with_high_regress(self) -> None:
-        from app.services.drift.model import compute_z_scores, compute_beta_raw
+    def test_disruption_increases_with_high_regress(self) -> None:
+        from app.services.drift.model import compute_disruption_score, compute_z_scores
         from app.services.drift.types import WindowFeatures
 
         baseline = {"regress_rate_mean": 0.05, "regress_rate_std": 0.05}
-        b_low,  _ = compute_beta_raw(compute_z_scores(WindowFeatures(n_batches=5, regress_rate_mean=0.05), baseline))
-        b_high, _ = compute_beta_raw(compute_z_scores(WindowFeatures(n_batches=5, regress_rate_mean=0.50), baseline))
-        assert b_high > b_low
+        d_low, _ = compute_disruption_score(
+            compute_z_scores(WindowFeatures(n_batches=5, regress_rate_mean=0.05), baseline),
+            baseline,
+        )
+        d_high, _ = compute_disruption_score(
+            compute_z_scores(WindowFeatures(n_batches=5, regress_rate_mean=0.50), baseline),
+            baseline,
+        )
+        assert d_high > d_low
 
-    def test_beta_clamps_within_range(self) -> None:
-        from app.services.drift.model import compute_beta_raw, BETA_MIN, BETA_MAX
+    def test_disruption_bounded_zero_to_one(self) -> None:
+        from app.services.drift.model import compute_disruption_score
         from app.services.drift.types import ZScores
 
         z_zero = ZScores()
-        z_max  = ZScores(z_idle=3, z_focus_loss=3, z_jitter=3, z_regress=3,
-                         z_pause=3, z_stagnation=3, z_mouse=3, z_pace=3)
-        beta_zero, _ = compute_beta_raw(z_zero)
-        beta_max,  _ = compute_beta_raw(z_max)
-        assert beta_zero >= BETA_MIN
-        assert beta_max  <= BETA_MAX
+        z_max = ZScores(z_idle=3, z_focus_loss=3, z_jitter=3, z_regress=3,
+                        z_pause=3, z_stagnation=3, z_mouse=3, z_pace=3, z_skim=3)
+        d_zero, _ = compute_disruption_score(z_zero, {})
+        d_max, _ = compute_disruption_score(z_max, {})
+        assert 0.0 <= d_zero <= 1.0
+        assert 0.0 <= d_max <= 1.0
 
-    def test_drift_increases_with_time(self) -> None:
-        from app.services.drift.model import compute_attention, compute_drift
+    def test_drift_level_increases_with_distraction(self) -> None:
+        """
+        Distracted features should drive drift_level up over time.
 
-        beta = 0.20
-        d_early = compute_drift(compute_attention(beta, 1.0))
-        d_late  = compute_drift(compute_attention(beta, 10.0))
-        assert d_late > d_early
+        With the exponential model (drift = 1-exp(-beta_ema * t)), passing
+        increasing elapsed_minutes with a high-disruption feature set should
+        produce clearly elevated drift.
+        """
+        from app.services.drift.model import BETA0, compute_drift_result
+        from app.services.drift.types import WindowFeatures
 
-    def test_drift_increases_with_higher_beta(self) -> None:
-        from app.services.drift.model import compute_attention, compute_drift
+        distracted = WindowFeatures(n_batches=15, idle_ratio_mean=0.9, focus_loss_rate=1.0)
+        prev_beta_ema = BETA0
+        prev_ema = 0.0
+        result = None
+        for i in range(30):
+            elapsed = (i + 1) * 2.0 / 60.0
+            result = compute_drift_result(distracted, {}, elapsed, prev_ema, prev_beta_ema)
+            prev_beta_ema = result.beta_ema
+            prev_ema = result.drift_ema
+        assert result is not None
+        assert result.drift_level > 0.3
 
-        t = 5.0
-        d_low  = compute_drift(compute_attention(0.06, t))
-        d_high = compute_drift(compute_attention(1.5, t))
-        assert d_high > d_low
+    def test_drift_level_decreases_with_engagement(self) -> None:
+        """
+        Engaged reading should lower beta_effective vs distracted, leading
+        to lower drift when elapsed time is the same.
+        """
+        from app.services.drift.model import BETA0, compute_drift_result
+        from app.services.drift.types import WindowFeatures
+
+        focused = WindowFeatures(n_batches=15, idle_ratio_mean=0.02, focus_loss_rate=0.0)
+        distracted = WindowFeatures(n_batches=15, idle_ratio_mean=0.90, focus_loss_rate=1.0)
+
+        r_f = compute_drift_result(focused, {}, 5.0, 0.0, BETA0)
+        r_d = compute_drift_result(distracted, {}, 5.0, 0.0, BETA0)
+        # Focused should produce lower beta and thus lower drift
+        assert r_f.beta_effective < r_d.beta_effective
+        assert r_f.drift_level < r_d.drift_level
 
     def test_ema_update_correct(self) -> None:
         from app.services.drift.model import update_ema, EMA_ALPHA
@@ -155,10 +194,11 @@ class TestDriftModel:
         f = WindowFeatures(n_batches=10, idle_ratio_mean=0.3, focus_loss_rate=0.2,
                            scroll_jitter_mean=0.2, pace_dev=0.3)
         r = compute_drift_result(f, {}, elapsed_minutes=5.0, prev_ema=0.0)
-        assert 0.0 < r.beta_effective <= 1.5
-        assert 0.0 < r.attention_score <= 1.0
-        assert 0.0 <= r.drift_score < 1.0
-        assert 0.0 <= r.drift_ema < 1.0
+        assert 0.0 <= r.disruption_score <= 1.0
+        assert 0.0 <= r.engagement_score <= 1.0
+        assert 0.0 <= r.attention_score <= 1.0
+        assert 0.0 <= r.drift_score <= 1.0
+        assert 0.0 <= r.drift_ema <= 1.0
         assert 0.0 <= r.confidence <= 1.0
 
 
@@ -284,8 +324,8 @@ class TestDriftIntegration:
                 select(SessionDriftState).where(SessionDriftState.session_id == sid)
             )).scalar_one_or_none()
         assert row is not None
-        assert 0.0 < row.beta_effective <= 1.5
-        assert 0.0 <= row.drift_score < 1.0
+        assert 0.0 <= row.disruption_score <= 1.0
+        assert 0.0 <= row.drift_score <= 1.0
 
     async def test_drift_endpoint_returns_200(
         self,
@@ -353,8 +393,8 @@ class TestDriftIntegration:
         resp = await api_client.get(f"/sessions/{sid}/drift", headers=auth_headers)
         assert resp.status_code == 200
         body = resp.json()
-        # With continuous blur + idle, drift should be non-trivial
-        assert body["beta_effective"] > 0.06  # above baseline beta0
+        # With continuous blur + idle, disruption should be clearly positive
+        assert body["disruption_score"] > 0.1
 
     async def test_drift_debug_blocked_without_debug_flag(
         self,

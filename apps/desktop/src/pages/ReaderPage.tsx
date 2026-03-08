@@ -418,9 +418,14 @@ function DriftMeter({
 
   const pct = Math.round(drift.drift_ema * 100);
   const color = driftColor(drift.drift_ema);
+  const disruptPct = Math.round((drift.disruption_score ?? 0) * 100);
+  const engagePct = Math.round((drift.engagement_score ?? 0) * 100);
 
   return (
-    <div className="drift-meter" title={`β=${drift.beta_effective.toFixed(3)} A=${drift.attention_score.toFixed(2)}`}>
+    <div
+      className="drift-meter"
+      title={`disruption=${disruptPct}% engagement=${engagePct}% level=${Math.round((drift.drift_level ?? drift.drift_score) * 100)}%`}
+    >
       <span className="drift-meter__label">Drift</span>
       <span className={`drift-meter__pill drift-meter__pill--${color}`}>
         {pct}%
@@ -464,12 +469,16 @@ function DriftDebugPanel({
     setLoading(false);
   };
 
-  // Top contributors: sort beta_components by value (descending), skip meta keys
+  // Top disruption contributors (skip meta/summary keys)
+  const META_KEYS = new Set([
+    "disruption_raw", "disruption_score", "up_rate", "down_rate",
+    "delta", "engagement_score", "confidence", "prev_drift_level",
+  ]);
   const topContribs = debug
     ? Object.entries(debug.beta_components)
-        .filter(([k]) => !["beta0", "beta_raw", "beta_ema", "confidence", "beta_gated"].includes(k))
-        .sort(([, a], [, b]) => b - a)
-        .slice(0, 3)
+        .filter(([k]) => !META_KEYS.has(k))
+        .sort(([, a], [, b]) => (b as number) - (a as number))
+        .slice(0, 4)
     : [];
 
   return (
@@ -487,19 +496,29 @@ function DriftDebugPanel({
           {debug && (
             <>
               <p><strong>baseline_used:</strong> {String(debug.baseline_used)}</p>
-              <p><strong>β_gated:</strong> {debug.beta_effective.toFixed(4)}
-                 &nbsp;β_raw:{debug.beta_raw.toFixed(4)}
-                 &nbsp;β_ema:{debug.beta_ema.toFixed(4)}</p>
-              <p><strong>confidence:</strong> {(debug.confidence * 100).toFixed(0)}%
-                 &nbsp;({debug.n_batches_in_window} batches)</p>
-              <p><strong>pace:</strong> avail={String(debug.pace_available)}
-                 &nbsp;ratio={debug.pace_ratio.toFixed(2)}
-                 &nbsp;dev={debug.pace_dev.toFixed(3)}</p>
+              <p>
+                <strong>drift_level:</strong> {((debug.drift_level ?? 0) * 100).toFixed(1)}%
+                &nbsp;<strong>drift_ema:</strong> {((debug.drift_ema ?? 0) * 100).toFixed(1)}%
+              </p>
+              <p>
+                <strong>disruption:</strong> {((debug.disruption_score ?? 0) * 100).toFixed(1)}%
+                &nbsp;<strong>engagement:</strong> {((debug.engagement_score ?? 0) * 100).toFixed(1)}%
+              </p>
+              <p>
+                <strong>confidence:</strong> {(debug.confidence * 100).toFixed(0)}%
+                &nbsp;({debug.n_batches_in_window} batches)
+              </p>
+              <p>
+                <strong>pace:</strong> avail={String(debug.pace_available)}
+                {debug.pace_ratio != null && <>&nbsp;ratio={debug.pace_ratio.toFixed(2)}</>}
+                &nbsp;dev={debug.pace_dev.toFixed(3)}
+                &nbsp;wpm={debug.window_wpm_effective.toFixed(0)}
+              </p>
               <p><strong>elapsed:</strong> {debug.elapsed_minutes.toFixed(2)} min</p>
-              <p><strong>top contributors to β:</strong></p>
+              <p><strong>top disruption drivers:</strong></p>
               <ul style={{ margin: 0, paddingLeft: 16 }}>
                 {topContribs.map(([k, v]) => (
-                  <li key={k}>{k}: {v.toFixed(4)}</li>
+                  <li key={k}>{k}: {(v as number).toFixed(4)}</li>
                 ))}
               </ul>
               <p><strong>z_scores:</strong></p>

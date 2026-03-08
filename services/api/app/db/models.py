@@ -297,9 +297,13 @@ class SessionDriftState(Base):
         ForeignKey("sessions.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    beta_effective: Mapped[float] = mapped_column(nullable=False, default=0.03)
-    # Smoothed beta — used as prev_beta_ema on the next cycle
-    beta_ema: Mapped[float] = mapped_column(nullable=False, default=0.03)
+    # Primary bidirectional drift state (Phase 7 stabilised)
+    drift_level: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    disruption_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    engagement_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    # Legacy / backward-compat fields (beta_effective = disruption_score proxy)
+    beta_effective: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    beta_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
     attention_score: Mapped[float] = mapped_column(nullable=False, default=1.0)
     drift_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
     drift_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)

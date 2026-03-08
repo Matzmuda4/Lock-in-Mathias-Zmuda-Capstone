@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
@@ -27,7 +27,7 @@ from app.db.session import get_db
 from app.services.drift.features import extract_features
 from app.services.drift.model import BETA0, compute_drift_result, elapsed_minutes_from_seconds
 from app.services.drift.store import get_drift_state, upsert_drift_state
-from app.services.drift.windowing import fetch_window
+from app.services.drift.windowing import fetch_progress_markers_count, fetch_window
 
 router = APIRouter(tags=["drift"])
 log = logging.getLogger(__name__)
@@ -42,40 +42,52 @@ class DriftStateResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     session_id: int
-    beta_effective: float
-    attention_score: float
-    drift_score: float
-    drift_ema: float
-    confidence: float
+    # Primary bidirectional state
+    drift_level: float = 0.0
+    drift_ema: float = 0.0
+    disruption_score: float = 0.0
+    engagement_score: float = 0.0
+    confidence: float = 0.0
+    # Legacy / compat
+    beta_effective: float = 0.0
+    attention_score: float = 1.0
+    drift_score: float = 0.0
+    # Optional pace info
+    pace_ratio: Optional[float] = None
+    pace_available: bool = False
     baseline_used: bool = False
     updated_at: datetime
 
 
 class DriftDebugResponse(BaseModel):
     """Full explainability payload — returned only when settings.debug=True."""
+
     session_id: int
     user_id: int
     baseline_used: bool
-    # Computed state
+    # Primary state
+    drift_level: float
+    drift_ema: float
+    disruption_score: float
+    engagement_score: float
+    confidence: float
+    # Legacy compat
     beta_effective: float
     beta_ema: float
-    beta_raw: float
     attention_score: float
     drift_score: float
-    drift_ema: float
-    confidence: float
     # Window metadata
     n_batches_in_window: int
     elapsed_minutes: float
     # Per-term breakdown
-    beta_components: dict[str, float]
-    z_scores: dict[str, float]
+    beta_components: dict[str, Any]
+    z_scores: dict[str, Any]
     # Extracted window features
     features: dict[str, Any]
-    # Baseline values actually used (for verification)
+    # Baseline values actually used
     baseline_snapshot: dict[str, Any]
     # Pace details
-    pace_ratio: float
+    pace_ratio: Optional[float]
     pace_dev: float
     pace_available: bool
     window_wpm_effective: float
@@ -92,7 +104,7 @@ async def _recompute_and_save(
     Fetch the rolling window, extract features, run the drift model,
     and upsert session_drift_states.  Returns the updated row.
 
-    This is called:
+    Called:
     - From activity.py after every POST /activity/batch (fast path).
     - From the drift GET endpoint when the row is stale.
     """
@@ -128,6 +140,7 @@ async def _recompute_and_save(
 
     # ── Rolling window ────────────────────────────────────────────────────────
     batches = await fetch_window(session.id, db)
+    progress_markers = await fetch_progress_markers_count(session.id, db)
 
     # ── Elapsed time (wall clock minutes from started_at) ─────────────────────
     now = datetime.now(timezone.utc)
@@ -137,14 +150,24 @@ async def _recompute_and_save(
     elapsed_s = max(0.0, (now - started).total_seconds())
     elapsed_min = elapsed_minutes_from_seconds(elapsed_s)
 
-    # ── Previous state (EMA continuity) ───────────────────────────────────────
+    # ── Previous state (beta EMA continuity across cycles) ───────────────────
     prev_row = await get_drift_state(session.id, db)
     prev_ema = prev_row.drift_ema if prev_row else 0.0
+    # beta_ema carries the smoothed decay rate; starts at BETA0 (natural decay)
     prev_beta_ema = prev_row.beta_ema if prev_row else BETA0
 
+    # ── Personalized pause threshold ──────────────────────────────────────────
+    b = baseline
+    pause_thresh = max(2.0, b.get("para_dwell_median_s", 10.0) / 3.0)
+
     # ── Feature extraction + model ────────────────────────────────────────────
-    baseline_wpm = baseline.get("wpm_effective") or baseline.get("wpm_gross") or 0.0
-    features = extract_features(batches, paragraph_word_counts, baseline_wpm)
+    baseline_wpm = b.get("wpm_effective") or b.get("wpm_gross") or 0.0
+    features = extract_features(
+        batches, paragraph_word_counts, baseline_wpm, pause_threshold_s=pause_thresh
+    )
+    # Attach progress markers
+    features.progress_markers_count = progress_markers
+
     result = compute_drift_result(
         features, baseline, elapsed_min, prev_ema, prev_beta_ema
     )
@@ -183,21 +206,18 @@ async def get_drift(
     """
     Return the drift state for a session.
 
-    If the state is missing or older than 10 seconds, recompute it
-    on demand before responding.
+    If the state is missing or older than 10 seconds (for active sessions),
+    recompute it on demand before responding.
     """
     session = await _get_owned_session(session_id, current_user.id, db)
 
     existing = await get_drift_state(session_id, db)
     now = datetime.now(timezone.utc)
 
-    needs_recompute = (
-        existing is None
-        or (
-            session.status == "active"
-            and (now - existing.updated_at.replace(tzinfo=timezone.utc))
-            > timedelta(seconds=_STALE_THRESHOLD_S)
-        )
+    needs_recompute = existing is None or (
+        session.status == "active"
+        and (now - existing.updated_at.replace(tzinfo=timezone.utc))
+        > timedelta(seconds=_STALE_THRESHOLD_S)
     )
 
     if needs_recompute and session.status == "active":
@@ -205,19 +225,26 @@ async def get_drift(
         await db.commit()
     else:
         row = existing
-        if row is None:
-            row = SessionDriftState(
-                session_id=session_id,
-                beta_effective=BETA0,
-                beta_ema=BETA0,
-                attention_score=1.0,
-                drift_score=0.0,
-                drift_ema=0.0,
-                confidence=0.0,
-                updated_at=now,
-            )
 
-    # Determine whether a baseline exists for the current user
+    # Fall back to a zero-state object if nothing exists
+    if row is None:
+        return DriftStateResponse(
+            session_id=session_id,
+            drift_level=0.0,
+            drift_ema=0.0,
+            disruption_score=0.0,
+            engagement_score=0.0,
+            confidence=0.0,
+            beta_effective=0.0,
+            attention_score=1.0,
+            drift_score=0.0,
+            pace_ratio=None,
+            pace_available=False,
+            baseline_used=False,
+            updated_at=now,
+        )
+
+    # Determine whether a baseline exists
     baseline_row = (
         await db.execute(
             select(UserBaseline).where(UserBaseline.user_id == current_user.id)
@@ -226,11 +253,16 @@ async def get_drift(
 
     return DriftStateResponse(
         session_id=session_id,
+        drift_level=row.drift_level,
+        drift_ema=row.drift_ema,
+        disruption_score=row.disruption_score,
+        engagement_score=row.engagement_score,
+        confidence=row.confidence,
         beta_effective=row.beta_effective,
         attention_score=row.attention_score,
         drift_score=row.drift_score,
-        drift_ema=row.drift_ema,
-        confidence=row.confidence,
+        pace_ratio=None,
+        pace_available=False,
         baseline_used=baseline_row is not None,
         updated_at=row.updated_at,
     )
@@ -243,11 +275,11 @@ async def get_drift_debug(
     db: AsyncSession = Depends(get_db),
 ) -> DriftDebugResponse:
     """
-    Full debug view: features, z-scores, beta components, baseline snapshot.
+    Full debug view: features, z-scores, component breakdown, baseline snapshot.
     Only available when settings.debug is True.
 
-    This endpoint is the primary tool for diagnosing why drift is high or low.
-    Check beta_components to see which term is the biggest contributor.
+    Check beta_components (now: disruption/engagement breakdown) to see
+    which signals are driving drift up or down.
     """
     if not settings.debug:
         raise HTTPException(
@@ -277,6 +309,7 @@ async def get_drift_debug(
         paragraph_word_counts[f"chunk-{c.chunk_index}"] = wc
 
     batches = await fetch_window(session.id, db)
+    progress_markers = await fetch_progress_markers_count(session.id, db)
 
     now = datetime.now(timezone.utc)
     started = session.started_at
@@ -289,14 +322,18 @@ async def get_drift_debug(
     prev_ema = prev_row.drift_ema if prev_row else 0.0
     prev_beta_ema = prev_row.beta_ema if prev_row else BETA0
 
-    baseline_wpm = baseline.get("wpm_effective") or baseline.get("wpm_gross") or 0.0
-    features = extract_features(batches, paragraph_word_counts, baseline_wpm)
+    b = baseline
+    pause_thresh = max(2.0, b.get("para_dwell_median_s", 10.0) / 3.0)
+    baseline_wpm = b.get("wpm_effective") or b.get("wpm_gross") or 0.0
+    features = extract_features(
+        batches, paragraph_word_counts, baseline_wpm, pause_threshold_s=pause_thresh
+    )
+    features.progress_markers_count = progress_markers
+
     result = compute_drift_result(
         features, baseline, elapsed_min, prev_ema, prev_beta_ema
     )
 
-    # Build a human-readable baseline snapshot so the caller can verify
-    # which values were actually used in normalization.
     baseline_snapshot: dict[str, Any] = {
         "baseline_used": baseline_used,
         "wpm_effective": baseline.get("wpm_effective"),
@@ -309,6 +346,8 @@ async def get_drift_debug(
         "scroll_jitter_std": baseline.get("scroll_jitter_std", 0.10),
         "regress_rate_mean": baseline.get("regress_rate_mean", 0.05),
         "regress_rate_std": baseline.get("regress_rate_std", 0.06),
+        "para_dwell_median_s": baseline.get("para_dwell_median_s"),
+        "para_dwell_iqr_s": baseline.get("para_dwell_iqr_s"),
         "scroll_velocity_norm_mean": baseline.get("scroll_velocity_norm_mean"),
         "scroll_velocity_norm_std": baseline.get("scroll_velocity_norm_std"),
         "presentation_profile": baseline.get("presentation_profile"),
@@ -321,20 +360,22 @@ async def get_drift_debug(
         session_id=session_id,
         user_id=session.user_id,
         baseline_used=baseline_used,
+        drift_level=result.drift_level,
+        drift_ema=result.drift_ema,
+        disruption_score=result.disruption_score,
+        engagement_score=result.engagement_score,
+        confidence=result.confidence,
         beta_effective=result.beta_effective,
         beta_ema=result.beta_ema,
-        beta_raw=result.beta_components.get("beta_raw", result.beta_effective),
         attention_score=result.attention_score,
         drift_score=result.drift_score,
-        drift_ema=result.drift_ema,
-        confidence=result.confidence,
         n_batches_in_window=features.n_batches,
         elapsed_minutes=elapsed_min,
         beta_components=result.beta_components,
         z_scores=z_dict,
         features=features_dict,
         baseline_snapshot=baseline_snapshot,
-        pace_ratio=features.pace_ratio,
+        pace_ratio=result.pace_ratio,
         pace_dev=features.pace_dev,
         pace_available=features.pace_available,
         window_wpm_effective=features.window_wpm_effective,
