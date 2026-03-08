@@ -61,6 +61,15 @@ async def init_db() -> None:
             )
         )
 
+    # Step 3b — Add beta_ema column to session_drift_states (idempotent)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "ALTER TABLE session_drift_states "
+                "ADD COLUMN IF NOT EXISTS beta_ema DOUBLE PRECISION NOT NULL DEFAULT 0.03"
+            )
+        )
+
     # Step 3 — Convert activity_events to a TimescaleDB hypertable
     async with engine.begin() as conn:
         await conn.execute(

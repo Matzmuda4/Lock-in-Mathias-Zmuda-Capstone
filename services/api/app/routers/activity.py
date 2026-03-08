@@ -13,6 +13,7 @@ from app.schemas.activity import (
     ActivityEventCreate,
     ActivityEventResponse,
 )
+from app.routers.drift import _recompute_and_save as _recompute_drift
 
 router = APIRouter(prefix="/activity", tags=["activity"])
 
@@ -100,7 +101,8 @@ async def post_activity_batch(
             Session.status == "active",
         )
     )
-    if result.scalar_one_or_none() is None:
+    session = result.scalar_one_or_none()
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Active session not found or does not belong to the current user",
@@ -118,6 +120,18 @@ async def post_activity_batch(
         created_at=datetime.now(timezone.utc),
     )
     db.add(event)
+    # Flush so the new event is visible inside this transaction for the drift query
+    await db.flush()
+
+    # Use a SAVEPOINT so that drift errors cannot abort the main transaction.
+    # If drift recompute fails (e.g. missing column, model error), the savepoint
+    # is released/rolled back and the telemetry event is still committed.
+    try:
+        async with db.begin_nested():
+            await _recompute_drift(session, db)
+    except Exception:  # noqa: BLE001
+        pass  # drift failure must not prevent telemetry storage
+
     await db.commit()
     await db.refresh(event)
     return ActivityBatchResponse.model_validate(event)

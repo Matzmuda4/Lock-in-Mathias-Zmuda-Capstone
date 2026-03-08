@@ -282,6 +282,39 @@ class UserBaseline(Base):
 # ─── End Phase B ───────────────────────────────────────────────────────────────
 
 
+# ─── Phase 7 — Drift state ────────────────────────────────────────────────────
+
+
+class SessionDriftState(Base):
+    """
+    Current drift model output for one session.  Upserted on every
+    telemetry batch ingestion.  One row per session.
+    """
+
+    __tablename__ = "session_drift_states"
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    beta_effective: Mapped[float] = mapped_column(nullable=False, default=0.03)
+    # Smoothed beta — used as prev_beta_ema on the next cycle
+    beta_ema: Mapped[float] = mapped_column(nullable=False, default=0.03)
+    attention_score: Mapped[float] = mapped_column(nullable=False, default=1.0)
+    drift_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    drift_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    last_window_ends_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ─── End Phase 7 ──────────────────────────────────────────────────────────────
+
+
 class Intervention(Base):
     __tablename__ = "interventions"
 

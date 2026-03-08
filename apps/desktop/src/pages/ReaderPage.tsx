@@ -5,6 +5,7 @@ import { useTelemetry } from "../hooks/useTelemetry";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { documentService, type Chunk } from "../services/documentService";
 import { sessionService, type Session, type SessionReaderData } from "../services/sessionService";
+import { driftService, driftColor, type DriftState, type DriftDebug } from "../services/driftService";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -404,6 +405,122 @@ function DebugPanel({ batch }: { batch: object | null }) {
   );
 }
 
+// ─── Drift meter ─────────────────────────────────────────────────────────────
+
+function DriftMeter({
+  drift,
+  showConfidence,
+}: {
+  drift: DriftState | null;
+  showConfidence: boolean;
+}) {
+  if (!drift) return null;
+
+  const pct = Math.round(drift.drift_ema * 100);
+  const color = driftColor(drift.drift_ema);
+
+  return (
+    <div className="drift-meter" title={`β=${drift.beta_effective.toFixed(3)} A=${drift.attention_score.toFixed(2)}`}>
+      <span className="drift-meter__label">Drift</span>
+      <span className={`drift-meter__pill drift-meter__pill--${color}`}>
+        {pct}%
+      </span>
+      {showConfidence && (
+        <>
+          <span className="drift-meter__conf" title="Window confidence">
+            conf:{Math.round(drift.confidence * 100)}%
+          </span>
+          {drift.baseline_used && (
+            <span className="drift-meter__baseline" title="Calibration baseline active">
+              ✓ baseline
+            </span>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Drift debug panel (DEV only) ────────────────────────────────────────────
+
+function DriftDebugPanel({
+  token,
+  sessionId,
+}: {
+  token: string | null;
+  sessionId: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [debug, setDebug] = useState<DriftDebug | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  if (!DEV) return null;
+
+  const fetchDebug = async () => {
+    if (!token) return;
+    setLoading(true);
+    const data = await driftService.getDebug(token, sessionId);
+    setDebug(data);
+    setLoading(false);
+  };
+
+  // Top contributors: sort beta_components by value (descending), skip meta keys
+  const topContribs = debug
+    ? Object.entries(debug.beta_components)
+        .filter(([k]) => !["beta0", "beta_raw", "beta_ema", "confidence", "beta_gated"].includes(k))
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, 3)
+    : [];
+
+  return (
+    <div className="debug-panel">
+      <button
+        className="debug-panel__toggle"
+        type="button"
+        onClick={() => { setOpen((o) => !o); if (!open) fetchDebug(); }}
+      >
+        {open ? "▾" : "▸"} Drift debug
+      </button>
+      {open && (
+        <div className="debug-panel__json">
+          {loading && <p>Loading…</p>}
+          {debug && (
+            <>
+              <p><strong>baseline_used:</strong> {String(debug.baseline_used)}</p>
+              <p><strong>β_gated:</strong> {debug.beta_effective.toFixed(4)}
+                 &nbsp;β_raw:{debug.beta_raw.toFixed(4)}
+                 &nbsp;β_ema:{debug.beta_ema.toFixed(4)}</p>
+              <p><strong>confidence:</strong> {(debug.confidence * 100).toFixed(0)}%
+                 &nbsp;({debug.n_batches_in_window} batches)</p>
+              <p><strong>pace:</strong> avail={String(debug.pace_available)}
+                 &nbsp;ratio={debug.pace_ratio.toFixed(2)}
+                 &nbsp;dev={debug.pace_dev.toFixed(3)}</p>
+              <p><strong>elapsed:</strong> {debug.elapsed_minutes.toFixed(2)} min</p>
+              <p><strong>top contributors to β:</strong></p>
+              <ul style={{ margin: 0, paddingLeft: 16 }}>
+                {topContribs.map(([k, v]) => (
+                  <li key={k}>{k}: {v.toFixed(4)}</li>
+                ))}
+              </ul>
+              <p><strong>z_scores:</strong></p>
+              <pre style={{ fontSize: 10, margin: 0 }}>
+                {JSON.stringify(debug.z_scores, null, 2)}
+              </pre>
+              <button
+                type="button"
+                style={{ marginTop: 4, fontSize: 10, cursor: "pointer" }}
+                onClick={fetchDebug}
+              >
+                ↺ Refresh
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── ReaderPage ──────────────────────────────────────────────────────────────
 
 export function ReaderPage() {
@@ -421,6 +538,9 @@ export function ReaderPage() {
   // Calibration-specific state
   const [calibBaseline, setCalibBaseline] = useState<BaselineData | null>(null);
   const [calibDone, setCalibDone] = useState(false);
+
+  // Drift state — polled every 3 s while active
+  const [driftState, setDriftState] = useState<DriftState | null>(null);
 
   const timerDisplay = useElapsedTimer(data?.session ?? null);
   // Raw seconds for calibration finish-condition logic
@@ -463,6 +583,18 @@ export function ReaderPage() {
       })
       .catch((e) => setError(e.message));
   }, [token, sessionId]);
+
+  // Poll drift every 3 seconds while session is active
+  useEffect(() => {
+    if (!token || !isActive) return;
+    const poll = async () => {
+      const state = await driftService.getDrift(token, sessionId);
+      if (state) setDriftState(state);
+    };
+    poll();
+    const id = setInterval(poll, 3000);
+    return () => clearInterval(id);
+  }, [token, sessionId, isActive]);
 
   const loadMore = useCallback(async () => {
     if (!token || !data) return;
@@ -584,6 +716,7 @@ export function ReaderPage() {
 
         <div className="reader-bar__right">
           <span className="reader-bar__timer">{timerDisplay}</span>
+          <DriftMeter drift={driftState} showConfidence={DEV} />
           {DEV && (
             <span className={`telemetry-badge${collecting ? " telemetry-badge--on" : ""}`}>
               ⊙ Telemetry: {collecting ? "ON" : "OFF"}
@@ -643,8 +776,9 @@ export function ReaderPage() {
         )}
       </main>
 
-      {/* Dev debug panel */}
+      {/* Dev debug panels */}
       {DEV && <DebugPanel batch={lastBatch} />}
+      {DEV && <DriftDebugPanel token={token} sessionId={sessionId} />}
 
       <style>{`
         /* ── Layout ── */
@@ -674,6 +808,28 @@ export function ReaderPage() {
         .reader-bar__mode { font-size:11px; color:var(--text-muted); font-style:italic; text-transform:capitalize; }
         .reader-bar__right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
         .reader-bar__timer { font-family:var(--font-mono); font-size:14px; color:var(--accent); min-width:48px; }
+
+        /* ── Drift meter ── */
+        .drift-meter {
+          display:flex; align-items:center; gap:5px;
+          font-size:12px;
+        }
+        .drift-meter__label {
+          color:var(--text-muted);
+          font-size:11px;
+        }
+        .drift-meter__pill {
+          padding:2px 8px;
+          border-radius:9999px;
+          font-weight:600;
+          font-size:12px;
+          font-family:var(--font-mono);
+        }
+        .drift-meter__pill--green  { background:#22c55e22; color:#22c55e; border:1px solid #22c55e44; }
+        .drift-meter__pill--yellow { background:#eab30822; color:#eab308; border:1px solid #eab30844; }
+        .drift-meter__pill--red    { background:#ef444422; color:#ef4444; border:1px solid #ef444444; }
+        .drift-meter__conf { font-size:10px; color:var(--text-muted); }
+        .drift-meter__baseline { font-size:10px; color:#22c55e; margin-left:4px; }
 
         /* ── Telemetry indicator (dev-only) ── */
         .telemetry-badge {

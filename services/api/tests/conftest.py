@@ -70,6 +70,13 @@ def init_test_db() -> None:
         async with eng.begin() as c:
             await c.execute(
                 text(
+                    "ALTER TABLE session_drift_states "
+                    "ADD COLUMN IF NOT EXISTS beta_ema DOUBLE PRECISION NOT NULL DEFAULT 0.03"
+                )
+            )
+        async with eng.begin() as c:
+            await c.execute(
+                text(
                     "SELECT create_hypertable("
                     "  'activity_events', 'created_at', if_not_exists => TRUE"
                     ")"
@@ -95,6 +102,7 @@ def clean_tables() -> None:
         conn = await asyncpg.connect(_ASYNCPG_DSN)
         try:
             await conn.execute("DELETE FROM activity_events")
+            await conn.execute("DELETE FROM session_drift_states")
             await conn.execute("DELETE FROM model_outputs")
             await conn.execute("DELETE FROM interventions")
             await conn.execute("DELETE FROM sessions")
