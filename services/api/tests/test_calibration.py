@@ -44,6 +44,8 @@ _CALIB_TEXT = (
 _TELEMETRY_BATCH = {
     "scroll_delta_sum": 240.0,
     "scroll_delta_abs_sum": 240.0,
+    "scroll_delta_pos_sum": 240.0,
+    "scroll_delta_neg_sum": 0.0,
     "scroll_event_count": 4,
     "scroll_direction_changes": 1,
     "scroll_pause_seconds": 0.5,
@@ -54,6 +56,9 @@ _TELEMETRY_BATCH = {
     "current_paragraph_id": "chunk-1",
     "current_chunk_index": 0,
     "viewport_progress_ratio": 0.4,
+    "viewport_height_px": 800.0,
+    "viewport_width_px": 1280.0,
+    "reader_container_height_px": 750.0,
     "client_timestamp": "2026-02-25T12:00:00Z",
 }
 
@@ -359,6 +364,214 @@ class TestCalibrationComplete:
             headers=headers_b,
         )
         assert resp.status_code == 404
+
+
+class TestBaselineComputationV2:
+    """Tests for Phase 6 v2 baseline metrics."""
+
+    # ── Effective WPM ──────────────────────────────────────────────────────────
+
+    def test_effective_wpm_excludes_idle_and_blur(self) -> None:
+        """wpm_effective should only count windows that are focused + low-idle."""
+        from app.services.calibration.baseline import compute_effective_wpm
+
+        # 4 windows: 2 qualifying (focused, idle <=1.5), 1 high-idle, 1 blurred
+        batches = [
+            {"window_focus_state": "focused", "idle_seconds": 0.5, "current_paragraph_id": "calib-0"},
+            {"window_focus_state": "focused", "idle_seconds": 1.0, "current_paragraph_id": "calib-1"},
+            {"window_focus_state": "focused", "idle_seconds": 5.0, "current_paragraph_id": "calib-0"},  # high idle
+            {"window_focus_state": "blurred",  "idle_seconds": 0.2, "current_paragraph_id": "calib-1"},  # blurred
+        ]
+        para_wc = {"calib-0": 100, "calib-1": 80}
+        result = compute_effective_wpm(batches, para_wc)
+
+        # effective_reading_seconds = 2 windows × 2.0 s = 4.0 s
+        assert result["effective_reading_seconds"] == 4.0
+        # words_read_estimated = 100 + 80 = 180 (both paragraphs were seen)
+        assert result["words_read_estimated"] == 180
+
+        # wpm_gross = 180 / (8s / 60) ≈ 1350 (total 4 windows → 8 s)
+        # wpm_effective = 180 / (4s / 60) ≈ 2700 — always ≥ wpm_gross here
+        assert result["wpm_effective"] > result["wpm_gross"]
+
+    def test_effective_wpm_with_total_words_override(self) -> None:
+        """With total_words_override, wpm_gross = total_words / duration_min."""
+        from app.services.calibration.baseline import compute_effective_wpm
+
+        batches = [{"window_focus_state": "focused", "idle_seconds": 0.0}] * 10
+        result = compute_effective_wpm(batches, {}, total_words_override=300)
+        # 300 words / (20 s / 60) = 900 wpm_gross
+        assert abs(result["wpm_gross"] - 900.0) < 1.0
+
+    # ── Normalised scroll velocity ─────────────────────────────────────────────
+
+    def test_scroll_velocity_norm_uses_viewport_height(self) -> None:
+        """Same scroll delta → lower norm velocity when viewport is taller."""
+        from app.services.calibration.baseline import scroll_velocities_norm
+
+        batch_small_vp = [{"scroll_delta_abs_sum": 100.0, "viewport_height_px": 500.0}]
+        batch_large_vp = [{"scroll_delta_abs_sum": 100.0, "viewport_height_px": 1000.0}]
+
+        norm_small = scroll_velocities_norm(batch_small_vp)[0]
+        norm_large = scroll_velocities_norm(batch_large_vp)[0]
+
+        # larger viewport → smaller normalised velocity
+        assert norm_small > norm_large
+        # 100 / (500 * 2) = 0.10;  100 / (1000 * 2) = 0.05
+        assert abs(norm_small - 0.10) < 1e-9
+        assert abs(norm_large - 0.05) < 1e-9
+
+    def test_scroll_velocity_norm_fallback_when_no_viewport(self) -> None:
+        """Batches without viewport_height_px use the fallback value."""
+        from app.services.calibration.baseline import scroll_velocities_norm
+
+        batches = [{"scroll_delta_abs_sum": 80.0}]  # no viewport_height_px key
+        norm = scroll_velocities_norm(batches, fallback_viewport_px=400.0)[0]
+        # 80 / (400 * 2) = 0.10
+        assert abs(norm - 0.10) < 1e-9
+
+    # ── Paragraph dwell distribution ───────────────────────────────────────────
+
+    def test_paragraph_dwell_median_iqr(self) -> None:
+        """Median and IQR of paragraph dwell times are computed correctly."""
+        from app.services.calibration.baseline import compute_paragraph_dwell_distribution
+
+        # paragraph 0: 1 window (2 s), 1: 3 windows (6 s), 2: 5 windows (10 s)
+        batches = (
+            [{"current_paragraph_id": "calib-0"}] * 1
+            + [{"current_paragraph_id": "calib-1"}] * 3
+            + [{"current_paragraph_id": "calib-2"}] * 5
+        )
+        result = compute_paragraph_dwell_distribution(batches)
+
+        # dwell_secs = [2.0, 6.0, 10.0]
+        assert result["paragraph_count_observed"] == 3
+        assert abs(result["para_dwell_median_s"] - 6.0) < 0.01
+        # Q1 = 2.0 + (4.0 * 0.5 * 0.5) ... depends on interpolation; IQR should be > 0
+        assert result["para_dwell_iqr_s"] > 0
+
+    def test_paragraph_dwell_single_paragraph(self) -> None:
+        """Single paragraph → IQR = 0 (only one data point)."""
+        from app.services.calibration.baseline import compute_paragraph_dwell_distribution
+
+        batches = [{"current_paragraph_id": "calib-0"}] * 4
+        result = compute_paragraph_dwell_distribution(batches)
+        assert result["paragraph_count_observed"] == 1
+        assert result["para_dwell_iqr_s"] == 0.0
+        assert result["para_dwell_mean_s"] == 8.0
+
+    # ── Regress rate ───────────────────────────────────────────────────────────
+
+    def test_regress_rate_from_signed_sums(self) -> None:
+        """regress_rate = neg / (neg + pos); 0 when no negative scroll."""
+        from app.services.calibration.baseline import compute_regress_rate_stats
+
+        # Window: pos=300, neg=100 → rate = 100/400 = 0.25
+        batches = [{"scroll_delta_pos_sum": 300.0, "scroll_delta_neg_sum": 100.0}]
+        result = compute_regress_rate_stats(batches)
+        assert abs(result["regress_rate_mean"] - 0.25) < 1e-6
+
+    def test_regress_rate_zero_when_only_forward(self) -> None:
+        from app.services.calibration.baseline import compute_regress_rate_stats
+
+        batches = [{"scroll_delta_pos_sum": 200.0, "scroll_delta_neg_sum": 0.0}]
+        result = compute_regress_rate_stats(batches)
+        assert result["regress_rate_mean"] == 0.0
+
+    def test_regress_rate_skips_no_scroll_windows(self) -> None:
+        """Windows with neither pos nor neg scroll are skipped."""
+        from app.services.calibration.baseline import compute_regress_rate_stats
+
+        batches = [
+            {"scroll_delta_pos_sum": 0.0, "scroll_delta_neg_sum": 0.0},  # skipped
+            {"scroll_delta_pos_sum": 100.0, "scroll_delta_neg_sum": 100.0},  # 0.5
+        ]
+        result = compute_regress_rate_stats(batches)
+        assert abs(result["regress_rate_mean"] - 0.5) < 1e-6
+
+    # ── Presentation profile ───────────────────────────────────────────────────
+
+    def test_presentation_profile_stats(self) -> None:
+        """Mean viewport dimensions are computed across batches."""
+        from app.services.calibration.baseline import compute_presentation_profile_stats
+
+        batches = [
+            {"viewport_height_px": 800.0, "viewport_width_px": 1280.0, "reader_container_height_px": 760.0},
+            {"viewport_height_px": 820.0, "viewport_width_px": 1280.0, "reader_container_height_px": 780.0},
+        ]
+        profile = compute_presentation_profile_stats(batches, calibration_text_word_count=450, paragraph_count_total=10)
+        assert abs(profile["viewport_height_px_mean"] - 810.0) < 0.1
+        assert abs(profile["viewport_width_px_mean"] - 1280.0) < 0.1
+        assert profile["calibration_text_word_count"] == 450
+        assert profile["paragraph_count_total"] == 10
+
+    # ── Full compute_baseline integration ─────────────────────────────────────
+
+    def test_full_baseline_contains_new_keys(self) -> None:
+        """compute_baseline result must contain all Phase 6 v2 keys."""
+        from app.services.calibration.baseline import compute_baseline
+
+        batches = [
+            {
+                "scroll_delta_abs_sum": 200.0,
+                "scroll_delta_pos_sum": 200.0,
+                "scroll_delta_neg_sum": 50.0,
+                "scroll_event_count": 5,
+                "scroll_direction_changes": 1,
+                "idle_seconds": 0.5,
+                "window_focus_state": "focused",
+                "current_paragraph_id": "calib-0",
+                "viewport_height_px": 800.0,
+                "viewport_width_px": 1280.0,
+                "reader_container_height_px": 760.0,
+            }
+        ] * 5
+
+        result = compute_baseline(batches, {}, 60, total_words=300, paragraph_count_total=1)
+
+        required = [
+            "wpm_gross", "wpm_effective", "words_read_estimated", "effective_reading_seconds",
+            "scroll_velocity_px_s_mean", "scroll_velocity_px_s_std",
+            "scroll_velocity_norm_mean", "scroll_velocity_norm_std",
+            "scroll_jitter_mean", "idle_ratio_mean", "idle_ratio_std",
+            "regress_rate_mean", "regress_rate_std",
+            "para_dwell_mean_s", "para_dwell_median_s", "para_dwell_iqr_s",
+            "paragraph_count_observed", "presentation_profile",
+            "calibration_duration_seconds",
+            # legacy
+            "wpm_mean", "scroll_velocity_mean", "paragraph_dwell_mean",
+        ]
+        for key in required:
+            assert key in result, f"Missing key: {key}"
+
+        assert isinstance(result["presentation_profile"], dict)
+        assert result["wpm_gross"] > 0
+        assert result["scroll_velocity_norm_mean"] > 0
+
+
+class TestExportCsvV2:
+    """Ensure new CSV columns appear in the export."""
+
+    async def test_export_csv_has_new_columns(
+        self,
+        api_client: AsyncClient,
+        auth_headers: dict,
+        calib_session: int,
+    ) -> None:
+        await api_client.post(
+            "/activity/batch",
+            json={"session_id": calib_session, **_TELEMETRY_BATCH},
+            headers=auth_headers,
+        )
+        resp = await api_client.get(
+            f"/sessions/{calib_session}/export.csv",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        header_row = resp.text.strip().splitlines()[0]
+        for col in ("scroll_delta_pos_sum", "scroll_delta_neg_sum",
+                    "viewport_height_px", "viewport_width_px", "reader_container_height_px"):
+            assert col in header_row, f"Missing CSV column: {col}"
 
 
 class TestExportCsv:

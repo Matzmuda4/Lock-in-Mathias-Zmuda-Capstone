@@ -252,18 +252,38 @@ async def calibration_complete(
     # Fetch all chunks for the calibration document
     ch_result = await db.execute(
         select(DocumentChunk).where(DocumentChunk.document_id == session.document_id)
+        .order_by(DocumentChunk.chunk_index)
     )
     chunks = ch_result.scalars().all()
-    chunk_word_counts = {c.id: len(c.text.split()) for c in chunks if c.text}
+
+    # int-keyed map (chunk.id → word_count) for backwards-compat path in baseline.py
+    chunk_word_counts: dict[int, int] = {}
+    # string-keyed map ("calib-N" → word_count) for effective WPM paragraph matching
+    paragraph_word_counts: dict[str, int] = {}
+
+    for c in chunks:
+        wc = (c.meta or {}).get("word_count") or len(c.text.split())
+        chunk_word_counts[c.id] = wc
+        paragraph_word_counts[f"calib-{c.chunk_index}"] = wc
+        paragraph_word_counts[f"chunk-{c.chunk_index}"] = wc
 
     # Total words = entire calibration text (user reads all of it).
-    # Prefer DB chunk word counts; fall back to reading the txt file directly.
     total_words: int = sum(chunk_word_counts.values())
     if total_words == 0 and _CALIB_TXT.exists():
         total_words = len(_CALIB_TXT.read_text(encoding="utf-8").split())
 
-    # Compute baseline — pass total_words so WPM = total_words / duration_min
-    baseline_data = compute_baseline(batches, chunk_word_counts, duration, total_words)
+    paragraph_count_total = len(chunks)
+
+    # Compute baseline with all enriched data
+    baseline_data = compute_baseline(
+        batches,
+        chunk_word_counts,
+        duration,
+        total_words=total_words,
+        paragraph_word_counts=paragraph_word_counts,
+        calibration_text_word_count=total_words,
+        paragraph_count_total=paragraph_count_total,
+    )
 
     # Upsert UserBaseline
     now = datetime.now(timezone.utc)

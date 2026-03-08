@@ -1,23 +1,28 @@
 /**
- * useTelemetry — Phase 5 Telemetry Logging v1
+ * useTelemetry — Phase 6 Telemetry Logging v2
  *
  * Collects user interaction signals every 2 seconds and sends an aggregated
  * batch to POST /activity/batch.  Pure-math helpers are exported so they can
  * be unit-tested independently.
  *
  * Signals collected:
- *   scroll_delta_sum          net signed scroll distance (px)
- *   scroll_delta_abs_sum      total absolute scroll distance (px)
- *   scroll_event_count        raw scroll event count
- *   scroll_direction_changes  direction reversals (backtracking proxy)
- *   scroll_pause_seconds      seconds since last scroll (capped 60 s)
- *   idle_seconds              seconds since any interaction (capped 60 s)
- *   mouse_path_px             total cursor path length (px)
- *   mouse_net_px              straight-line net displacement (px)
- *   window_focus_state        "focused" | "blurred"
- *   current_paragraph_id      data-paragraph-id of most-visible paragraph
- *   current_chunk_index       chunk index of most-visible chunk
- *   viewport_progress_ratio   scrollTop / (scrollHeight - clientHeight)
+ *   scroll_delta_sum              net signed scroll distance (px)
+ *   scroll_delta_abs_sum          total absolute scroll distance (px)
+ *   scroll_delta_pos_sum          sum of positive (down) deltas only
+ *   scroll_delta_neg_sum          sum of |negative (up) deltas| only
+ *   scroll_event_count            raw scroll event count
+ *   scroll_direction_changes      direction reversals (backtracking proxy)
+ *   scroll_pause_seconds          seconds since last scroll (capped 60 s)
+ *   idle_seconds                  seconds since any interaction (capped 60 s)
+ *   mouse_path_px                 total cursor path length (px)
+ *   mouse_net_px                  straight-line net displacement (px)
+ *   window_focus_state            "focused" | "blurred"
+ *   current_paragraph_id          data-paragraph-id of most-visible paragraph
+ *   current_chunk_index           chunk index of most-visible chunk
+ *   viewport_progress_ratio       scrollTop / (scrollHeight - clientHeight)
+ *   viewport_height_px            window.innerHeight
+ *   viewport_width_px             window.innerWidth
+ *   reader_container_height_px    scrollable container clientHeight
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -109,6 +114,8 @@ export function useTelemetry({
   // ── Accumulators (reset each flush) ──────────────────────────────────────
   const scrollDeltaSum = useRef(0);
   const scrollDeltaAbsSum = useRef(0);
+  const scrollDeltaPosSum = useRef(0);  // downward only
+  const scrollDeltaNegSum = useRef(0);  // |upward| only
   const scrollEventCount = useRef(0);
   const scrollDirectionChanges = useRef(0);
   const lastScrollTime = useRef<number>(Date.now());
@@ -133,12 +140,13 @@ export function useTelemetry({
   const resetAccumulators = useCallback(() => {
     scrollDeltaSum.current = 0;
     scrollDeltaAbsSum.current = 0;
+    scrollDeltaPosSum.current = 0;
+    scrollDeltaNegSum.current = 0;
     scrollEventCount.current = 0;
     scrollDirectionChanges.current = 0;
     mousePoints.current = [];
-    const container = containerRef.current;
     mouseStart.current = { x: 0, y: 0 };
-    // capture current scrollY as new baseline
+    const container = containerRef.current;
     if (container) lastScrollY.current = container.scrollTop;
     else lastScrollY.current = window.scrollY;
   }, [containerRef]);
@@ -176,6 +184,8 @@ export function useTelemetry({
       session_id: sessionId,
       scroll_delta_sum: scrollDeltaSum.current,
       scroll_delta_abs_sum: scrollDeltaAbsSum.current,
+      scroll_delta_pos_sum: scrollDeltaPosSum.current,
+      scroll_delta_neg_sum: scrollDeltaNegSum.current,
       scroll_event_count: scrollEventCount.current,
       scroll_direction_changes: scrollDirectionChanges.current,
       scroll_pause_seconds: scrollPauseSec,
@@ -186,6 +196,9 @@ export function useTelemetry({
       current_paragraph_id: currentParagraphId.current,
       current_chunk_index: currentChunkIndex.current,
       viewport_progress_ratio: viewportProgress,
+      viewport_height_px: window.innerHeight,
+      viewport_width_px: window.innerWidth,
+      reader_container_height_px: container ? container.clientHeight : window.innerHeight,
       client_timestamp: new Date().toISOString(),
     };
 
@@ -210,6 +223,8 @@ export function useTelemetry({
 
       scrollDeltaSum.current += dy;
       scrollDeltaAbsSum.current += Math.abs(dy);
+      if (dy > 0) scrollDeltaPosSum.current += dy;
+      else if (dy < 0) scrollDeltaNegSum.current += Math.abs(dy);
       scrollEventCount.current += 1;
 
       const dir: "down" | "up" = dy >= 0 ? "down" : "up";

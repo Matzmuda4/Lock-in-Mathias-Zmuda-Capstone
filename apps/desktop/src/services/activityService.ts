@@ -2,18 +2,32 @@ import { apiRequest } from "./apiClient";
 
 export interface TelemetryBatch {
   session_id: number;
+  // ── Scroll ────────────────────────────────────────────────────────────────
   scroll_delta_sum: number;
   scroll_delta_abs_sum: number;
   scroll_event_count: number;
   scroll_direction_changes: number;
   scroll_pause_seconds: number;
+  /** Sum of positive (downward) scroll deltas only — for regress_rate. */
+  scroll_delta_pos_sum: number;
+  /** Sum of absolute values of negative (upward) scroll deltas — for regress_rate. */
+  scroll_delta_neg_sum: number;
+  // ── Engagement ────────────────────────────────────────────────────────────
   idle_seconds: number;
+  // ── Mouse ─────────────────────────────────────────────────────────────────
   mouse_path_px: number;
   mouse_net_px: number;
+  // ── Focus ─────────────────────────────────────────────────────────────────
   window_focus_state: "focused" | "blurred";
+  // ── Reading position ──────────────────────────────────────────────────────
   current_paragraph_id: string | null;
   current_chunk_index: number | null;
   viewport_progress_ratio: number;
+  // ── Presentation profile (viewport dimensions for normalisation) ───────────
+  viewport_height_px: number;
+  viewport_width_px: number;
+  reader_container_height_px: number;
+  // ── Timestamp ─────────────────────────────────────────────────────────────
   client_timestamp: string;
 }
 

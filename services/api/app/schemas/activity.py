@@ -42,6 +42,10 @@ class ActivityBatchCreate(BaseModel):
     scroll_delta_sum: float = Field(default=0.0)
     # Total absolute displacement (always >= 0).
     scroll_delta_abs_sum: float = Field(default=0.0, ge=0)
+    # Sum of positive (downward) deltas only — for regress_rate computation.
+    scroll_delta_pos_sum: float = Field(default=0.0, ge=0)
+    # Sum of |negative (upward) deltas| only — for regress_rate computation.
+    scroll_delta_neg_sum: float = Field(default=0.0, ge=0)
     # Number of discrete scroll events in the window.
     scroll_event_count: int = Field(default=0, ge=0)
     # How many times the scroll direction reversed in the window.
@@ -70,6 +74,14 @@ class ActivityBatchCreate(BaseModel):
     current_chunk_index: Optional[int] = None
     # scrollTop / (scrollHeight - clientHeight), clamped [0, 1].
     viewport_progress_ratio: float = Field(default=0.0, ge=0, le=1)
+
+    # ── Presentation profile (viewport dimensions for normalisation) ──────────
+    # window.innerHeight at flush time.
+    viewport_height_px: Optional[float] = Field(default=None, ge=0)
+    # window.innerWidth at flush time.
+    viewport_width_px: Optional[float] = Field(default=None, ge=0)
+    # clientHeight of the scrollable reader container.
+    reader_container_height_px: Optional[float] = Field(default=None, ge=0)
 
     # ── Timestamp ───────────────────────────────────────────────────────────
     # ISO-8601 timestamp from the client; server uses now() if absent.

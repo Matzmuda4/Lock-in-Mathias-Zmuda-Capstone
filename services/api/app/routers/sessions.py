@@ -244,18 +244,29 @@ async def get_session_reader(
 
 _CSV_FIELDS = [
     "created_at",
+    # scroll
     "scroll_delta_sum",
     "scroll_delta_abs_sum",
+    "scroll_delta_pos_sum",
+    "scroll_delta_neg_sum",
     "scroll_event_count",
     "scroll_direction_changes",
     "scroll_pause_seconds",
+    # engagement
     "idle_seconds",
+    # mouse
     "mouse_path_px",
     "mouse_net_px",
+    # focus
     "window_focus_state",
+    # reading position
     "current_paragraph_id",
     "current_chunk_index",
     "viewport_progress_ratio",
+    # presentation profile
+    "viewport_height_px",
+    "viewport_width_px",
+    "reader_container_height_px",
 ]
 
 

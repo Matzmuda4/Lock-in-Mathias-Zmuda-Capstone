@@ -6,6 +6,80 @@
 import { describe, it, expect } from "vitest";
 import { computeMouseStats, selectCurrentParagraph, type Point, type IntersectionEntry } from "../hooks/useTelemetry";
 
+// ─── Signed scroll sum helpers (inline, mirrors hook accumulator logic) ────────
+
+/**
+ * Simulate the hook's accumulator for a sequence of deltaY values.
+ * Returns { posSum, negSum, absSum, netSum }.
+ */
+function computeSignedScrollSums(deltas: number[]) {
+  let posSum = 0;
+  let negSum = 0;
+  let absSum = 0;
+  let netSum = 0;
+  for (const dy of deltas) {
+    netSum += dy;
+    absSum += Math.abs(dy);
+    if (dy > 0) posSum += dy;
+    else if (dy < 0) negSum += Math.abs(dy);
+  }
+  return { posSum, negSum, absSum, netSum };
+}
+
+/**
+ * Compute viewport-normalised scroll velocity (mirrors baseline.py logic).
+ * vel_norm = scroll_delta_abs_sum / (viewport_height_px * window_seconds)
+ */
+function normalizedScrollVelocity(
+  scrollDeltaAbsSum: number,
+  viewportHeightPx: number,
+  windowSeconds: number = 2.0,
+): number {
+  if (viewportHeightPx <= 0) return 0;
+  return scrollDeltaAbsSum / (viewportHeightPx * windowSeconds);
+}
+
+describe("computeSignedScrollSums", () => {
+  it("all forward scrolling: posSum = absSum, negSum = 0", () => {
+    const { posSum, negSum, absSum } = computeSignedScrollSums([100, 200, 50]);
+    expect(posSum).toBeCloseTo(350);
+    expect(negSum).toBe(0);
+    expect(absSum).toBeCloseTo(350);
+  });
+
+  it("all backward scrolling: negSum = absSum, posSum = 0", () => {
+    const { posSum, negSum, absSum } = computeSignedScrollSums([-80, -120]);
+    expect(posSum).toBe(0);
+    expect(negSum).toBeCloseTo(200);
+    expect(absSum).toBeCloseTo(200);
+  });
+
+  it("mixed scrolling: posSum + negSum = absSum", () => {
+    const { posSum, negSum, absSum } = computeSignedScrollSums([300, -100, 200, -50]);
+    expect(posSum).toBeCloseTo(500);      // 300 + 200
+    expect(negSum).toBeCloseTo(150);      // 100 + 50
+    expect(absSum).toBeCloseTo(posSum + negSum);
+  });
+
+  it("zero deltas are ignored in both sums", () => {
+    const { posSum, negSum } = computeSignedScrollSums([0, 0, 100]);
+    expect(posSum).toBeCloseTo(100);
+    expect(negSum).toBe(0);
+  });
+
+  it("regress_rate = negSum / (negSum + posSum)", () => {
+    const { posSum, negSum } = computeSignedScrollSums([300, -100]);
+    const regressRate = negSum / (negSum + posSum);
+    // 100 / (100 + 300) = 0.25
+    expect(regressRate).toBeCloseTo(0.25);
+  });
+
+  it("net sum = posSum - negSum", () => {
+    const { posSum, negSum, netSum } = computeSignedScrollSums([200, -80]);
+    expect(netSum).toBeCloseTo(posSum - negSum);
+  });
+});
+
 // ─── computeMouseStats ────────────────────────────────────────────────────────
 
 describe("computeMouseStats", () => {
@@ -121,5 +195,28 @@ describe("selectCurrentParagraph", () => {
     const result = selectCurrentParagraph(entries);
     expect(result.paragraphId).toBe("chunk-9");
     expect(result.chunkIndex).toBeNull();
+  });
+});
+
+// ─── Viewport-normalised scroll velocity ─────────────────────────────────────
+
+describe("normalizedScrollVelocity", () => {
+  it("large viewport → smaller normalised velocity for same delta", () => {
+    const small = normalizedScrollVelocity(100, 500);
+    const large = normalizedScrollVelocity(100, 1000);
+    expect(small).toBeGreaterThan(large);
+  });
+
+  it("matches formula: delta / (vh * 2)", () => {
+    expect(normalizedScrollVelocity(200, 800)).toBeCloseTo(200 / (800 * 2));
+  });
+
+  it("returns 0 when viewport height is 0 (guard against division by zero)", () => {
+    expect(normalizedScrollVelocity(100, 0)).toBe(0);
+  });
+
+  it("proportional to scroll delta", () => {
+    const vh = 800;
+    expect(normalizedScrollVelocity(200, vh)).toBeCloseTo(2 * normalizedScrollVelocity(100, vh));
   });
 });

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -8,7 +8,6 @@ class CalibrationStatus(BaseModel):
     """Returned by GET /calibration/status."""
 
     has_baseline: bool
-    # True when the calibration PDF file is present on the server.
     calib_available: bool
     # "none" | "pending" | "running" | "succeeded" | "failed"
     parse_status: str
@@ -28,17 +27,59 @@ class CalibrationCompleteRequest(BaseModel):
 
 
 class BaselineData(BaseModel):
-    """Shape of the baseline_json field stored in user_baselines."""
+    """
+    Shape of baseline_json stored in user_baselines (Phase 6 v2).
 
-    wpm_mean: float
-    wpm_std: float
-    scroll_velocity_mean: float
-    scroll_velocity_std: float
-    scroll_jitter_mean: float
-    idle_ratio_mean: float
-    regress_rate_mean: float
-    paragraph_dwell_mean: float
-    calibration_duration_seconds: int
+    All v1 legacy fields remain optional for backwards compatibility.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # ── WPM ──────────────────────────────────────────────────────────────────
+    wpm_gross: float = 0.0
+    wpm_effective: float = 0.0
+    words_read_estimated: int = 0
+    effective_reading_seconds: float = 0.0
+
+    # ── Scroll velocity ───────────────────────────────────────────────────────
+    scroll_velocity_px_s_mean: float = 0.0
+    scroll_velocity_px_s_std: float = 0.0
+    scroll_velocity_norm_mean: float = 0.0
+    scroll_velocity_norm_std: float = 0.0
+
+    # ── Jitter ────────────────────────────────────────────────────────────────
+    scroll_jitter_mean: float = 0.0
+    scroll_jitter_std: float = 0.0
+
+    # ── Idle ──────────────────────────────────────────────────────────────────
+    idle_ratio_mean: float = 0.0
+    idle_ratio_std: float = 0.0
+    idle_seconds_mean: float = 0.0
+    idle_seconds_std: float = 0.0
+
+    # ── Regress rate ──────────────────────────────────────────────────────────
+    regress_rate_mean: float = 0.0
+    regress_rate_std: float = 0.0
+
+    # ── Paragraph dwell distribution ──────────────────────────────────────────
+    para_dwell_mean_s: float = 0.0
+    para_dwell_median_s: float = 0.0
+    para_dwell_iqr_s: float = 0.0
+    paragraph_count_observed: int = 0
+
+    # ── Presentation profile ──────────────────────────────────────────────────
+    presentation_profile: Optional[dict[str, Any]] = None
+
+    # ── Duration ─────────────────────────────────────────────────────────────
+    calibration_duration_seconds: int = 0
+
+    # ── Legacy aliases (v1 keys kept for backwards compatibility) ─────────────
+    wpm_mean: float = 0.0
+    wpm_std: float = 0.0
+    scroll_velocity_mean: float = 0.0
+    scroll_velocity_std: float = 0.0
+    paragraph_dwell_mean: float = 0.0
+    regress_rate_mean_legacy: float = 0.0
 
 
 class CalibrationCompleteResponse(BaseModel):
