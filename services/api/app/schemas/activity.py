@@ -54,8 +54,11 @@ class ActivityBatchCreate(BaseModel):
     scroll_pause_seconds: float = Field(default=0.0, ge=0)
 
     # ── Engagement signals ──────────────────────────────────────────────────
-    # Seconds since any interaction: scroll / mouse / keyboard (capped at 60 s).
+    # Seconds idle IN THIS 2s window (0..2) — per-window, not cumulative.
+    # Server clamps to 2.0 and flags telemetry_fault if > 2.0 received.
     idle_seconds: float = Field(default=0.0, ge=0)
+    # Diagnostic: total seconds since last interaction (not used by model).
+    idle_since_interaction_seconds: Optional[float] = Field(default=None, ge=0)
 
     # ── Mouse signals ───────────────────────────────────────────────────────
     # Total physical path the cursor travelled (px).

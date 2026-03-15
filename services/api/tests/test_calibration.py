@@ -312,11 +312,19 @@ class TestCalibrationComplete:
         calib_session: int,
     ) -> None:
         """After completing calibration, GET /calibration/status must return has_baseline=True."""
-        await api_client.post(
+        # Post minimum telemetry to pass the sufficiency check (>= 3 batches)
+        for _ in range(3):
+            await api_client.post(
+                "/activity/batch",
+                json={"session_id": calib_session, **_TELEMETRY_BATCH},
+                headers=auth_headers,
+            )
+        complete_resp = await api_client.post(
             "/calibration/complete",
             json={"session_id": calib_session},
             headers=auth_headers,
         )
+        assert complete_resp.status_code == 200, complete_resp.text
         status_resp = await api_client.get("/calibration/status", headers=auth_headers)
         assert status_resp.json()["has_baseline"] is True
 

@@ -65,13 +65,17 @@ from app.services.drift.model import (
 from app.services.drift.types import WindowFeatures, ZScores
 
 # ── Shared test baseline ──────────────────────────────────────────────────────
+# Realistic values reflecting a typical reader during calibration.
+# Key insight: readers are idle ~35% of 2-second windows (between scrolls).
+# Using unrealistic low values (e.g. idle_ratio_mean=0.05) causes every
+# batch to look like extreme distraction and masks signal discrimination.
 
 _BASELINE: dict[str, Any] = {
     "wpm_effective": 180.0,
-    "idle_ratio_mean": 0.05,
-    "idle_ratio_std": 0.08,
-    "idle_seconds_mean": 1.0,
-    "idle_seconds_std": 1.0,
+    "idle_ratio_mean": 0.35,   # realistic: ~35% of 2s windows have no interaction
+    "idle_ratio_std": 0.20,    # realistic window-to-window variability for readers
+    "idle_seconds_mean": 0.70,
+    "idle_seconds_std": 0.70,
     "scroll_jitter_mean": 0.10,
     "scroll_jitter_std": 0.10,
     "regress_rate_mean": 0.05,
@@ -315,17 +319,21 @@ class TestBetaComputation:
         assert abs(ema - 0.50) < 0.01
 
     def test_focused_reading_beta_near_baseline(self) -> None:
-        """Normal reading (cycling 3 paras) should produce beta close to BETA0."""
+        """
+        Normal reading (cycling 3 paras, idle at 0.05 ratio) sits below the
+        realistic baseline idle_ratio_mean=0.35, so z_idle=0 and beta → BETA_MIN.
+        """
         batches = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(15)]
         features = extract_features(batches, _WORD_COUNTS, 180.0)
         result = compute_drift_result(features, _BASELINE, 2.0, 0.0, BETA0)
-        # Beta should be only modestly elevated from BETA0 for focused reading
-        assert result.beta_effective < 0.20
+        # Active reading (below-baseline idle) → beta at or near BETA_MIN
+        assert result.beta_effective < 0.10
 
     def test_distracted_reading_raises_beta_significantly(self) -> None:
+        """Heavy idle+blur should push beta to BETA_MAX territory."""
         features = extract_features([_distracted_batch()] * 15, _WORD_COUNTS, 180.0)
         result = compute_drift_result(features, _BASELINE, 2.0, 0.0, BETA0)
-        assert result.beta_effective > 0.20
+        assert result.beta_effective > 0.40
 
 
 # ── Exponential model tests ───────────────────────────────────────────────────
@@ -642,25 +650,34 @@ class TestTimelineScenarios:
 
 class TestDistractedReadingDetection:
     def test_three_levels_ordered(self) -> None:
-        """focused_drift < mild_drift < heavy_drift at 3 min."""
+        """
+        focused_drift < moderate_drift < heavy_drift at 3 min.
+
+        With realistic baseline (idle_ratio_mean=0.35):
+          - focused (idle=0.05, active scrolling) → BELOW baseline → beta ≈ BETA_MIN
+          - moderate (idle=1.2s = ratio 0.60, 1.7× baseline) → notable idle z-score
+          - heavy (idle=1.8s + blur) → z_idle=2.75, z_focus=3.0 → beta → BETA_MAX
+        """
         focused = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(90)]
-        mild = [
-            _batch(idle_s=0.8, focus="focused", scroll_abs=150.0, para_id=f"chunk-{i % 3 + 1}")
+        moderate = [
+            _batch(idle_s=1.2, focus="focused", scroll_abs=100.0, para_id=f"chunk-{i % 3 + 1}")
             for i in range(90)
         ]
         heavy = [_distracted_batch("chunk-1")] * 90
 
         ema_f = _simulate_timeline(focused, _BASELINE)[-1][1]
-        ema_m = _simulate_timeline(mild, _BASELINE)[-1][1]
+        ema_m = _simulate_timeline(moderate, _BASELINE)[-1][1]
         ema_h = _simulate_timeline(heavy, _BASELINE)[-1][1]
 
-        assert ema_f < ema_m < ema_h, f"f={ema_f:.2f} m={ema_m:.2f} h={ema_h:.2f}"
+        assert ema_f < ema_m, f"focused={ema_f:.3f} should < moderate={ema_m:.3f}"
+        assert ema_m < ema_h, f"moderate={ema_m:.3f} should < heavy={ema_h:.3f}"
 
     def test_early_distraction_raises_drift_vs_focused(self) -> None:
         """1 min of heavy distraction → drift clearly above 1 min of focused."""
         traj_f = _simulate_timeline([_focused_batch("chunk-1")] * 30, _BASELINE)
         traj_h = _simulate_timeline([_distracted_batch("chunk-1")] * 30, _BASELINE)
-        assert traj_h[-1][1] > traj_f[-1][1] + 0.05
+        # With realistic baseline, distracted has beta→0.65 vs focused beta→BETA_MIN
+        assert traj_h[-1][1] > traj_f[-1][1] + 0.20
 
     def test_distraction_onset_mid_session_raises_drift(self) -> None:
         seq = (

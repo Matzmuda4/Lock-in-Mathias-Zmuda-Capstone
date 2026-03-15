@@ -316,6 +316,37 @@ class SessionDriftState(Base):
     )
 
 
+class SessionDriftHistory(Base):
+    """
+    Append-only drift history hypertable — one row every ~10 seconds per session.
+
+    Unlike session_drift_states (latest snapshot only), this table lets us
+    reconstruct the full drift trajectory for analysis and LLM context.
+
+    TimescaleDB hypertable constraint: the partitioning column (created_at) must
+    be part of the primary/composite key.  We use (session_id, created_at) as the
+    composite PK — unique per session per timestamp, no serial id needed.
+    """
+
+    __tablename__ = "session_drift_history"
+    __table_args__ = (
+        PrimaryKeyConstraint("session_id", "created_at"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    drift_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    beta_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    disruption_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    engagement_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    pace_ratio: Mapped[Optional[float]] = mapped_column(nullable=True)
+
+
 # ─── End Phase 7 ──────────────────────────────────────────────────────────────
 
 

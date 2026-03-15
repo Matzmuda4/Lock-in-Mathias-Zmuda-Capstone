@@ -91,6 +91,13 @@ class DriftDebugResponse(BaseModel):
     pace_dev: float
     pace_available: bool
     window_wpm_effective: float
+    # Data quality flags
+    telemetry_fault_rate: float = 0.0
+    scroll_capture_fault_rate: float = 0.0
+    paragraph_missing_fault_rate: float = 0.0
+    quality_confidence_mult: float = 1.0
+    baseline_valid: bool = True
+    skim_fallback_z: float = 0.0
 
 
 # ── Internal recompute helper ─────────────────────────────────────────────────
@@ -356,6 +363,9 @@ async def get_drift_debug(
     z_dict = dataclasses.asdict(result.z_scores)
     features_dict = dataclasses.asdict(features)
 
+    wpm_eff = baseline.get("wpm_effective") or baseline.get("wpm_gross") or 0.0
+    baseline_valid = baseline_used and wpm_eff > 0
+
     return DriftDebugResponse(
         session_id=session_id,
         user_id=session.user_id,
@@ -379,4 +389,184 @@ async def get_drift_debug(
         pace_dev=features.pace_dev,
         pace_available=features.pace_available,
         window_wpm_effective=features.window_wpm_effective,
+        telemetry_fault_rate=features.telemetry_fault_rate,
+        scroll_capture_fault_rate=features.scroll_capture_fault_rate,
+        paragraph_missing_fault_rate=features.paragraph_missing_fault_rate,
+        quality_confidence_mult=features.quality_confidence_mult,
+        baseline_valid=baseline_valid,
+        skim_fallback_z=result.beta_components.get("skim_fallback_z", 0.0),
+    )
+
+
+# ── Part D: LLM-ready state packet ────────────────────────────────────────────
+
+
+class StatePacketFlags(BaseModel):
+    baseline_valid: bool
+    baseline_wpm_valid: bool
+    telemetry_fault_rate: float
+    scroll_capture_fault_rate: float
+    paragraph_missing_fault_rate: float
+    quality_confidence_mult: float
+
+
+class StatePacketDrift(BaseModel):
+    drift_ema: float
+    drift_level: float
+    beta_ema: float
+    disruption_score: float
+    engagement_score: float
+    confidence: float
+
+
+class StatePacketContext(BaseModel):
+    progress_ratio: float
+    current_paragraph_id: Optional[str]
+    pace_ratio: Optional[float]
+    pace_available: bool
+    progress_velocity: float
+
+
+class StatePacket(BaseModel):
+    """
+    Structured payload prepared for the future LLM attentional-state classifier.
+
+    The LLM will later map these signals to probabilistic state labels
+    (Focused / Drifting / Hyperfocused / Fatigued) and select an
+    intervention tier.  This endpoint produces the payload only — no LLM
+    is invoked here.
+    """
+    session_id: int
+    user_id: int
+    computed_at: datetime
+    # Compact baseline snapshot (keys the LLM needs)
+    baseline_snapshot: dict[str, Any]
+    # Extracted window features (current 30 s)
+    window_features: dict[str, Any]
+    # Normalised z-scores
+    z_scores: dict[str, Any]
+    # Drift state
+    drift: StatePacketDrift
+    # Data-quality / validity flags
+    flags: StatePacketFlags
+    # Reading context
+    context: StatePacketContext
+
+
+@router.get("/sessions/{session_id}/state-packet", response_model=StatePacket)
+async def get_state_packet(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StatePacket:
+    """
+    LLM-ready input packet for session {session_id}.
+
+    Returns a structured payload containing:
+    - Calibration baseline snapshot (selected keys)
+    - Extracted 30-second window features
+    - Normalised z-scores for all signals
+    - Current drift state (drift_ema, beta_ema, disruption, engagement)
+    - Data-quality flags (baseline_valid, telemetry_fault, etc.)
+    - Reading context (progress_ratio, paragraph_id)
+
+    No LLM is invoked.  This endpoint is preparation for Phase 8.
+    Ownership enforced: only the session owner can access.
+    """
+    session = await _get_owned_session(session_id, current_user.id, db)
+
+    # Baseline
+    baseline_row = (
+        await db.execute(
+            select(UserBaseline).where(UserBaseline.user_id == session.user_id)
+        )
+    ).scalar_one_or_none()
+    baseline: dict = baseline_row.baseline_json if baseline_row else {}
+
+    wpm_eff = baseline.get("wpm_effective") or baseline.get("wpm_gross") or 0.0
+    baseline_valid = baseline_row is not None and wpm_eff > 0
+
+    # Paragraph word counts
+    chunks_result = await db.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == session.document_id)
+    )
+    chunks = chunks_result.scalars().all()
+    paragraph_word_counts: dict[str, int] = {}
+    for c in chunks:
+        wc = (c.meta or {}).get("word_count") or len(c.text.split())
+        paragraph_word_counts[f"chunk-{c.id}"] = wc
+        paragraph_word_counts[f"calib-{c.chunk_index}"] = wc
+
+    batches = await fetch_window(session.id, db)
+    progress_markers = await fetch_progress_markers_count(session.id, db)
+
+    now = datetime.now(timezone.utc)
+    started = session.started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    elapsed_s = max(0.0, (now - started).total_seconds())
+    elapsed_min = elapsed_s / 60.0
+
+    b = baseline
+    pause_thresh = max(2.0, b.get("para_dwell_median_s", 10.0) / 3.0)
+    features = extract_features(batches, paragraph_word_counts, wpm_eff, pause_threshold_s=pause_thresh)
+    features.progress_markers_count = progress_markers
+
+    from app.services.drift.model import compute_z_scores, compute_drift_result, BETA0 as _BETA0
+    prev_row = await get_drift_state(session.id, db)
+    prev_ema = prev_row.drift_ema if prev_row else 0.0
+    prev_beta_ema = prev_row.beta_ema if prev_row else _BETA0
+
+    result = compute_drift_result(features, baseline, elapsed_min, prev_ema, prev_beta_ema)
+
+    import dataclasses as _dc
+    z_dict = _dc.asdict(result.z_scores)
+    feat_dict = _dc.asdict(features)
+
+    # Latest batch context
+    last_batch = batches[-1] if batches else {}
+
+    baseline_snapshot = {
+        "wpm_effective": wpm_eff,
+        "wpm_gross": baseline.get("wpm_gross"),
+        "idle_ratio_mean": baseline.get("idle_ratio_mean", 0.35),
+        "idle_ratio_std": baseline.get("idle_ratio_std", 0.20),
+        "scroll_jitter_mean": baseline.get("scroll_jitter_mean"),
+        "regress_rate_mean": baseline.get("regress_rate_mean"),
+        "para_dwell_median_s": baseline.get("para_dwell_median_s"),
+        "para_dwell_iqr_s": baseline.get("para_dwell_iqr_s"),
+        "scroll_velocity_norm_mean": baseline.get("scroll_velocity_norm_mean"),
+        "calibration_duration_seconds": baseline.get("calibration_duration_seconds"),
+    }
+
+    return StatePacket(
+        session_id=session_id,
+        user_id=session.user_id,
+        computed_at=now,
+        baseline_snapshot=baseline_snapshot,
+        window_features=feat_dict,
+        z_scores=z_dict,
+        drift=StatePacketDrift(
+            drift_ema=result.drift_ema,
+            drift_level=result.drift_level,
+            beta_ema=result.beta_ema,
+            disruption_score=result.disruption_score,
+            engagement_score=result.engagement_score,
+            confidence=result.confidence,
+        ),
+        flags=StatePacketFlags(
+            baseline_valid=baseline_valid,
+            baseline_wpm_valid=wpm_eff > 0,
+            telemetry_fault_rate=features.telemetry_fault_rate,
+            scroll_capture_fault_rate=features.scroll_capture_fault_rate,
+            paragraph_missing_fault_rate=features.paragraph_missing_fault_rate,
+            quality_confidence_mult=features.quality_confidence_mult,
+        ),
+        context=StatePacketContext(
+            progress_ratio=last_batch.get("viewport_progress_ratio", 0.0),
+            current_paragraph_id=last_batch.get("current_paragraph_id"),
+            pace_ratio=result.pace_ratio,
+            pace_available=features.pace_available,
+            progress_velocity=features.progress_velocity,
+        ),
     )

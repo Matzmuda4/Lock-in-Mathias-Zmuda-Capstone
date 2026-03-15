@@ -4,7 +4,15 @@
  * These run without any React environment — no DOM, no hooks, no mocks.
  */
 import { describe, it, expect } from "vitest";
-import { computeMouseStats, selectCurrentParagraph, type Point, type IntersectionEntry } from "../hooks/useTelemetry";
+import {
+  computeMouseStats,
+  selectCurrentParagraph,
+  computeWindowIdle,
+  checkTelemetrySanity,
+  findCurrentParagraphFromDOM,
+  type Point,
+  type IntersectionEntry,
+} from "../hooks/useTelemetry";
 
 // ─── Signed scroll sum helpers (inline, mirrors hook accumulator logic) ────────
 
@@ -150,19 +158,20 @@ describe("selectCurrentParagraph", () => {
     expect(paragraphId).toBeNull();
   });
 
-  it("returns null when all ratios are below 0.6 threshold", () => {
+  it("falls back to highest-ratio when all below 0.6", () => {
+    // A3 fix: no longer returns null — picks the highest-ratio element
     const entries: IntersectionEntry[] = [
-      { paragraphId: "chunk-1", chunkIndex: 0, ratio: 0.3 },
-      { paragraphId: "chunk-2", chunkIndex: 1, ratio: 0.59 },
+      { paragraphId: "chunk-1", chunkIndex: 0, ratio: 0.3, topOffset: 100 },
+      { paragraphId: "chunk-2", chunkIndex: 1, ratio: 0.59, topOffset: 50 },
     ];
     const { paragraphId } = selectCurrentParagraph(entries);
-    expect(paragraphId).toBeNull();
+    expect(paragraphId).toBe("chunk-2"); // highest ratio
   });
 
   it("returns the single element when only one meets threshold", () => {
     const entries: IntersectionEntry[] = [
-      { paragraphId: "chunk-3", chunkIndex: 2, ratio: 0.1 },
-      { paragraphId: "chunk-4", chunkIndex: 3, ratio: 0.75 },
+      { paragraphId: "chunk-3", chunkIndex: 2, ratio: 0.1, topOffset: 200 },
+      { paragraphId: "chunk-4", chunkIndex: 3, ratio: 0.75, topOffset: 10 },
     ];
     const result = selectCurrentParagraph(entries);
     expect(result.paragraphId).toBe("chunk-4");
@@ -171,9 +180,9 @@ describe("selectCurrentParagraph", () => {
 
   it("returns the element with highest ratio when multiple meet threshold", () => {
     const entries: IntersectionEntry[] = [
-      { paragraphId: "chunk-5", chunkIndex: 4, ratio: 0.65 },
-      { paragraphId: "chunk-6", chunkIndex: 5, ratio: 0.9 },
-      { paragraphId: "chunk-7", chunkIndex: 6, ratio: 0.72 },
+      { paragraphId: "chunk-5", chunkIndex: 4, ratio: 0.65, topOffset: 300 },
+      { paragraphId: "chunk-6", chunkIndex: 5, ratio: 0.9, topOffset: 100 },
+      { paragraphId: "chunk-7", chunkIndex: 6, ratio: 0.72, topOffset: 200 },
     ];
     const result = selectCurrentParagraph(entries);
     expect(result.paragraphId).toBe("chunk-6");
@@ -182,7 +191,7 @@ describe("selectCurrentParagraph", () => {
 
   it("treats exactly 0.6 as meeting the threshold", () => {
     const entries: IntersectionEntry[] = [
-      { paragraphId: "chunk-8", chunkIndex: 7, ratio: 0.6 },
+      { paragraphId: "chunk-8", chunkIndex: 7, ratio: 0.6, topOffset: 0 },
     ];
     const result = selectCurrentParagraph(entries);
     expect(result.paragraphId).toBe("chunk-8");
@@ -190,11 +199,189 @@ describe("selectCurrentParagraph", () => {
 
   it("preserves null chunkIndex when it is null", () => {
     const entries: IntersectionEntry[] = [
-      { paragraphId: "chunk-9", chunkIndex: null, ratio: 0.8 },
+      { paragraphId: "chunk-9", chunkIndex: null, ratio: 0.8, topOffset: 0 },
     ];
     const result = selectCurrentParagraph(entries);
     expect(result.paragraphId).toBe("chunk-9");
     expect(result.chunkIndex).toBeNull();
+  });
+
+  it("falls back to closest-to-top when all ratios are 0", () => {
+    const entries: IntersectionEntry[] = [
+      { paragraphId: "chunk-10", chunkIndex: 0, ratio: 0, topOffset: 300 },
+      { paragraphId: "chunk-11", chunkIndex: 1, ratio: 0, topOffset: 10 },
+    ];
+    const { paragraphId } = selectCurrentParagraph(entries);
+    expect(paragraphId).toBe("chunk-11"); // closest to top
+  });
+});
+
+// ─── A1: computeWindowIdle ────────────────────────────────────────────────────
+
+describe("computeWindowIdle (A1 fix)", () => {
+  const WINDOW_S = 2.0;
+
+  it("returns WINDOW_S when last interaction was before the window started", () => {
+    const now = 10_000;
+    const windowStart = 8_000;
+    const lastInteraction = 7_500; // before window start
+    expect(computeWindowIdle(windowStart, lastInteraction, now, WINDOW_S)).toBeCloseTo(WINDOW_S);
+  });
+
+  it("returns 0 when interaction happened at the very end of window", () => {
+    const now = 10_000;
+    const windowStart = 8_000;
+    const lastInteraction = 9_990; // just before now
+    const idle = computeWindowIdle(windowStart, lastInteraction, now, WINDOW_S);
+    expect(idle).toBeCloseTo(0.01, 1);
+  });
+
+  it("never exceeds WINDOW_S", () => {
+    const now = 100_000;
+    const windowStart = 0;
+    const lastInteraction = 0; // ancient
+    const idle = computeWindowIdle(windowStart, lastInteraction, now, WINDOW_S);
+    expect(idle).toBeLessThanOrEqual(WINDOW_S);
+  });
+
+  it("is always >= 0", () => {
+    const now = 10_000;
+    const windowStart = 9_000;
+    const lastInteraction = 10_500; // future (shouldn't happen, but guard)
+    const idle = computeWindowIdle(windowStart, lastInteraction, now, WINDOW_S);
+    expect(idle).toBeGreaterThanOrEqual(0);
+  });
+
+  it("partial idle when user interacted mid-window", () => {
+    // Window is 2s. Interaction happened 1s ago = 1s idle in window
+    const now = 10_000;
+    const windowStart = 8_000;
+    const lastInteraction = 9_000; // 1s ago = within window
+    const idle = computeWindowIdle(windowStart, lastInteraction, now, WINDOW_S);
+    expect(idle).toBeCloseTo(1.0, 1);
+  });
+});
+
+// ─── A4: checkTelemetrySanity ────────────────────────────────────────────────
+
+describe("checkTelemetrySanity (A4 fix)", () => {
+  it("flags idleExceedsWindow when idle > 2.0", () => {
+    const w = checkTelemetrySanity(2.1, 0, 0.0, 0.0, null);
+    expect(w.idleExceedsWindow).toBe(true);
+  });
+
+  it("does not flag idleExceedsWindow when idle <= 2.0", () => {
+    const w = checkTelemetrySanity(2.0, 100, 0.0, 0.0, "chunk-1");
+    expect(w.idleExceedsWindow).toBe(false);
+  });
+
+  it("flags scrollZeroWithProgress when scroll=0 but progress changed > 0.05", () => {
+    const w = checkTelemetrySanity(0.5, 0, 0.0, 0.1, "chunk-1", true);
+    expect(w.scrollZeroWithProgress).toBe(true);
+  });
+
+  it("does not flag scrollZeroWithProgress when scroll events captured", () => {
+    const w = checkTelemetrySanity(0.5, 100, 0.0, 0.1, "chunk-1", true);
+    expect(w.scrollZeroWithProgress).toBe(false);
+  });
+
+  it("does not flag scrollZeroWithProgress when listener not yet ready (loading phase)", () => {
+    // Even though scroll=0 and progress changed, no false positive during load
+    const w = checkTelemetrySanity(0.5, 0, 0.0, 0.37, "chunk-1", false);
+    expect(w.scrollZeroWithProgress).toBe(false);
+  });
+
+  it("defaults scrollListenerReady to true for backwards compatibility", () => {
+    // Omitting the argument should behave the same as passing true
+    const w = checkTelemetrySanity(0.5, 0, 0.0, 0.1, "chunk-1");
+    expect(w.scrollZeroWithProgress).toBe(true);
+  });
+
+  it("flags paragraphMissing when paragraphId is null", () => {
+    const w = checkTelemetrySanity(0.5, 100, 0.0, 0.1, null);
+    expect(w.paragraphMissing).toBe(true);
+  });
+
+  it("does not flag paragraphMissing when paragraphId present", () => {
+    const w = checkTelemetrySanity(0.5, 100, 0.0, 0.1, "chunk-5");
+    expect(w.paragraphMissing).toBe(false);
+  });
+});
+
+// ─── findCurrentParagraphFromDOM ─────────────────────────────────────────────
+// These tests require a DOM environment (jsdom, provided by vitest).
+
+function makeParagraphEl(
+  paragraphId: string,
+  chunkIndex: number,
+  offsetTop: number,
+  height: number,
+): HTMLElement {
+  const el = document.createElement("div");
+  el.dataset.paragraphId = paragraphId;
+  el.dataset.chunkIndex = String(chunkIndex);
+  // jsdom doesn't compute layout, so we mock offsetTop via a getter
+  Object.defineProperty(el, "offsetTop", { get: () => offsetTop });
+  Object.defineProperty(el, "offsetHeight", { get: () => height });
+  return el;
+}
+
+function makeContainer(
+  scrollTop: number,
+  clientHeight: number,
+  children: HTMLElement[],
+): HTMLElement {
+  const container = document.createElement("div");
+  Object.defineProperty(container, "scrollTop", { get: () => scrollTop });
+  Object.defineProperty(container, "clientHeight", { get: () => clientHeight });
+  children.forEach((c) => container.appendChild(c));
+  return container;
+}
+
+describe("findCurrentParagraphFromDOM", () => {
+  it("returns null when container has no paragraph elements", () => {
+    const container = makeContainer(0, 600, []);
+    const { paragraphId } = findCurrentParagraphFromDOM(container);
+    expect(paragraphId).toBeNull();
+  });
+
+  it("returns the only element when there is one", () => {
+    const el = makeParagraphEl("chunk-1", 0, 100, 80);
+    const container = makeContainer(0, 600, [el]);
+    const { paragraphId, chunkIndex } = findCurrentParagraphFromDOM(container);
+    expect(paragraphId).toBe("chunk-1");
+    expect(chunkIndex).toBe(0);
+  });
+
+  it("returns element closest to viewport centre", () => {
+    // Viewport: scrollTop=0, clientHeight=600, centre=300
+    // chunk-1 centre: offsetTop 50 + height 100 / 2 = 100  → dist 200
+    // chunk-2 centre: offsetTop 250 + height 100 / 2 = 300 → dist 0
+    // chunk-3 centre: offsetTop 600 + height 100 / 2 = 650 → dist 350
+    const el1 = makeParagraphEl("chunk-1", 0, 50, 100);
+    const el2 = makeParagraphEl("chunk-2", 1, 250, 100);
+    const el3 = makeParagraphEl("chunk-3", 2, 600, 100);
+    const container = makeContainer(0, 600, [el1, el2, el3]);
+    const { paragraphId } = findCurrentParagraphFromDOM(container);
+    expect(paragraphId).toBe("chunk-2");
+  });
+
+  it("correctly handles scrolled-down state", () => {
+    // Viewport: scrollTop=500, clientHeight=600, centre=800
+    // chunk-4 centre: 750 + 50 = 800 → dist 0 (perfect match)
+    // chunk-5 centre: 200 + 50 = 250 → dist 550 (far above)
+    const el4 = makeParagraphEl("chunk-4", 3, 750, 100);
+    const el5 = makeParagraphEl("chunk-5", 4, 200, 100);
+    const container = makeContainer(500, 600, [el4, el5]);
+    const { paragraphId } = findCurrentParagraphFromDOM(container);
+    expect(paragraphId).toBe("chunk-4");
+  });
+
+  it("returns correct chunkIndex", () => {
+    const el = makeParagraphEl("chunk-7", 7, 100, 50);
+    const container = makeContainer(0, 600, [el]);
+    const { chunkIndex } = findCurrentParagraphFromDOM(container);
+    expect(chunkIndex).toBe(7);
   });
 });
 

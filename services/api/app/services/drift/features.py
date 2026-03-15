@@ -120,6 +120,57 @@ def estimate_window_wpm(
     return (words_read / eff_seconds) * 60.0, True, n_paragraphs
 
 
+# ── Quality flag helpers ──────────────────────────────────────────────────────
+
+
+def compute_quality_confidence_mult(batches: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+    """
+    Compute data-quality rates and a combined confidence multiplier.
+
+    Returns:
+        (telemetry_fault_rate, scroll_capture_fault_rate,
+         paragraph_missing_fault_rate, quality_confidence_mult)
+
+    Confidence penalties (multiplicative):
+        - telemetry_fault (idle > 2s)       → ×0.5
+        - scroll_capture_fault              → ×0.7
+        - paragraph_missing for all batches → ×0.7
+    """
+    n = len(batches)
+    if n == 0:
+        return 0.0, 0.0, 0.0, 1.0
+
+    tf = sum(1 for b in batches if b.get("telemetry_fault", False)) / n
+    scf = sum(1 for b in batches if b.get("scroll_capture_fault", False)) / n
+    pmf = sum(1 for b in batches if b.get("paragraph_missing_fault", b.get("current_paragraph_id") is None)) / n
+
+    mult = 1.0
+    if tf > 0.3:   # more than 30% of batches had idle > 2s
+        mult *= 0.5
+    if scf > 0.5:  # more than 50% of batches had no scroll events
+        mult *= 0.7
+    if pmf > 0.7:  # more than 70% of batches missing paragraph id
+        mult *= 0.7
+
+    return tf, scf, pmf, mult
+
+
+def compute_progress_velocity(batches: list[dict[str, Any]]) -> float:
+    """
+    Rate of progress_ratio change per second across the window.
+    Used as a skimming fallback when pace estimation is unavailable.
+
+    Returns progress delta / window_seconds (0 if insufficient data).
+    """
+    progresses = [b.get("viewport_progress_ratio", 0.0) for b in batches]
+    if len(progresses) < 2:
+        return 0.0
+    # Change from first to last batch in window
+    total_change = progresses[-1] - progresses[0]
+    window_seconds = len(progresses) * _BATCH_WINDOW_S
+    return total_change / max(window_seconds, _EPS)
+
+
 # ── Main extractor ────────────────────────────────────────────────────────────
 
 
@@ -134,6 +185,9 @@ def extract_features(
 
     pause_threshold_s is the personalized threshold for "long pause" detection;
     callers should pass `max(2.0, baseline_para_dwell_median_s / 3)`.
+
+    Also computes data-quality flags and confidence multiplier from
+    server-side telemetry fault tags.
     """
     n = len(batches)
     if n == 0:
@@ -194,6 +248,12 @@ def extract_features(
 
     stag = compute_stagnation_ratio(batches)
 
+    # Progress velocity (skimming fallback)
+    prog_vel = compute_progress_velocity(batches)
+
+    # Data-quality flags and confidence multiplier
+    tf_rate, scf_rate, pmf_rate, qual_mult = compute_quality_confidence_mult(batches)
+
     return WindowFeatures(
         n_batches=n,
         scroll_velocity_norm_mean=sv_mean,
@@ -214,4 +274,9 @@ def extract_features(
         mouse_path_px_mean=mean(mouse_paths),
         stagnation_ratio=stag,
         paragraph_stagnation=stag,  # alias
+        progress_velocity=prog_vel,
+        telemetry_fault_rate=tf_rate,
+        scroll_capture_fault_rate=scf_rate,
+        paragraph_missing_fault_rate=pmf_rate,
+        quality_confidence_mult=qual_mult,
     )

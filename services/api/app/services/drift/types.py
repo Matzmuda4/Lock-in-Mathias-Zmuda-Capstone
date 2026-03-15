@@ -56,6 +56,20 @@ class WindowFeatures:
     # Count of "progress_marker" events in the last 30 s
     progress_markers_count: int = 0
 
+    # ── Progress velocity (skimming fallback when pace unavailable) ───────────
+    # delta(progress_ratio) / window_seconds — non-zero when user scrolled quickly
+    progress_velocity: float = 0.0
+
+    # ── Data-quality flags (from server-side guardrails) ──────────────────────
+    # Fraction of batches with telemetry_fault (idle > 2s received by server)
+    telemetry_fault_rate: float = 0.0
+    # Fraction of batches with scroll_capture_fault
+    scroll_capture_fault_rate: float = 0.0
+    # Fraction of batches with paragraph_missing_fault
+    paragraph_missing_fault_rate: float = 0.0
+    # Derived confidence multiplier applied by model (0..1)
+    quality_confidence_mult: float = 1.0
+
 
 @dataclass
 class ZScores:

@@ -108,9 +108,40 @@ async def post_activity_batch(
             detail="Active session not found or does not belong to the current user",
         )
 
+    # ── B1/B2: Data quality guardrails ────────────────────────────────────────
+    # Apply corrections and tag faults before storage so the drift model
+    # can apply confidence penalties on retrieval.
+    _WINDOW_S = 2.0
+    _PROGRESS_JUMP_THRESH = 0.20
+
+    raw_idle = body.idle_seconds
+    telemetry_fault = raw_idle > _WINDOW_S
+    # Server-side clamp — idle must be 0..WINDOW_S
+    clamped_idle = min(raw_idle, _WINDOW_S)
+
+    scroll_abs = body.scroll_delta_abs_sum
+    scroll_capture_fault = (
+        scroll_abs < 0.1
+        and body.scroll_event_count == 0
+        # Only flag when progress ratio has changed significantly
+        # (we don't have the previous batch's ratio here, so we use a proxy:
+        #  if the user has been reading long enough, progress > 0 means they scrolled at some point)
+        # Full check happens in feature extraction using rolling window context.
+        # Here we just check if scroll_event_count is suspiciously 0.
+        # The deeper per-window check happens in features.py.
+    )
+
+    paragraph_missing_fault = body.current_paragraph_id is None
+
     # Store the full batch payload in JSONB for downstream analysis.
     # One row per 2-second window — low overhead on the hypertable.
     payload = body.model_dump(exclude={"session_id", "client_timestamp"})
+    # Overwrite idle_seconds with the server-clamped value
+    payload["idle_seconds"] = clamped_idle
+    # Attach quality flags so feature extraction + model can apply penalties
+    payload["telemetry_fault"] = telemetry_fault
+    payload["scroll_capture_fault"] = scroll_capture_fault
+    payload["paragraph_missing_fault"] = paragraph_missing_fault
 
     event = ActivityEvent(
         user_id=current_user.id,

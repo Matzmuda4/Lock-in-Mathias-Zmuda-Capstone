@@ -145,7 +145,11 @@ function ImageChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   }
 
   return (
-    <div className="chunk chunk--figure">
+    <div
+      className="chunk chunk--figure"
+      data-paragraph-id={`chunk-img-${assetId}`}
+      data-chunk-index={-1}
+    >
       {url
         ? <img src={url} alt={caption} className="chunk__img" />
         : <p className="chunk__image-loading">Loading figure…</p>
@@ -165,7 +169,11 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   const imageOk = assetId && url && !fetchError && !renderError;
 
   return (
-    <div className="chunk chunk--table">
+    <div
+      className="chunk chunk--table"
+      data-paragraph-id={`chunk-tbl-${chunk.id}`}
+      data-chunk-index={-1}
+    >
       {imageOk && (
         <img
           src={url}
@@ -384,9 +392,24 @@ function ExportCsvButton({ sessionId, token }: { sessionId: number; token: strin
 
 // ─── Dev-only debug panel ────────────────────────────────────────────────────
 
-function DebugPanel({ batch }: { batch: object | null }) {
+import type { TelemetrySanityWarnings } from "../hooks/useTelemetry";
+
+function DebugPanel({
+  batch,
+  warnings,
+}: {
+  batch: object | null;
+  warnings: TelemetrySanityWarnings | null;
+}) {
   const [open, setOpen] = useState(false);
   if (!DEV) return null;
+
+  const hasWarnings = warnings && (
+    warnings.idleExceedsWindow ||
+    warnings.scrollZeroWithProgress ||
+    warnings.paragraphMissing
+  );
+
   return (
     <div className="debug-panel">
       <button
@@ -395,11 +418,21 @@ function DebugPanel({ batch }: { batch: object | null }) {
         onClick={() => setOpen((o) => !o)}
       >
         {open ? "▾" : "▸"} Last telemetry batch
+        {hasWarnings && <span style={{ color: "orange", marginLeft: 6 }}>⚠ warnings</span>}
       </button>
       {open && (
-        <pre className="debug-panel__json">
-          {batch ? JSON.stringify(batch, null, 2) : "—"}
-        </pre>
+        <>
+          {hasWarnings && (
+            <div style={{ padding: "4px 12px", fontSize: 11, color: "orange" }}>
+              {warnings?.idleExceedsWindow && <div>⚠ idle_seconds &gt; 2.0 (should be 0–2)</div>}
+              {warnings?.scrollZeroWithProgress && <div>⚠ scroll=0 but progress ratio changed — scroll capture may be broken</div>}
+              {warnings?.paragraphMissing && <div>⚠ current_paragraph_id missing — IntersectionObserver may not be attached</div>}
+            </div>
+          )}
+          <pre className="debug-panel__json">
+            {batch ? JSON.stringify(batch, null, 2) : "—"}
+          </pre>
+        </>
       )}
     </div>
   );
@@ -585,7 +618,7 @@ export function ReaderPage() {
 
   // Telemetry — active only while the session is in "active" status
   const isActive = data?.session?.status === "active";
-  const { lastBatch, collecting } = useTelemetry({
+  const { lastBatch, collecting, warnings } = useTelemetry({
     sessionId,
     token,
     active: isActive,
@@ -796,7 +829,7 @@ export function ReaderPage() {
       </main>
 
       {/* Dev debug panels */}
-      {DEV && <DebugPanel batch={lastBatch} />}
+      {DEV && <DebugPanel batch={lastBatch} warnings={warnings} />}
       {DEV && <DriftDebugPanel token={token} sessionId={sessionId} />}
 
       <style>{`

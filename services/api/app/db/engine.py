@@ -83,3 +83,39 @@ async def init_db() -> None:
                 ")"
             )
         )
+
+    # Step 4 — Ensure session_drift_history has the correct composite PK
+    # If the table was previously created with a serial id PK (wrong), drop and
+    # recreate it so the hypertable conversion succeeds.
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_name='session_drift_history' AND column_name='id'"
+            )
+        )
+        has_id_column = result.scalar() > 0
+
+    if has_id_column:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS session_drift_history CASCADE"))
+        # Recreate with correct schema
+        from app.db.base import Base
+        import app.db.models as _models  # noqa: F401
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                lambda sync_conn: Base.metadata.tables["session_drift_history"].create(
+                    sync_conn, checkfirst=True
+                )
+            )
+
+    # Convert to hypertable (idempotent)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "SELECT create_hypertable("
+                "  'session_drift_history', 'created_at',"
+                "  if_not_exists => TRUE"
+                ")"
+            )
+        )

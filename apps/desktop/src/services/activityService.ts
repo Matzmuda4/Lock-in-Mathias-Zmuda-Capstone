@@ -13,7 +13,10 @@ export interface TelemetryBatch {
   /** Sum of absolute values of negative (upward) scroll deltas — for regress_rate. */
   scroll_delta_neg_sum: number;
   // ── Engagement ────────────────────────────────────────────────────────────
+  /** Seconds idle IN THIS 2s window (0..2). Fix: no longer cumulative. */
   idle_seconds: number;
+  /** Diagnostic: total seconds since last interaction (not used by model). */
+  idle_since_interaction_seconds?: number;
   // ── Mouse ─────────────────────────────────────────────────────────────────
   mouse_path_px: number;
   mouse_net_px: number;

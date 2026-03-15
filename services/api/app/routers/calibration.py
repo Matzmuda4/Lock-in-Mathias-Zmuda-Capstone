@@ -274,6 +274,35 @@ async def calibration_complete(
 
     paragraph_count_total = len(chunks)
 
+    # ── B3: Minimum calibration sufficiency check ─────────────────────────────
+    # Reject baseline generation if the session provided insufficient data.
+    # This prevents zero/invalid baselines from corrupting the drift model.
+    _MIN_DURATION_S = 90
+    _MIN_PARAGRAPHS = 3    # relaxed: calibration text may not have many paragraphs
+    _MIN_BATCHES = 3       # at least 3 telemetry batches (6 seconds of data)
+    paras_visited = len({
+        b.get("current_paragraph_id") for b in batches
+        if b.get("current_paragraph_id")
+    })
+    # Any one condition is sufficient to pass
+    sufficient = (
+        duration >= _MIN_DURATION_S
+        or paras_visited >= _MIN_PARAGRAPHS
+        or len(batches) >= _MIN_BATCHES
+        or total_words >= 100
+    )
+    if not sufficient:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Calibration insufficient: duration={duration}s, "
+                f"paragraphs_visited={paras_visited}, batches={len(batches)}. "
+                f"Need at least one of: >={_MIN_DURATION_S}s duration, "
+                f">={_MIN_PARAGRAPHS} paragraphs visited, or >={_MIN_BATCHES} telemetry batches. "
+                "Please read through more of the calibration text before finishing."
+            ),
+        )
+
     # Compute baseline with all enriched data
     baseline_data = compute_baseline(
         batches,

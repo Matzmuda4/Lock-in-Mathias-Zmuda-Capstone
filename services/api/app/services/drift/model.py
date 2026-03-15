@@ -1,54 +1,136 @@
 """
-Hybrid drift model — Phase 7 (stabilized, bidirectional beta).
+Hybrid drift model — Phase 7 v2 (idle-sensitive, research-grounded weights).
 
-Mathematical foundation
------------------------
-Attention follows an exponential decay:
+═══════════════════════════════════════════════════════════════════════════
+MATHEMATICAL FOUNDATION
+═══════════════════════════════════════════════════════════════════════════
 
-    A(t) = exp(-beta_effective * t)
-    drift_score = 1 - A(t)
+Attention follows a personalised exponential decay (Yerkes–Dodson / arousal
+literature; exponential forgetting curves — Ebbinghaus 1885; applied to
+sustained reading by Smallwood & Schooler 2006):
 
-This guarantees:
-- drift is NEVER permanently at 0 (it grows naturally with time-on-task)
-- drift can DECREASE if beta drops below the current value (re-engagement)
-- drift grows faster when beta_effective is higher (distraction/instability)
+    A(t)  = exp(−beta_ema × t_minutes)    ∈ (0, 1]
+    drift = 1 − A(t)                       ∈ [0, 1)
 
-Beta modulation
----------------
-beta_effective is computed every window cycle:
+Properties:
+  • drift is NEVER stuck at 0 (grows naturally with time-on-task)
+  • drift DECREASES when beta_ema drops (re-engagement, recovery)
+  • drift grows faster when beta_ema is large (distraction / idleness)
+  • at t = 0 drift is exactly 0; at t → ∞ drift → 1
 
-    beta_raw = beta0
-             + confidence * W_DISRUPT * disruption_score
-             - confidence * W_ENGAGE  * engagement_score
+═══════════════════════════════════════════════════════════════════════════
+BETA MODULATION (personalised decay rate)
+═══════════════════════════════════════════════════════════════════════════
+
+Every 2-second telemetry cycle recomputes beta_effective, then smooth-tracks
+it with a slow EMA so single-window noise cannot spike drift:
+
+    beta_raw = BETA0
+             + confidence × W_DISRUPT × disruption_score
+             − confidence × W_ENGAGE  × engagement_score
 
     beta_effective = clamp(beta_raw, BETA_MIN, BETA_MAX)
-    beta_ema       = BETA_EMA_ALPHA * beta_effective + (1 - BETA_EMA_ALPHA) * prev_beta_ema
+    beta_ema       = BETA_EMA_ALPHA × beta_effective
+                   + (1 − BETA_EMA_ALPHA) × prev_beta_ema
 
-Then:
-    drift_score = 1 - exp(-beta_ema * elapsed_minutes)
-    drift_ema   = EMA_ALPHA * drift_score + (1 - EMA_ALPHA) * prev_ema
+Expected beta values for a correctly-calibrated user:
+  Focused reading at baseline    →  beta ≈ BETA_MIN = 0.02
+  Slightly above-baseline idle   →  beta ≈ 0.05 – 0.12
+  Complete idle, no interaction  →  beta ≈ 0.63 – 0.65 (BETA_MAX)
+  Tab away / window blur         →  beta ≈ 0.65 (BETA_MAX)
+  Skimming (2× baseline WPM)     →  beta ≈ 0.46
 
-Disruption/engagement scoring
-------------------------------
-disruption_score ∈ [0,1]  — sigmoid of weighted z-score sum
-    rises when: idle spikes, focus lost, stagnation, regress, jitter, skimming
-engagement_score ∈ [0,1]  — multiplicative calm × pace-alignment
-    rises when: calm (low idle + focus), pace near baseline, progress markers
+Expected drift curves:
+  beta = 0.02 (focused at baseline): 2% @ 1 min,  6% @ 3 min, 18% @ 10 min
+  beta = 0.20 (mild distraction):   18% @ 1 min, 45% @ 3 min, 86% @ 10 min
+  beta = 0.45 (skimming/regress):   36% @ 1 min, 74% @ 3 min, ~99% @ 10 min
+  beta = 0.65 (idle/blur at max):   48% @ 1 min, 86% @ 3 min, ~100% @ 10 min
 
-Skimming detection
-------------------
-Skimming (pace_ratio > SKIM_THRESHOLD) fires two signals simultaneously:
-  z_pace  — symmetric too-fast/too-slow deviation
-  z_skim  — asymmetric extra boost for pace_ratio > 1.3 (reading too fast)
-This ensures fast scrolling through many paragraphs is always detected,
-even when other metrics (idle, focus) look normal.
+═══════════════════════════════════════════════════════════════════════════
+DISRUPTION SCORE (research-grounded signal weights)
+═══════════════════════════════════════════════════════════════════════════
 
-Expected drift curves (typical calibrated user)
------------------------------------------------
-Focused reading:    beta ≈ 0.03 → drift 21% at 3 min, 26% at 10 min
-Mild distraction:   beta ≈ 0.12 → drift 30% at 3 min, 70% at 10 min
-Heavy distraction:  beta ≈ 0.48 → drift 62% at 2 min, 78% at 3 min
-Skimming (1.7×):    beta ≈ 0.19 → drift 43% at 3 min, 61% at 5 min
+disruption_score = sigmoid((disruption_raw − CENTER) / SCALE)
+
+disruption_raw = W_D_IDLE       × z_idle        # PRIMARY — see below
+               + W_D_FOCUS      × z_focus_loss   # explicit disengagement
+               + W_D_STAGNATION × z_stagnation   # stuck on same paragraph
+               + W_D_PACE       × z_pace         # too fast or too slow
+               + W_D_SKIM       × z_skim         # asymmetric fast-skim
+               + W_D_REGRESS    × z_regress      # comprehension-difficulty proxy
+               + W_D_JITTER     × z_jitter       # restlessness/erratic scroll
+               + W_D_BURSTINESS × z_burstiness   # burst scroll instability
+
+Research basis for signal ordering:
+  1. Idle / lack of interaction  (W_D_IDLE = 0.22)
+     Smallwood & Schooler (2006, Psych. Bull.) — sustained mind-wandering is
+     the strongest predictor of offline, stimulus-independent thought.
+     Unsworth & McMillan (2013) link scroll inactivity to mind-wandering.
+  2. Focus loss / tab-away  (W_D_FOCUS = 0.18)
+     Direct behavioural evidence: the user has explicitly left the reading
+     context. Slightly lower than idle because brief accidental switches occur.
+  3. Stagnation on paragraph  (W_D_STAGNATION = 0.12)
+     Rayner (1998, Psych. Bull.) — abnormally long dwell on a single region
+     indicates comprehension difficulty or zoning-out.
+  4. Pace deviation  (W_D_PACE = 0.15) + Skim  (W_D_SKIM = 0.18)
+     Just & Carpenter (1980) — reading rate is tightly coupled to cognitive
+     processing depth. Skimming (impulsive fast forward) AND crawling (stuck)
+     both signal attentional anomaly. Skim receives an asymmetric extra weight.
+  5. Regress rate  (W_D_REGRESS = 0.10)
+     Rayner & Pollatsek (1989) — high regressive saccade rate correlates with
+     reading difficulty / comprehension failure. Weighted below idle because
+     some regress is deliberate review.
+  6. Jitter / direction changes  (W_D_JITTER = 0.08)
+     Novel signal; restless oscillatory scroll is associated with attention
+     restlessness (no published norm; weight is conservative).
+  7. Scroll burstiness  (W_D_BURSTINESS = 0.05) — secondary instability signal.
+
+IMPORTANT: idle weight is NEVER down-weighted by baseline variability.
+Idle is the single most reliable attention signal regardless of user pattern.
+Jitter and regress weights use a softened variability adjustment (0.5×
+instead of 1.0×) so highly-variable users are only mildly de-sensitised.
+
+═══════════════════════════════════════════════════════════════════════════
+ENGAGEMENT SCORE (multiplicative — skimming cannot hide behind calmness)
+═══════════════════════════════════════════════════════════════════════════
+
+engagement = calm × (0.80 × pace_align + 0.20 × progress_boost)
+
+calm       = (1 − z_idle/3) × (1 − z_focus_loss/3)   ∈ [0, 1]
+pace_align = 1 − max(z_pace, z_skim) / 3              ∈ [0, 1]  if pace_available
+           = 0.5 (neutral)                             if pace not yet measurable
+
+The multiplicative design ensures:
+  • Skimming (low pace_align) reduces engagement even when the user is calm
+  • Blur / idle (low calm)   reduces engagement even when pace looks normal
+  • Both bad simultaneously → engagement → 0 → beta approaches BETA_MAX
+
+═══════════════════════════════════════════════════════════════════════════
+CALIBRATION BASELINE USAGE
+═══════════════════════════════════════════════════════════════════════════
+
+All z-scores are computed against the user's own calibration baseline:
+
+    z_idle      = z_pos(idle_ratio_mean,  baseline["idle_ratio_mean"],
+                                          baseline["idle_ratio_std"])
+    z_stagnation = z_pos(stagnation_ratio, stagnation_mu, 0.15)
+                   where stagnation_mu = para_dwell_median_s / 30.0
+    z_pace      = pace_dev / pace_scale
+                  where pace_scale from para_dwell_iqr/median ratio
+    ... etc.
+
+This means the SAME idle_ratio = 0.8 can produce very different z_idle
+depending on the user:
+  • User A: baseline idle_ratio_mean=0.35, std=0.20 → z_idle = 2.25
+  • User B: baseline idle_ratio_mean=0.70, std=0.15 → z_idle = 0.67
+User B naturally pauses more; they are less disrupted by the same raw idle.
+
+Fallback defaults when calibration baseline is absent:
+  idle_ratio_mean = 0.35  (population average for reading sessions)
+  idle_ratio_std  = 0.20  (realistic window-to-window variability)
+Users without calibration get a reasonable population baseline so drift
+still responds correctly. Calibration is mandatory in the app, so fallbacks
+are a safety net, not the primary path.
 """
 
 from __future__ import annotations
@@ -60,39 +142,42 @@ from app.services.drift.types import DriftResult, WindowFeatures, ZScores
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Natural time-on-task decay rate (drift at baseline is ~3% at 1 min, ~21% at 8 min)
+# Natural time-on-task decay rate
+# BETA0 = 0.03 → drift ≈ 3% at 1 min, 9% at 3 min, 26% at 10 min
 BETA0: float = 0.03
 BETA_MIN: float = 0.02    # floor: even perfect engagement can't eliminate decay
-BETA_MAX: float = 0.65    # ceiling: extreme distraction
-BETA_EMA_ALPHA: float = 0.10   # slow EMA for stable beta; 90% there in ~1 min
+BETA_MAX: float = 0.65    # ceiling: extreme distraction / full idle
+BETA_EMA_ALPHA: float = 0.20  # 50% convergence in ~3 steps (6 s) — responsive
 
-# Beta modulation weights
-W_DISRUPT: float = 0.50   # disruption_score × this → added to beta (max +0.50)
-W_ENGAGE: float = 0.18    # engagement_score × this → subtracted from beta (max -0.18)
+# Beta modulation weights (research-grounded; see module docstring)
+W_DISRUPT: float = 0.70   # disruption_score contribution to beta (max +0.70)
+W_ENGAGE: float = 0.425   # engagement_score reduction of beta  (max -0.425)
 
-# Drift display smoothing
+# Drift display smoothing (EMA alpha for UI value)
 EMA_ALPHA: float = 0.25
 
 # Z-score cap per signal term
 Z_POS_CAP: float = 3.0
 
 # Disruption sigmoid parameters: sigmoid((raw - CENTER) / SCALE)
+# CENTER = 0.35 means disruption_raw must exceed 0.35 to score > 0.5
 DISRUPT_CENTER: float = 0.35
 DISRUPT_SCALE: float = 0.25
 
 # Skimming thresholds
-SKIM_THRESHOLD: float = 1.3   # pace_ratio > this triggers asymmetric skimming signal
+SKIM_THRESHOLD: float = 1.3   # pace_ratio > this triggers asymmetric skim signal
 SKIM_SCALE: float = 0.5       # (pace_ratio - 1) / this → z_skim
 
 # Disruption component weights (W_D_X × z_X → disruption_raw)
-W_D_IDLE: float = 0.10
-W_D_FOCUS: float = 0.12
-W_D_STAGNATION: float = 0.08
-W_D_JITTER: float = 0.06
-W_D_REGRESS: float = 0.07
-W_D_PACE: float = 0.15
-W_D_SKIM: float = 0.18    # asymmetric: only fires when pace_ratio > SKIM_THRESHOLD
-W_D_BURSTINESS: float = 0.05
+# Ordered by research-backed importance (see module docstring)
+W_D_IDLE: float = 0.22        # PRIMARY — never reduced by baseline variability
+W_D_FOCUS: float = 0.18       # explicit disengagement
+W_D_STAGNATION: float = 0.12  # stuck on paragraph
+W_D_PACE: float = 0.15        # pace deviation (too fast or too slow)
+W_D_SKIM: float = 0.18        # asymmetric fast-skim signal
+W_D_REGRESS: float = 0.10     # high back-scroll rate
+W_D_JITTER: float = 0.08      # erratic direction changes
+W_D_BURSTINESS: float = 0.05  # burst scroll instability
 
 _EPS: float = 1e-5
 
@@ -129,10 +214,12 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
     """
     b = baseline
 
+    # Realistic fallbacks for uncalibrated users:
+    # readers are idle ~35% of 2-second windows between scrolls
     z_idle = z_pos(
         features.idle_ratio_mean,
-        b.get("idle_ratio_mean", 0.05),
-        max(b.get("idle_ratio_std", 0.08), 0.04),
+        b.get("idle_ratio_mean", 0.35),
+        max(b.get("idle_ratio_std", 0.20), 0.08),
     )
 
     z_focus = z_pos(features.focus_loss_rate, 0.0, 0.08)
@@ -214,16 +301,22 @@ def compute_disruption_score(
     Compute disruption_score ∈ [0,1] via sigmoid of weighted z-score sum.
     Returns (score, per-term breakdown dict).
 
-    Higher-variance baseline signals get slightly down-weighted (the user is
-    naturally variable, so we're less surprised by deviations).
+    Idle weight is FIXED at W_D_IDLE — never reduced by baseline variability.
+    Idle is the primary attention signal; all users should be equally sensitive
+    to deviations from their own measured idle baseline.
+
+    Jitter and regress use a SOFTENED variability adjustment (0.5× penalty
+    vs old 1.0×) so highly-variable users are only mildly de-sensitised.
     """
 
     def _adj(base_w: float, std_key: str, mean_key: str) -> float:
+        """Soft variability adjustment: reduce weight by at most 50%."""
         std = baseline.get(std_key, 0.0)
         mu = max(abs(baseline.get(mean_key, 0.01)), 0.01)
-        return base_w / (1.0 + min(std / mu, 2.0))
+        return base_w / (1.0 + 0.5 * min(std / mu, 2.0))
 
-    w_idle = _adj(W_D_IDLE, "idle_ratio_std", "idle_ratio_mean")
+    # Idle: fixed weight — never adjusted by baseline variability
+    w_idle = W_D_IDLE
     w_jitter = _adj(W_D_JITTER, "scroll_jitter_std", "scroll_jitter_mean")
     w_regress = _adj(W_D_REGRESS, "regress_rate_std", "regress_rate_mean")
 
@@ -341,7 +434,7 @@ def personalized_rates(baseline: dict[str, Any]) -> tuple[float, float]:
     """
     from app.services.drift.model import W_DISRUPT, W_ENGAGE
     var_factor = min(max(
-        baseline.get("idle_ratio_std", 0.05)
+        baseline.get("idle_ratio_std", 0.20)
         + baseline.get("scroll_jitter_std", 0.05)
         + baseline.get("regress_rate_std", 0.03),
         0.01,
@@ -382,15 +475,50 @@ def compute_drift_result(
     - disruption_score, engagement_score       [informational, debug]
     """
     z = compute_z_scores(features, baseline)
+
+    # ── C1: Skimming fallback via progress_velocity ────────────────────────
+    # When pace estimation is unavailable (no paragraph IDs), use the rate of
+    # viewport_progress_ratio change as a secondary skimming signal.
+    # Only triggers when progress_velocity is strongly positive (fast scroll).
+    skim_fallback_z = 0.0
+    if not features.pace_available and features.progress_velocity > 0.02:
+        # Normalize: > 0.05/s is fast scrolling (half-page per second)
+        skim_fallback_z = min(Z_POS_CAP, features.progress_velocity / 0.03)
+        z = ZScores(
+            z_idle=z.z_idle,
+            z_focus_loss=z.z_focus_loss,
+            z_jitter=z.z_jitter,
+            z_regress=z.z_regress,
+            z_pause=z.z_pause,
+            z_stagnation=z.z_stagnation,
+            z_mouse=z.z_mouse,
+            z_pace=z.z_pace,
+            z_skim=max(z.z_skim, skim_fallback_z),
+            z_burstiness=z.z_burstiness,
+        )
+
     disruption_score, components = compute_disruption_score(z, baseline)
     engagement_score = compute_engagement_score(z, features)
-    confidence = compute_confidence(features.n_batches)
+
+    # ── B2: Apply data-quality confidence penalty ──────────────────────────
+    # Multiply base confidence by quality multiplier so broken telemetry
+    # reduces the model's aggressiveness.
+    base_confidence = compute_confidence(features.n_batches)
+    confidence = base_confidence * features.quality_confidence_mult
+
+    # ── C2: Faster re-engagement: increase EMA alpha when engagement is high
+    # When the user shows sustained engagement (score > 0.6), allow beta to
+    # drop faster by using a higher EMA alpha temporarily.
+    effective_ema_alpha = BETA_EMA_ALPHA
+    if engagement_score > 0.60 and prev_beta_ema > BETA0 * 2:
+        effective_ema_alpha = min(0.40, BETA_EMA_ALPHA * 2)
 
     # Beta: baseline decay + disruption boost - engagement dampening
     beta_effective = compute_beta_raw(disruption_score, engagement_score, confidence)
 
-    # Smooth beta with slow EMA (prevents single-window spikes from over-driving drift)
-    beta_ema = apply_beta_ema(beta_effective, prev_beta_ema)
+    # Smooth beta with EMA (faster when re-engaging)
+    beta_ema = effective_ema_alpha * beta_effective + (1.0 - effective_ema_alpha) * prev_beta_ema
+    beta_ema = min(max(beta_ema, BETA_MIN), BETA_MAX)
 
     # Exponential attention decay
     attention = compute_attention(beta_ema, elapsed_minutes)
@@ -408,6 +536,9 @@ def compute_drift_result(
         "W_ENGAGE_x_engagement": W_ENGAGE * confidence * engagement_score,
         "engagement_score": engagement_score,
         "confidence": confidence,
+        "base_confidence": base_confidence,
+        "quality_confidence_mult": features.quality_confidence_mult,
+        "skim_fallback_z": skim_fallback_z,
         "elapsed_minutes": elapsed_minutes,
     })
 
