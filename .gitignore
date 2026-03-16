@@ -49,6 +49,9 @@ services/api/uploads/
 # ── Parsed PDF cache (extracted images + docling artifacts) ───────────────────
 services/api/parsed_cache/
 
+# ── Telemetry CSV exports ──────────────────────────────────────────────────────
+services/api/exports/
+
 # ── Test PDFs (local dev only) ────────────────────────────────────────────────
 pdfs/
 

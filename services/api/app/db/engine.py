@@ -35,6 +35,7 @@ async def init_db() -> None:
     # Ensure storage directories exist
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     settings.parsed_cache_dir.mkdir(parents=True, exist_ok=True)
+    settings.exports_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1 — TimescaleDB extension (needs DDL outside a transaction block)
     raw_dsn = settings.database_url.replace("postgresql+asyncpg", "postgresql")
@@ -51,12 +52,69 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # Step 3a — Add is_calibration column to documents (idempotent for existing DBs)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "ALTER TABLE documents "
+                "ADD COLUMN IF NOT EXISTS is_calibration BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+
+    # Step 3b — Add new columns to session_drift_states (idempotent)
+    async with engine.begin() as conn:
+        for col_sql in [
+            "ADD COLUMN IF NOT EXISTS beta_ema DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS drift_level DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS disruption_score DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS engagement_score DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        ]:
+            await conn.execute(
+                text(f"ALTER TABLE session_drift_states {col_sql}")
+            )
+
     # Step 3 — Convert activity_events to a TimescaleDB hypertable
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 "SELECT create_hypertable("
                 "  'activity_events', 'created_at',"
+                "  if_not_exists => TRUE"
+                ")"
+            )
+        )
+
+    # Step 4 — Ensure session_drift_history has the correct composite PK
+    # If the table was previously created with a serial id PK (wrong), drop and
+    # recreate it so the hypertable conversion succeeds.
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_name='session_drift_history' AND column_name='id'"
+            )
+        )
+        has_id_column = result.scalar() > 0
+
+    if has_id_column:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS session_drift_history CASCADE"))
+        # Recreate with correct schema
+        from app.db.base import Base
+        import app.db.models as _models  # noqa: F401
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                lambda sync_conn: Base.metadata.tables["session_drift_history"].create(
+                    sync_conn, checkfirst=True
+                )
+            )
+
+    # Convert to hypertable (idempotent)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "SELECT create_hypertable("
+                "  'session_drift_history', 'created_at',"
                 "  if_not_exists => TRUE"
                 ")"
             )

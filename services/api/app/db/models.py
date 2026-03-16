@@ -10,6 +10,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -43,6 +44,9 @@ class User(Base):
     sessions: Mapped[list["Session"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
+    baseline: Mapped[Optional["UserBaseline"]] = relationship(
+        back_populates="user", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class Document(Base):
@@ -56,6 +60,8 @@ class Document(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # True for the shared calibration document; hides it from normal document lists.
+    is_calibration: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -239,6 +245,109 @@ class DocumentAsset(Base):
 
 
 # ─── End Phase 4 ──────────────────────────────────────────────────────────────
+
+
+# ─── Phase B — Calibration baseline ──────────────────────────────────────────
+
+
+class UserBaseline(Base):
+    """
+    One row per user, upserted at the end of a successful calibration session.
+
+    baseline_json shape (v1):
+      wpm_mean, wpm_std, scroll_velocity_mean, scroll_velocity_std,
+      scroll_jitter_mean, idle_ratio_mean, regress_rate_mean,
+      paragraph_dwell_mean, calibration_duration_seconds
+    """
+
+    __tablename__ = "user_baselines"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    baseline_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="baseline")
+
+
+# ─── End Phase B ───────────────────────────────────────────────────────────────
+
+
+# ─── Phase 7 — Drift state ────────────────────────────────────────────────────
+
+
+class SessionDriftState(Base):
+    """
+    Current drift model output for one session.  Upserted on every
+    telemetry batch ingestion.  One row per session.
+    """
+
+    __tablename__ = "session_drift_states"
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # Primary bidirectional drift state (Phase 7 stabilised)
+    drift_level: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    disruption_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    engagement_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    # Legacy / backward-compat fields (beta_effective = disruption_score proxy)
+    beta_effective: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    beta_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    attention_score: Mapped[float] = mapped_column(nullable=False, default=1.0)
+    drift_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    drift_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    last_window_ends_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class SessionDriftHistory(Base):
+    """
+    Append-only drift history hypertable — one row every ~10 seconds per session.
+
+    Unlike session_drift_states (latest snapshot only), this table lets us
+    reconstruct the full drift trajectory for analysis and LLM context.
+
+    TimescaleDB hypertable constraint: the partitioning column (created_at) must
+    be part of the primary/composite key.  We use (session_id, created_at) as the
+    composite PK — unique per session per timestamp, no serial id needed.
+    """
+
+    __tablename__ = "session_drift_history"
+    __table_args__ = (
+        PrimaryKeyConstraint("session_id", "created_at"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    drift_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    beta_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    disruption_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    engagement_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    pace_ratio: Mapped[Optional[float]] = mapped_column(nullable=True)
+
+
+# ─── End Phase 7 ──────────────────────────────────────────────────────────────
 
 
 class Intervention(Base):

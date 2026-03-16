@@ -59,6 +59,24 @@ def init_test_db() -> None:
         eng = create_async_engine(_SQLALCHEMY_DSN, poolclass=NullPool)
         async with eng.begin() as c:
             await c.run_sync(Base.metadata.create_all)
+        # Idempotent column additions for existing DBs (mirrors engine.py init_db)
+        async with eng.begin() as c:
+            await c.execute(
+                text(
+                    "ALTER TABLE documents "
+                    "ADD COLUMN IF NOT EXISTS is_calibration BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        for col_sql in [
+            "ADD COLUMN IF NOT EXISTS beta_ema DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS drift_level DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS disruption_score DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ADD COLUMN IF NOT EXISTS engagement_score DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        ]:
+            async with eng.begin() as c:
+                await c.execute(
+                    text(f"ALTER TABLE session_drift_states {col_sql}")
+                )
         async with eng.begin() as c:
             await c.execute(
                 text(
@@ -87,6 +105,7 @@ def clean_tables() -> None:
         conn = await asyncpg.connect(_ASYNCPG_DSN)
         try:
             await conn.execute("DELETE FROM activity_events")
+            await conn.execute("DELETE FROM session_drift_states")
             await conn.execute("DELETE FROM model_outputs")
             await conn.execute("DELETE FROM interventions")
             await conn.execute("DELETE FROM sessions")
@@ -95,6 +114,8 @@ def clean_tables() -> None:
             await conn.execute("DELETE FROM document_chunks")
             await conn.execute("DELETE FROM document_parse_jobs")
             await conn.execute("DELETE FROM documents")
+            # Phase B tables (FK → users)
+            await conn.execute("DELETE FROM user_baselines")
             await conn.execute("DELETE FROM users")
         finally:
             await conn.close()

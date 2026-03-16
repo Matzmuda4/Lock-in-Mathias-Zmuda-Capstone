@@ -1,7 +1,7 @@
 import { apiRequest } from "./apiClient";
 import type { AssetSummary, Chunk } from "./documentService";
 
-export type SessionMode = "baseline" | "adaptive";
+export type SessionMode = "baseline" | "adaptive" | "calibration";
 export type SessionStatus = "active" | "paused" | "ended" | "completed";
 
 export interface Session {

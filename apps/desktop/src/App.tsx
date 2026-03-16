@@ -1,6 +1,8 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./contexts/AuthContext";
 import { ProtectedRoute } from "./components/ProtectedRoute";
+import { CalibrationPage } from "./pages/CalibrationPage";
+import { CalibrationReaderPage } from "./pages/CalibrationReaderPage";
 import { LoginPage } from "./pages/LoginPage";
 import { HomePage } from "./pages/HomePage";
 import { ReaderPage } from "./pages/ReaderPage";
@@ -11,6 +13,14 @@ export function App() {
       <AuthProvider>
         <Routes>
           <Route path="/login" element={<LoginPage />} />
+          <Route
+            path="/calibration"
+            element={
+              <ProtectedRoute>
+                <CalibrationPage />
+              </ProtectedRoute>
+            }
+          />
           <Route
             path="/"
             element={
@@ -24,6 +34,14 @@ export function App() {
             element={
               <ProtectedRoute>
                 <ReaderPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/sessions/:id/calibration-reader"
+            element={
+              <ProtectedRoute>
+                <CalibrationReaderPage />
               </ProtectedRoute>
             }
           />

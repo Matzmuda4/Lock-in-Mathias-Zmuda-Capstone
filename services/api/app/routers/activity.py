@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_user
 from app.db.models import ActivityEvent, Session, User
 from app.db.session import get_db
-from app.schemas.activity import ActivityEventCreate, ActivityEventResponse
+from app.schemas.activity import (
+    ActivityBatchCreate,
+    ActivityBatchResponse,
+    ActivityEventCreate,
+    ActivityEventResponse,
+)
+from app.routers.drift import _recompute_and_save as _recompute_drift
 
 router = APIRouter(prefix="/activity", tags=["activity"])
 
@@ -66,3 +72,97 @@ async def post_activity(
     await db.commit()
     await db.refresh(event)
     return ActivityEventResponse.model_validate(event)
+
+
+@router.post(
+    "/batch",
+    response_model=ActivityBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def post_activity_batch(
+    body: ActivityBatchCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ActivityBatchResponse:
+    """
+    Ingest one aggregated 2-second telemetry batch from the reader.
+
+    Validates that the session is active and belongs to the caller, then
+    inserts a single row into the activity_events hypertable with
+    event_type="telemetry_batch" and the full payload as JSONB.
+
+    Only active sessions are accepted (not paused) — we do not collect
+    telemetry while the reader is paused.
+    """
+    result = await db.execute(
+        select(Session).where(
+            Session.id == body.session_id,
+            Session.user_id == current_user.id,
+            Session.status == "active",
+        )
+    )
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Active session not found or does not belong to the current user",
+        )
+
+    # ── B1/B2: Data quality guardrails ────────────────────────────────────────
+    # Apply corrections and tag faults before storage so the drift model
+    # can apply confidence penalties on retrieval.
+    _WINDOW_S = 2.0
+    _PROGRESS_JUMP_THRESH = 0.20
+
+    raw_idle = body.idle_seconds
+    telemetry_fault = raw_idle > _WINDOW_S
+    # Server-side clamp — idle must be 0..WINDOW_S
+    clamped_idle = min(raw_idle, _WINDOW_S)
+
+    scroll_abs = body.scroll_delta_abs_sum
+    scroll_capture_fault = (
+        scroll_abs < 0.1
+        and body.scroll_event_count == 0
+        # Only flag when progress ratio has changed significantly
+        # (we don't have the previous batch's ratio here, so we use a proxy:
+        #  if the user has been reading long enough, progress > 0 means they scrolled at some point)
+        # Full check happens in feature extraction using rolling window context.
+        # Here we just check if scroll_event_count is suspiciously 0.
+        # The deeper per-window check happens in features.py.
+    )
+
+    paragraph_missing_fault = body.current_paragraph_id is None
+
+    # Store the full batch payload in JSONB for downstream analysis.
+    # One row per 2-second window — low overhead on the hypertable.
+    payload = body.model_dump(exclude={"session_id", "client_timestamp"})
+    # Overwrite idle_seconds with the server-clamped value
+    payload["idle_seconds"] = clamped_idle
+    # Attach quality flags so feature extraction + model can apply penalties
+    payload["telemetry_fault"] = telemetry_fault
+    payload["scroll_capture_fault"] = scroll_capture_fault
+    payload["paragraph_missing_fault"] = paragraph_missing_fault
+
+    event = ActivityEvent(
+        user_id=current_user.id,
+        session_id=body.session_id,
+        event_type="telemetry_batch",
+        payload=payload,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(event)
+    # Flush so the new event is visible inside this transaction for the drift query
+    await db.flush()
+
+    # Use a SAVEPOINT so that drift errors cannot abort the main transaction.
+    # If drift recompute fails (e.g. missing column, model error), the savepoint
+    # is released/rolled back and the telemetry event is still committed.
+    try:
+        async with db.begin_nested():
+            await _recompute_drift(session, db)
+    except Exception:  # noqa: BLE001
+        pass  # drift failure must not prevent telemetry storage
+
+    await db.commit()
+    await db.refresh(event)
+    return ActivityBatchResponse.model_validate(event)

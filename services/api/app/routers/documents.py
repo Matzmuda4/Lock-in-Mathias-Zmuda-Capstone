@@ -92,7 +92,10 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
 ) -> DocumentListResponse:
     result = await db.execute(
-        select(Document).where(Document.user_id == current_user.id)
+        select(Document).where(
+            Document.user_id == current_user.id,
+            Document.is_calibration.is_(False),
+        )
     )
     docs = result.scalars().all()
     return DocumentListResponse(
