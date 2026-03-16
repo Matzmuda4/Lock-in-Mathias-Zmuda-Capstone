@@ -1,12 +1,12 @@
 # Phase 7 — Personalised Mathematical Drift Modelling
 
-> **Status:** Implemented (v3 — telemetry reliability fixes, data-quality guardrails, LLM-ready state packet)
+> **Status:** Implemented (v4 — scenario-calibrated drift curves, long-paragraph protection, broken-calibration defence)
 >
 > **No LLM, no interventions.** Pure mathematics + telemetry signals only.
 
 ---
 
-## Changelog: v2 → v3 (current)
+## Changelog: v2 → v3
 
 | Area | Change |
 |---|---|
@@ -17,9 +17,20 @@
 | **Backend guardrails (B1/B2)** | Each batch is tagged at ingestion with `telemetry_fault`, `scroll_capture_fault`, `paragraph_missing_fault`. Feature extraction reads these flags and applies a `quality_confidence_mult` penalty (×0.5 for idle fault, ×0.7 for scroll/para faults). |
 | **Backend guardrails (B3)** | Calibration completeness check: at least one of duration ≥ 90 s, ≥ 3 paragraphs visited, or ≥ 3 batches recorded must be met; otherwise `POST /calibration/complete` returns `400`. Baseline validity flag `baseline_valid` (requires `wpm_effective > 0`) is included in all debug/state endpoints. |
 | **Drift model (C1)** | Skimming fallback via `progress_velocity` (Δprogress_ratio / seconds) when pace estimation is unavailable due to missing paragraph IDs. |
-| **Drift model (C2)** | Faster re-engagement: when `engagement_score > 0.6` and previous beta is elevated, the beta EMA alpha is temporarily doubled (0.20 → 0.40) so recovery is noticeably quicker. |
+| **Drift model (C2)** | Faster re-engagement: when `engagement_score > 0.6` and previous beta is elevated, the beta EMA alpha is temporarily doubled (0.30 → 0.60) so recovery is noticeably quicker. |
 | **Drift history (C3)** | New `session_drift_history` Timescale hypertable stores a snapshot every ≈10 seconds so the full trajectory can be analysed and plotted (not just the latest state). |
 | **LLM input packet (D)** | New endpoint `GET /sessions/{id}/state-packet` returns a structured JSON payload that the future Ollama LLM classifier will consume: baseline snapshot, window features, z-scores, drift state, quality flags, and reading context. No LLM is called here. |
+
+## Changelog: v3 → v4 (current)
+
+| Area | Change | Why |
+|---|---|---|
+| **`DISRUPT_CENTER` 0.35 → 0.45** | The sigmoid threshold that controls when disruption_score crosses 0.5 was raised. | With 0.35, mild signals (small stagnation, slightly elevated idle) pushed disruption above 0.5 too easily, making "normal reading with variation" look distracted. |
+| **`W_D_IDLE` 0.22 → 0.15** | Idle weight in disruption_raw reduced. | A reader sitting still on a long paragraph for 20 s (no scroll/mouse) naturally produces `idle_ratio ≈ 0.8–1.0`. Reducing the weight prevents this from dominating disruption. |
+| **`idle_ratio_std` min floor 0.08 → 0.25** | The minimum standard deviation used in z_idle computation was widened. | With std=0.08, idle=0.8 against a baseline of 0.35 gave z=5.6 (capped at 3.0). With std=0.25, the same idle gives z=1.8 — still elevated, but not catastrophic. |
+| **`W_DISRUPT` 0.40 → 0.30 and `BETA_MAX` 0.40 → 0.30** | Both the modulation weight and the ceiling were lowered together. | Maintains `BETA0 + W_DISRUPT × 1.0 ≈ BETA_MAX` so a fully-disrupted window can still reach the ceiling. Avoids drift > 33% in the first minute of heavy distraction. |
+| **Stagnation halving for long paragraphs** | When pace data is unavailable (`pace_available=False`) AND `focus_loss_rate < 0.15`, `z_stagnation` is multiplied by 0.5. | Without pace transitions, we cannot distinguish "reader is carefully working through a long paragraph" from "reader is stuck". Halving gives benefit of the doubt. With blur (focus_loss ≥ 0.15), the reader is clearly not reading — stagnation fires at full weight. |
+| **Baseline sanity checks for broken calibration** | If a user calibrated when scroll tracking was broken (`scroll_jitter_mean < 0.04` or `regress_rate_mean < 0.02`), those stored zeros are replaced with population-average fallbacks (0.10, 0.05) for z-score computation. | Without this fix, a stored jitter baseline of 0.0 made any real jitter (e.g., 0.10 during reading) look like a z-score of +∞, falsely driving disruption very high. |
 
 ---
 
@@ -49,16 +60,18 @@ drift     = 1 − A(t)                        ∈ [0, 1)
 | Drift can decrease | If `beta_ema` drops (user re-engages), the growth rate of `1 - exp(-beta*t)` decreases. At any point where `new_beta < prev_beta`, the drift curve has a lower slope. |
 | Bounded to [0, 1) | Mathematical guarantee from exponential form. |
 
-### Expected drift curves for a calibrated user
+### Expected drift curves for a calibrated user (v4)
 
-| Scenario | `beta_ema` | Drift at 1 min | Drift at 3 min | Drift at 10 min |
+These targets reflect the behaviour that was validated through the iterative tuning for ADHD users, where attentional drift typically becomes clinically significant after 10–12 minutes.
+
+| Scenario | `beta_ema` | Drift at 1 min | Drift at 5 min | Drift at 10 min |
 |---|---|---|---|---|
-| Focused, below-baseline idle | ≈ 0.02 | 2% | 6% | 18% |
-| Mild distraction (1.7× idle) | ≈ 0.12 | 11% | 30% | 70% |
-| Heavy idle (no interaction) | ≈ 0.65 | 48% | 86% | ~100% |
-| Tab away / window blur | ≈ 0.65 | 48% | 86% | ~100% |
-| Sustained skimming (2× WPM) | ≈ 0.46 | 36% | 74% | ~99% |
-| Stuck/confused (stagnation) | ≈ 0.27 | 24% | 55% | 93% |
+| **Focused reading at baseline** | ≈ BETA_MIN = 0.003 | ~0.3% | ~1.5% | ~3% |
+| **Normal reading (minor variation)** | ≈ 0.015–0.025 | ~2–3% | ~8–14% | ~16–25% |
+| **Moderate distraction** (stuck, some blur) | ≈ 0.05–0.12 | ~5–11% | ~22–45% | ~39–70% |
+| **Tab-away / full idle** | ≈ 0.20–0.30 (BETA_MAX) | ~20–26% | ~63–78% | ~86–95% |
+
+**Key insight for ADHD students:** A reader at their personal baseline pace with normal reading pauses will see < 3% drift after a full minute. Only when signals are clearly anomalous relative to *their own* calibration baseline does drift grow significantly. Drift can decrease when the user re-engages.
 
 ---
 

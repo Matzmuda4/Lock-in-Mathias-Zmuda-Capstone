@@ -147,7 +147,9 @@ class TestDriftModel:
             prev_beta_ema = result.beta_ema
             prev_ema = result.drift_ema
         assert result is not None
-        assert result.drift_level > 0.3
+        # v4: BETA_MAX = 0.30 → max drift at 1 min = 1-exp(-0.30*1) ≈ 26%.
+        # Heavy distraction (blur+idle) should reach that ceiling.
+        assert result.drift_level > 0.20
 
     def test_drift_level_decreases_with_engagement(self) -> None:
         """

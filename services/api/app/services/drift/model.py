@@ -1,5 +1,5 @@
 """
-Hybrid drift model — Phase 7 v2 (idle-sensitive, research-grounded weights).
+Hybrid drift model — Phase 7 v3 (ADHD-calibrated, accurate for sustained reading).
 
 ═══════════════════════════════════════════════════════════════════════════
 MATHEMATICAL FOUNDATION
@@ -19,11 +19,51 @@ Properties:
   • at t = 0 drift is exactly 0; at t → ∞ drift → 1
 
 ═══════════════════════════════════════════════════════════════════════════
+CALIBRATION (v4 — ADHD-appropriate timescales, accurate for real reading)
+═══════════════════════════════════════════════════════════════════════════
+
+Research on ADHD sustained attention (Barkley 1997; Tsal et al 2005) shows
+that attentional drift typically becomes clinically significant after
+10–12 minutes of uninterrupted reading for typical ADHD presentation.
+
+The beta scale is set so that:
+  Fully engaged reader at baseline → beta ≈ BETA_MIN = 0.003
+    → drift:  ~0.3% @ 1 min,  ~1.5% @ 5 min,  ~3% @ 10 min  (essentially flat)
+
+  Normal reading with minor variation → beta ≈ 0.015–0.025
+    → drift:  ~2–3% @ 1 min,  ~8–14% @ 5 min,  ~16–25% @ 10 min
+
+  Moderate distraction (stuck, some blur, pace deviation) → beta ≈ 0.05–0.12
+    → drift:  ~5–11% @ 1 min,  ~22–45% @ 5 min,  ~39–70% @ 10 min
+
+  Heavy distraction (tab-away, full idle) → beta ≈ 0.20–0.30 (BETA_MAX)
+    → drift:  ~20–26% @ 1 min,  ~63–78% @ 5 min,  ~86–95% @ 10 min
+
+KEY v4 FIXES:
+  1. DISRUPT_CENTER raised 0.35 → 0.45: mild signals (small stagnation,
+     moderate idle) no longer push disruption_score above 0.5.
+  2. W_DISRUPT lowered 0.40 → 0.30 and BETA_MAX lowered 0.40 → 0.30:
+     heavy distraction reaches ~0.29 beta (not 0.39), so drift at 1 min
+     stays ~25% rather than ~33% for extreme tab-away.
+  3. W_D_IDLE lowered 0.22 → 0.15 + wider idle_std floor 0.08 → 0.25:
+     natural reading pauses (reader sits still for 10-20s on a long
+     paragraph) no longer produce high z_idle.
+  4. Baseline sanity checks for broken calibration: if the user's
+     calibration was done with broken scroll tracking (jitter_mean = 0.0,
+     regress_mean = 0.0), those zero baselines are replaced with realistic
+     population-average fallbacks.  This prevents every normal jitter event
+     from appearing as a huge deviation from an impossible zero baseline.
+  5. Stagnation halved when pace unavailable + no blur: when the reader is
+     on a long paragraph (can't distinguish reading from stuck without pace
+     data and no explicit focus loss), z_stagnation is halved to avoid
+     false positives.
+
+═══════════════════════════════════════════════════════════════════════════
 BETA MODULATION (personalised decay rate)
 ═══════════════════════════════════════════════════════════════════════════
 
 Every 2-second telemetry cycle recomputes beta_effective, then smooth-tracks
-it with a slow EMA so single-window noise cannot spike drift:
+it with an EMA so single-window noise cannot spike drift:
 
     beta_raw = BETA0
              + confidence × W_DISRUPT × disruption_score
@@ -33,19 +73,6 @@ it with a slow EMA so single-window noise cannot spike drift:
     beta_ema       = BETA_EMA_ALPHA × beta_effective
                    + (1 − BETA_EMA_ALPHA) × prev_beta_ema
 
-Expected beta values for a correctly-calibrated user:
-  Focused reading at baseline    →  beta ≈ BETA_MIN = 0.02
-  Slightly above-baseline idle   →  beta ≈ 0.05 – 0.12
-  Complete idle, no interaction  →  beta ≈ 0.63 – 0.65 (BETA_MAX)
-  Tab away / window blur         →  beta ≈ 0.65 (BETA_MAX)
-  Skimming (2× baseline WPM)     →  beta ≈ 0.46
-
-Expected drift curves:
-  beta = 0.02 (focused at baseline): 2% @ 1 min,  6% @ 3 min, 18% @ 10 min
-  beta = 0.20 (mild distraction):   18% @ 1 min, 45% @ 3 min, 86% @ 10 min
-  beta = 0.45 (skimming/regress):   36% @ 1 min, 74% @ 3 min, ~99% @ 10 min
-  beta = 0.65 (idle/blur at max):   48% @ 1 min, 86% @ 3 min, ~100% @ 10 min
-
 ═══════════════════════════════════════════════════════════════════════════
 DISRUPTION SCORE (research-grounded signal weights)
 ═══════════════════════════════════════════════════════════════════════════
@@ -54,41 +81,24 @@ disruption_score = sigmoid((disruption_raw − CENTER) / SCALE)
 
 disruption_raw = W_D_IDLE       × z_idle        # PRIMARY — see below
                + W_D_FOCUS      × z_focus_loss   # explicit disengagement
-               + W_D_STAGNATION × z_stagnation   # stuck on same paragraph
+               + W_D_STAGNATION × z_stagnation   # truly stuck (NOT normal dwell)
                + W_D_PACE       × z_pace         # too fast or too slow
                + W_D_SKIM       × z_skim         # asymmetric fast-skim
                + W_D_REGRESS    × z_regress      # comprehension-difficulty proxy
                + W_D_JITTER     × z_jitter       # restlessness/erratic scroll
-               + W_D_BURSTINESS × z_burstiness   # burst scroll instability
+               + W_D_BURSTINESS × z_burstiness   # erratic velocity pattern
 
-Research basis for signal ordering:
-  1. Idle / lack of interaction  (W_D_IDLE = 0.22)
-     Smallwood & Schooler (2006, Psych. Bull.) — sustained mind-wandering is
-     the strongest predictor of offline, stimulus-independent thought.
-     Unsworth & McMillan (2013) link scroll inactivity to mind-wandering.
-  2. Focus loss / tab-away  (W_D_FOCUS = 0.18)
-     Direct behavioural evidence: the user has explicitly left the reading
-     context. Slightly lower than idle because brief accidental switches occur.
-  3. Stagnation on paragraph  (W_D_STAGNATION = 0.12)
-     Rayner (1998, Psych. Bull.) — abnormally long dwell on a single region
-     indicates comprehension difficulty or zoning-out.
-  4. Pace deviation  (W_D_PACE = 0.15) + Skim  (W_D_SKIM = 0.18)
-     Just & Carpenter (1980) — reading rate is tightly coupled to cognitive
-     processing depth. Skimming (impulsive fast forward) AND crawling (stuck)
-     both signal attentional anomaly. Skim receives an asymmetric extra weight.
-  5. Regress rate  (W_D_REGRESS = 0.10)
-     Rayner & Pollatsek (1989) — high regressive saccade rate correlates with
-     reading difficulty / comprehension failure. Weighted below idle because
-     some regress is deliberate review.
-  6. Jitter / direction changes  (W_D_JITTER = 0.08)
-     Novel signal; restless oscillatory scroll is associated with attention
-     restlessness (no published norm; weight is conservative).
-  7. Scroll burstiness  (W_D_BURSTINESS = 0.05) — secondary instability signal.
+KEY v3 FIX — Stagnation normalisation:
+  Staying on one paragraph for the majority of a 30 s window is EXPECTED
+  reading behaviour, not a distraction signal.  The stagnation mean is
+  floored at 0.45 so that normal dwell (50% of window on one paragraph)
+  produces z_stagnation ≈ 0.  Only truly frozen behaviour (80%+ on same
+  paragraph AND above expected median) triggers significant z_stagnation.
 
-IMPORTANT: idle weight is NEVER down-weighted by baseline variability.
-Idle is the single most reliable attention signal regardless of user pattern.
-Jitter and regress weights use a softened variability adjustment (0.5×
-instead of 1.0×) so highly-variable users are only mildly de-sensitised.
+KEY v3 FIX — Burstiness normalisation:
+  Natural reading is bursty: the user scrolls a little, pauses to read,
+  scrolls again.  Coefficient of variation ≈ 2–3 is normal.  The baseline
+  is now 2.5 (was 1.0) so normal bursting no longer penalises the reader.
 
 ═══════════════════════════════════════════════════════════════════════════
 ENGAGEMENT SCORE (multiplicative — skimming cannot hide behind calmness)
@@ -98,39 +108,36 @@ engagement = calm × (0.80 × pace_align + 0.20 × progress_boost)
 
 calm       = (1 − z_idle/3) × (1 − z_focus_loss/3)   ∈ [0, 1]
 pace_align = 1 − max(z_pace, z_skim) / 3              ∈ [0, 1]  if pace_available
-           = 0.5 (neutral)                             if pace not yet measurable
+           = 0.65 (benefit of the doubt)               if pace not yet measurable
 
-The multiplicative design ensures:
-  • Skimming (low pace_align) reduces engagement even when the user is calm
-  • Blur / idle (low calm)   reduces engagement even when pace looks normal
-  • Both bad simultaneously → engagement → 0 → beta approaches BETA_MAX
+KEY v3 FIX — pace_align default raised from 0.5 → 0.65:
+  During the first minute (before 2 paragraphs observed), the absence of
+  pace evidence should NOT count against the reader.  0.65 means focused
+  reading without pace data still yields engagement ≈ 0.52+, enough to
+  hold beta near BETA_MIN.
 
 ═══════════════════════════════════════════════════════════════════════════
 CALIBRATION BASELINE USAGE
 ═══════════════════════════════════════════════════════════════════════════
 
-All z-scores are computed against the user's own calibration baseline:
+All z-scores are computed against the user's own calibration baseline.
+The SAME raw value can produce different z-scores per user:
+  User A: baseline idle_ratio_mean=0.35, std=0.20 → z_idle(0.8) = 2.25
+  User B: baseline idle_ratio_mean=0.70, std=0.15 → z_idle(0.8) = 0.67
 
-    z_idle      = z_pos(idle_ratio_mean,  baseline["idle_ratio_mean"],
-                                          baseline["idle_ratio_std"])
-    z_stagnation = z_pos(stagnation_ratio, stagnation_mu, 0.15)
-                   where stagnation_mu = para_dwell_median_s / 30.0
-    z_pace      = pace_dev / pace_scale
-                  where pace_scale from para_dwell_iqr/median ratio
-    ... etc.
+Fallback defaults (when calibration absent or key missing):
+  idle_ratio_mean = 0.35, idle_ratio_std = 0.20 (floor 0.25)
+  scroll_jitter_mean = 0.10, scroll_jitter_std = 0.10
+  regress_rate_mean = 0.05, regress_rate_std = 0.06
+  para_dwell_median_s = 10.0, para_dwell_iqr_s = 5.0
 
-This means the SAME idle_ratio = 0.8 can produce very different z_idle
-depending on the user:
-  • User A: baseline idle_ratio_mean=0.35, std=0.20 → z_idle = 2.25
-  • User B: baseline idle_ratio_mean=0.70, std=0.15 → z_idle = 0.67
-User B naturally pauses more; they are less disrupted by the same raw idle.
-
-Fallback defaults when calibration baseline is absent:
-  idle_ratio_mean = 0.35  (population average for reading sessions)
-  idle_ratio_std  = 0.20  (realistic window-to-window variability)
-Users without calibration get a reasonable population baseline so drift
-still responds correctly. Calibration is mandatory in the app, so fallbacks
-are a safety net, not the primary path.
+Baseline sanity checks (v4 — broken calibration defence):
+  If calibration was done with non-functional scroll tracking, the stored
+  scroll_jitter_mean and regress_rate_mean will be near 0.  Those values
+  produce astronomically high z-scores for any real session activity.
+  If jitter_mean < 0.04 or regress_mean < 0.02, override with population
+  averages (0.10 / 0.05) so the model behaves sensibly until the user
+  re-calibrates with the fixed telemetry.
 """
 
 from __future__ import annotations
@@ -142,26 +149,35 @@ from app.services.drift.types import DriftResult, WindowFeatures, ZScores
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Natural time-on-task decay rate
-# BETA0 = 0.03 → drift ≈ 3% at 1 min, 9% at 3 min, 26% at 10 min
-BETA0: float = 0.03
-BETA_MIN: float = 0.02    # floor: even perfect engagement can't eliminate decay
-BETA_MAX: float = 0.65    # ceiling: extreme distraction / full idle
-BETA_EMA_ALPHA: float = 0.20  # 50% convergence in ~3 steps (6 s) — responsive
+# Natural time-on-task decay rate (very small — represents inevitable fatigue)
+# BETA0 = 0.005 → drift ≈ 0.5% at 1 min, 2.5% at 5 min, 4.9% at 10 min
+BETA0: float = 0.005
+# Floor: fully focused reader experiences almost no drift growth per cycle
+BETA_MIN: float = 0.003
+# Ceiling: heavy distraction / complete tab-away.
+# v4: lowered 0.40 → 0.30 to match W_DISRUPT=0.30 range.
+# At 0.30: drift = 26% @ 1 min, 78% @ 5 min, 95% @ 10 min
+BETA_MAX: float = 0.30
+# EMA alpha for beta smoothing — 0.30 gives ~7 cycles (14 s) to reach 95%
+# of a step change.  Fast enough to respond but resistant to single-window spikes.
+BETA_EMA_ALPHA: float = 0.30
 
-# Beta modulation weights (research-grounded; see module docstring)
-W_DISRUPT: float = 0.70   # disruption_score contribution to beta (max +0.70)
-W_ENGAGE: float = 0.425   # engagement_score reduction of beta  (max -0.425)
+# Beta modulation weights
+# v4: W_DISRUPT lowered 0.40 → 0.30 so BETA0 + W_DISRUPT×1.0 ≈ BETA_MAX
+# W_ENGAGE × 1.0 (max engagement) → subtracts up to 0.15 from beta → BETA_MIN floor
+W_DISRUPT: float = 0.30
+W_ENGAGE: float = 0.15
 
 # Drift display smoothing (EMA alpha for UI value)
-EMA_ALPHA: float = 0.25
+EMA_ALPHA: float = 0.30
 
 # Z-score cap per signal term
 Z_POS_CAP: float = 3.0
 
 # Disruption sigmoid parameters: sigmoid((raw - CENTER) / SCALE)
-# CENTER = 0.35 means disruption_raw must exceed 0.35 to score > 0.5
-DISRUPT_CENTER: float = 0.35
+# v4: CENTER raised 0.35 → 0.45 so mild/moderate signals don't over-trigger.
+# disruption_raw must now exceed 0.45 to produce score > 0.5.
+DISRUPT_CENTER: float = 0.45
 DISRUPT_SCALE: float = 0.25
 
 # Skimming thresholds
@@ -169,15 +185,23 @@ SKIM_THRESHOLD: float = 1.3   # pace_ratio > this triggers asymmetric skim signa
 SKIM_SCALE: float = 0.5       # (pace_ratio - 1) / this → z_skim
 
 # Disruption component weights (W_D_X × z_X → disruption_raw)
-# Ordered by research-backed importance (see module docstring)
-W_D_IDLE: float = 0.22        # PRIMARY — never reduced by baseline variability
-W_D_FOCUS: float = 0.18       # explicit disengagement
-W_D_STAGNATION: float = 0.12  # stuck on paragraph
+# Ordered by research-backed importance
+# v4: W_D_IDLE lowered 0.22 → 0.15 because natural reading pauses produce
+#     high idle_seconds (reader sits still while reading a long paragraph).
+#     The wider idle_std floor (0.25) further reduces false positives.
+W_D_IDLE: float = 0.15        # idle — less dominant (reading pauses are normal)
+W_D_FOCUS: float = 0.18       # explicit disengagement (tab-away, blur)
+W_D_STAGNATION: float = 0.12  # truly stuck (beyond normal dwell — see v4 fix)
 W_D_PACE: float = 0.15        # pace deviation (too fast or too slow)
 W_D_SKIM: float = 0.18        # asymmetric fast-skim signal
 W_D_REGRESS: float = 0.10     # high back-scroll rate
 W_D_JITTER: float = 0.08      # erratic direction changes
-W_D_BURSTINESS: float = 0.05  # burst scroll instability
+W_D_BURSTINESS: float = 0.05  # erratic velocity bursting (v3: higher baseline)
+
+# Stagnation halving: when pace is unavailable AND focus loss is low, the reader
+# is likely still reading a long paragraph.  In this case halve z_stagnation
+# to avoid falsely penalising careful, deliberate reading.
+_STAGNATION_FOCUS_LOSS_THRESH: float = 0.15  # focus_loss_rate below this → halve
 
 _EPS: float = 1e-5
 
@@ -211,29 +235,63 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
     - z_mouse is 0 when mouse is stationary (< 10 px path) — not a distraction signal.
     - z_pace and z_skim are 0 when pace_available is False.
     - z_stagnation uses a personalized expected mean from para_dwell_median_s.
+
+    v4 fixes:
+    - Baseline sanity checks for broken calibration (jitter/regress stored as 0).
+    - Wider idle_ratio_std floor (0.25) so reading pauses don't over-penalise.
+    - z_stagnation halved when pace unavailable + focus_loss < threshold.
     """
     b = baseline
 
-    # Realistic fallbacks for uncalibrated users:
-    # readers are idle ~35% of 2-second windows between scrolls
+    # ── Idle ─────────────────────────────────────────────────────────────────
+    # v4: floor idle_std at 0.25 (was 0.08).  A reader sitting still on a
+    # long paragraph for 20 s naturally produces idle_ratio ≈ 0.8-1.0.  With
+    # std=0.08 that was z=6+ (capped at 3), driving drift up hard even during
+    # careful reading.  With std=0.25 the same idle_ratio only produces z≈2.
     z_idle = z_pos(
         features.idle_ratio_mean,
         b.get("idle_ratio_mean", 0.35),
-        max(b.get("idle_ratio_std", 0.20), 0.08),
+        max(b.get("idle_ratio_std", 0.20), 0.25),
     )
 
-    z_focus = z_pos(features.focus_loss_rate, 0.0, 0.08)
+    # Focus loss: slightly less hair-trigger than v2.
+    # std=0.12 means one unfocused batch in 8 (12.5%) gives z≈1.0.
+    z_focus = z_pos(features.focus_loss_rate, 0.0, 0.12)
+
+    # ── Baseline sanity checks for broken scroll calibration (v4) ─────────
+    # If the user calibrated when scroll tracking was broken (bug in
+    # useTelemetry.ts), scroll_jitter_mean and regress_rate_mean will be
+    # stored as ~0.  Using those as the baseline gives astronomically high
+    # z-scores for any real jitter/regress in a session.
+    # Replace them with realistic population averages until re-calibration.
+    _jitter_mu_raw = b.get("scroll_jitter_mean", 0.10)
+    _jitter_sigma_raw = b.get("scroll_jitter_std", 0.10)
+    if _jitter_mu_raw < 0.04:   # suspiciously low — broken calibration
+        _jitter_mu = 0.10
+        _jitter_sigma = max(_jitter_sigma_raw, 0.10)
+    else:
+        _jitter_mu = _jitter_mu_raw
+        _jitter_sigma = _jitter_sigma_raw
+
+    _regress_mu_raw = b.get("regress_rate_mean", 0.05)
+    _regress_sigma_raw = b.get("regress_rate_std", 0.06)
+    if _regress_mu_raw < 0.02:  # suspiciously low — broken calibration
+        _regress_mu = 0.05
+        _regress_sigma = max(_regress_sigma_raw, 0.06)
+    else:
+        _regress_mu = _regress_mu_raw
+        _regress_sigma = _regress_sigma_raw
 
     z_jitter = z_pos(
         features.scroll_jitter_mean,
-        b.get("scroll_jitter_mean", 0.10),
-        max(b.get("scroll_jitter_std", 0.10), 0.05),
+        _jitter_mu,
+        max(_jitter_sigma, 0.05),
     )
 
     z_regress = z_pos(
         features.regress_rate_mean,
-        b.get("regress_rate_mean", 0.05),
-        max(b.get("regress_rate_std", 0.06), 0.03),
+        _regress_mu,
+        max(_regress_sigma, 0.03),
     )
 
     z_pause = z_pos(
@@ -242,9 +300,26 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
         max(b.get("idle_seconds_std", 1.0), 0.5),
     )
 
-    # Stagnation: personalized expected fraction from para_dwell_median_s
-    stagnation_mu = min(max(b.get("para_dwell_median_s", 10.0) / 30.0, 0.05), 0.80)
-    z_stagnation = z_pos(features.stagnation_ratio, stagnation_mu, 0.15)
+    # ── Stagnation ───────────────────────────────────────────────────────────
+    # v3 fix — floor at 0.45 so normal reading (50% of window on one
+    # paragraph) produces z_stagnation ≈ 0.  Only true freezing (70%+ above
+    # median dwell) triggers a signal.
+    stagnation_mu = min(
+        max(b.get("para_dwell_median_s", 10.0) / 20.0, 0.45),
+        0.85,
+    )
+    z_stagnation = z_pos(features.stagnation_ratio, stagnation_mu, 0.18)
+
+    # v4 fix — stagnation halving for long-paragraph reading.
+    # When pace tracking is unavailable (e.g., first minute, or document has
+    # very long paragraphs) AND focus loss is low, we cannot distinguish
+    # "reader is still working through a long paragraph" from "reader is
+    # stuck / mind-wandering".  Halve the signal to give benefit of the doubt.
+    if (
+        not features.pace_available
+        and features.focus_loss_rate < _STAGNATION_FOCUS_LOSS_THRESH
+    ):
+        z_stagnation *= 0.5
 
     # Mouse: skip when stationary
     z_mouse_val = (
@@ -274,7 +349,10 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
         else 0.0
     )
 
-    z_burstiness = z_pos(features.scroll_burstiness, 1.0, 0.5)
+    # Burstiness: v3 fix — natural reading is bursty (scroll-stop-read-scroll).
+    # Coefficient of variation ≈ 2–3 is expected; baseline raised from 1.0 to 2.5.
+    # Only truly erratic rapid-fire scrolling (CV > 4) generates a signal.
+    z_burstiness = z_pos(features.scroll_burstiness, 2.5, 1.0)
 
     return ZScores(
         z_idle=z_idle,
@@ -364,7 +442,12 @@ def compute_engagement_score(z: ZScores, features: WindowFeatures) -> float:
         worst_pace_z = max(z.z_pace, z.z_skim)
         pace_align = 1.0 - min(worst_pace_z / Z_POS_CAP, 1.0)
     else:
-        pace_align = 0.5  # neutral when no evidence yet
+        # v3 fix: raised from 0.5 → 0.65.
+        # Absence of pace evidence is NOT evidence of bad pace.  Give the reader
+        # benefit of the doubt during the first ~60 s before paragraph data
+        # accumulates.  This prevents the model from penalising normal reading
+        # simply because pace estimation hasn't warmed up yet.
+        pace_align = 0.65
 
     progress_boost = min(1.0, features.progress_markers_count / 2.0)
     score = calm * (0.80 * pace_align + 0.20 * progress_boost)

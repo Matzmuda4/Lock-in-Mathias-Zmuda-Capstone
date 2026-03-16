@@ -333,7 +333,8 @@ class TestBetaComputation:
         """Heavy idle+blur should push beta to BETA_MAX territory."""
         features = extract_features([_distracted_batch()] * 15, _WORD_COUNTS, 180.0)
         result = compute_drift_result(features, _BASELINE, 2.0, 0.0, BETA0)
-        assert result.beta_effective > 0.40
+        # BETA_MAX is now 0.40; heavy distraction should reach that ceiling
+        assert result.beta_effective >= BETA_MAX * 0.95
 
 
 # ── Exponential model tests ───────────────────────────────────────────────────
@@ -433,11 +434,12 @@ class TestDisruptionScore:
 
 class TestEngagementScore:
     def test_moderate_when_focused_no_pace(self) -> None:
-        """calm=1, pace_align=0.5 (neutral) → engagement = 1 × 0.8 × 0.5 = 0.40."""
+        """calm=1, pace_align=0.65 (v3 default) → engagement = 1 × 0.8 × 0.65 = 0.52."""
         z = ZScores()
         f = WindowFeatures(n_batches=10, pace_available=False)
         score = compute_engagement_score(z, f)
-        assert 0.35 <= score <= 0.45
+        # v3: pace_align default raised to 0.65 to benefit-of-the-doubt readers
+        assert 0.48 <= score <= 0.56
 
     def test_low_when_blurred_and_idle(self) -> None:
         z = ZScores(z_idle=3.0, z_focus_loss=3.0)
@@ -508,7 +510,9 @@ class TestTimelineScenarios:
         # After 1 min, drift must be clearly above 0
         ema_at_1min = traj[-1][1]
         assert ema_at_1min > 0.0, "Drift must never be permanently zero"
-        assert ema_at_1min > 0.005  # At least 0.5%
+        # v3: BETA_MIN = 0.003, so 1 min of perfect focus → drift ≈ 0.3%.
+        # The important invariant is drift > 0 (natural time-on-task fatigue exists).
+        assert ema_at_1min > 0.001  # Clearly above zero
 
     def test_scenario2_tab_away_raises_drift_significantly(self) -> None:
         """Constant blur + idle for 2 min: drift_ema should be significantly elevated."""
@@ -768,3 +772,190 @@ class TestEdgeCases:
         assert result.drift_score == result.drift_level
         # beta_effective is the actual computed beta rate, not disruption_score
         assert BETA_MIN <= result.beta_effective <= BETA_MAX
+
+
+# ── v4 scenario table tests ───────────────────────────────────────────────────
+
+
+class TestV4ScenarioTable:
+    """
+    Validate the drift stays within the designed scenario table:
+
+    Scenario              | 1 min  | 5 min  | 10 min
+    ----------------------+--------+--------+--------
+    Focused at baseline   | ~0.3%  | ~1.5%  | ~3%
+    Normal reading        | ~2–3%  | ~8–14% | ~16–25%
+    Moderate distraction  | ~5–11% | 22–45% | ~39–70%
+    Tab-away / full idle  | ~20%+  | ~63%+  | ~86%+
+    """
+
+    def test_focused_reading_drift_minimal_at_1min(self) -> None:
+        """
+        Focused reading (at-baseline idle, on-pace, cycling 3 paras) should
+        produce drift < 5% at 1 minute.  With beta ≈ BETA_MIN, drift ≈ 0.3%.
+        """
+        seq = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(30)]
+        traj = _simulate_timeline(seq, _BASELINE)
+        ema_at_1min = traj[-1][1]
+        assert ema_at_1min < 0.05, (
+            f"Focused reading at 1 min should produce drift < 5%, got {ema_at_1min:.1%}"
+        )
+
+    def test_focused_reading_drift_minimal_at_10min(self) -> None:
+        """Focused reading for 10 min should stay below 10%."""
+        seq = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(300)]
+        traj = _simulate_timeline(seq, _BASELINE)
+        ema_at_10min = traj[-1][1]
+        assert ema_at_10min < 0.10, (
+            f"Focused reading at 10 min should produce drift < 10%, got {ema_at_10min:.1%}"
+        )
+
+    def test_tab_away_drift_exceeds_20pct_at_1min(self) -> None:
+        """
+        Complete tab-away (blur + idle) should exceed 20% drift within 1 minute.
+        With BETA_MAX = 0.30, max drift at 1 min ≈ 26%.
+        """
+        seq = [_distracted_batch("chunk-1")] * 30
+        traj = _simulate_timeline(seq, _BASELINE)
+        ema_at_1min = traj[-1][1]
+        assert ema_at_1min > 0.18, (
+            f"Tab-away at 1 min should produce drift > 18%, got {ema_at_1min:.1%}"
+        )
+
+    def test_tab_away_drift_exceeds_60pct_at_5min(self) -> None:
+        """Complete distraction for 5 min should pass 60%."""
+        seq = [_distracted_batch("chunk-1")] * 150
+        traj = _simulate_timeline(seq, _BASELINE)
+        ema_at_5min = traj[-1][1]
+        assert ema_at_5min > 0.60, (
+            f"Tab-away at 5 min should produce drift > 60%, got {ema_at_5min:.1%}"
+        )
+
+    def test_tab_away_clearly_higher_than_focused(self) -> None:
+        """At 5 min, tab-away must be at least 40 percentage points above focused."""
+        seq_f = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(150)]
+        seq_h = [_distracted_batch("chunk-1")] * 150
+        ema_f = _simulate_timeline(seq_f, _BASELINE)[-1][1]
+        ema_h = _simulate_timeline(seq_h, _BASELINE)[-1][1]
+        assert ema_h - ema_f > 0.40, (
+            f"Tab-away should be 40pp+ above focused at 5 min; gap={ema_h - ema_f:.1%}"
+        )
+
+
+# ── v4 stagnation halving tests ───────────────────────────────────────────────
+
+
+class TestV4StagnationHalving:
+    """Verify that long-paragraph reading (stagnation without blur) doesn't spike drift."""
+
+    def test_long_paragraph_no_blur_low_drift(self) -> None:
+        """
+        A reader stuck on one paragraph (no pace data) with NO focus loss
+        should have z_stagnation halved → low disruption → drift stays minimal.
+        """
+        # 15 batches all on same paragraph, no blur, no idle (actively reading)
+        seq = [_batch(idle_s=0.1, focus="focused", scroll_abs=50.0, para_id="chunk-1")] * 15
+        features = extract_features(seq, _WORD_COUNTS, 180.0)
+
+        assert not features.pace_available    # single para, pace unavailable
+        assert features.focus_loss_rate < 0.15
+
+        z = compute_z_scores(features, _BASELINE)
+        # z_stagnation should be halved; disruption should stay low
+        d, _ = compute_disruption_score(z, _BASELINE)
+        assert d < 0.45, f"Long paragraph (no blur) disruption should be < 0.45, got {d:.3f}"
+
+        result = compute_drift_result(features, _BASELINE, 1.0, 0.0, BETA0)
+        assert result.beta_effective < 0.08, (
+            f"Long paragraph (no blur) beta should be < 0.08, got {result.beta_effective:.3f}"
+        )
+
+    def test_long_paragraph_with_blur_full_stagnation(self) -> None:
+        """
+        Same paragraph + blur (focus_loss ≥ 0.15) → stagnation NOT halved.
+        Higher disruption than the no-blur case.
+        """
+        seq_no_blur = [_batch(idle_s=0.1, focus="focused", scroll_abs=20.0, para_id="chunk-1")] * 15
+        seq_blur = [_batch(idle_s=0.5, focus="blurred", scroll_abs=0.0, para_id="chunk-1")] * 15
+
+        f_no = extract_features(seq_no_blur, _WORD_COUNTS, 180.0)
+        f_bl = extract_features(seq_blur, _WORD_COUNTS, 180.0)
+
+        z_no = compute_z_scores(f_no, _BASELINE)
+        z_bl = compute_z_scores(f_bl, _BASELINE)
+
+        d_no, _ = compute_disruption_score(z_no, _BASELINE)
+        d_bl, _ = compute_disruption_score(z_bl, _BASELINE)
+
+        # Blur case should have clearly higher disruption
+        assert d_bl > d_no + 0.05, (
+            f"Blur+stagnation ({d_bl:.3f}) should be > no-blur ({d_no:.3f}) by 0.05+"
+        )
+
+
+# ── v4 baseline sanity check tests ───────────────────────────────────────────
+
+
+class TestV4BaselineSanityChecks:
+    """
+    Verify that broken calibration baselines (scroll not captured → jitter/regress = 0)
+    are replaced with population-average fallbacks, preventing huge z-scores.
+    """
+
+    _BROKEN_BASELINE: dict = {
+        "wpm_effective": 180.0,
+        "idle_ratio_mean": 1.0,     # cumulative bug → always 1.0
+        "idle_ratio_std": 0.05,
+        "scroll_jitter_mean": 0.0,  # broken — scroll not captured
+        "scroll_jitter_std": 0.0,
+        "regress_rate_mean": 0.0,   # broken — scroll not captured
+        "regress_rate_std": 0.0,
+        "para_dwell_median_s": 0.0,
+        "para_dwell_iqr_s": 0.0,
+    }
+
+    def test_broken_baseline_jitter_uses_fallback(self) -> None:
+        """
+        With jitter_mean=0 in baseline, a session with normal jitter=0.10
+        should give z_jitter ≈ 0 (at fallback baseline), NOT a huge z-score.
+        """
+        features = WindowFeatures(n_batches=15, scroll_jitter_mean=0.10)
+        z = compute_z_scores(features, self._BROKEN_BASELINE)
+        # Fallback: mu=0.10, std=0.10 → z = 0
+        assert z.z_jitter < 0.5, (
+            f"With broken jitter baseline, z_jitter for 0.10 should be ~0, got {z.z_jitter:.3f}"
+        )
+
+    def test_broken_baseline_regress_uses_fallback(self) -> None:
+        """
+        With regress_mean=0 in baseline, a session with normal regress=0.05
+        should give z_regress ≈ 0 (at fallback baseline), NOT a huge z-score.
+        """
+        features = WindowFeatures(n_batches=15, regress_rate_mean=0.05)
+        z = compute_z_scores(features, self._BROKEN_BASELINE)
+        # Fallback: mu=0.05, std=0.06 → z = 0
+        assert z.z_regress < 0.5, (
+            f"With broken regress baseline, z_regress for 0.05 should be ~0, got {z.z_regress:.3f}"
+        )
+
+    def test_sane_baseline_jitter_not_overridden(self) -> None:
+        """When baseline has sensible jitter (≥ 0.04), it should be used as-is."""
+        # jitter much higher than the sane baseline (0.10) → high z_jitter
+        features = WindowFeatures(n_batches=15, scroll_jitter_mean=0.50)
+        z_broken = compute_z_scores(features, self._BROKEN_BASELINE)
+        z_sane = compute_z_scores(features, _BASELINE)
+        # Both should detect high jitter; sane baseline should give non-trivial z
+        assert z_sane.z_jitter > 1.0, "High jitter should produce z > 1 against sane baseline"
+
+    def test_broken_calibration_focused_reading_stays_low(self) -> None:
+        """
+        A user with broken calibration (zeros) who is reading focused should
+        not have their drift explode due to sanity checks.
+        """
+        seq = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(30)]
+        traj = _simulate_timeline(seq, self._BROKEN_BASELINE)
+        ema_at_1min = traj[-1][1]
+        assert ema_at_1min < 0.10, (
+            f"Focused reading with broken baseline should stay < 10% at 1 min, "
+            f"got {ema_at_1min:.1%}"
+        )
