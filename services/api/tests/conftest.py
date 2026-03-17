@@ -85,6 +85,44 @@ def init_test_db() -> None:
                     ")"
                 )
             )
+        # Drop session_drift_history if it has the old serial 'id' column
+        # (same guard as engine.py init_db)
+        async with eng.begin() as c:
+            result = await c.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_name='session_drift_history' AND column_name='id'"
+                )
+            )
+            has_id = result.scalar() > 0
+        if has_id:
+            async with eng.begin() as c:
+                await c.execute(text("DROP TABLE IF EXISTS session_drift_history CASCADE"))
+            from app.db.base import Base
+            import app.db.models as _m  # noqa: F401
+            async with eng.begin() as c:
+                await c.run_sync(
+                    lambda sc: Base.metadata.tables["session_drift_history"].create(
+                        sc, checkfirst=True
+                    )
+                )
+        for ht in ("session_drift_history", "session_state_packets"):
+            async with eng.begin() as c:
+                await c.execute(
+                    text(
+                        f"SELECT create_hypertable("
+                        f"  '{ht}', 'created_at', if_not_exists => TRUE"
+                        f")"
+                    )
+                )
+        # Idempotent: add new columns to session_state_packets
+        for col_sql in [
+            "ADD COLUMN IF NOT EXISTS packet_seq INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN IF NOT EXISTS window_start_at TIMESTAMPTZ",
+            "ADD COLUMN IF NOT EXISTS window_end_at TIMESTAMPTZ",
+        ]:
+            async with eng.begin() as c:
+                await c.execute(text(f"ALTER TABLE session_state_packets {col_sql}"))
         await eng.dispose()
 
     asyncio.run(_setup())
@@ -106,6 +144,8 @@ def clean_tables() -> None:
         try:
             await conn.execute("DELETE FROM activity_events")
             await conn.execute("DELETE FROM session_drift_states")
+            await conn.execute("DELETE FROM session_drift_history")
+            await conn.execute("DELETE FROM session_state_packets")
             await conn.execute("DELETE FROM model_outputs")
             await conn.execute("DELETE FROM interventions")
             await conn.execute("DELETE FROM sessions")

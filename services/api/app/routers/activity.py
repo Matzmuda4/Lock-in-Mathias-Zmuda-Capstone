@@ -120,16 +120,14 @@ async def post_activity_batch(
     clamped_idle = min(raw_idle, _WINDOW_S)
 
     scroll_abs = body.scroll_delta_abs_sum
-    scroll_capture_fault = (
-        scroll_abs < 0.1
-        and body.scroll_event_count == 0
-        # Only flag when progress ratio has changed significantly
-        # (we don't have the previous batch's ratio here, so we use a proxy:
-        #  if the user has been reading long enough, progress > 0 means they scrolled at some point)
-        # Full check happens in feature extraction using rolling window context.
-        # Here we just check if scroll_event_count is suspiciously 0.
-        # The deeper per-window check happens in features.py.
-    )
+    # scroll_capture_fault CANNOT be reliably computed from a single batch
+    # because we would need the previous batch's progress_ratio to know whether
+    # "no scroll events" is a normal reading pause or a listener failure.
+    # Computing it here with only the current batch would create a massive false-
+    # positive rate: every pause to read is flagged as a capture failure.
+    # Instead, features.py computes this properly from consecutive batch pairs
+    # in the rolling window, where the full context is available.
+    scroll_capture_fault = False
 
     paragraph_missing_fault = body.current_paragraph_id is None
 

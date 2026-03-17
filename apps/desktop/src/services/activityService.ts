@@ -30,6 +30,11 @@ export interface TelemetryBatch {
   viewport_height_px: number;
   viewport_width_px: number;
   reader_container_height_px: number;
+  // ── UI context (Phase 8 — adaptive panel telemetry) ──────────────────────
+  /** READ_MAIN | PANEL_OPEN | PANEL_INTERACTING | USER_PAUSED */
+  ui_context?: "READ_MAIN" | "PANEL_OPEN" | "PANEL_INTERACTING" | "USER_PAUSED";
+  /** reader | panel | other */
+  interaction_zone?: "reader" | "panel" | "other";
   // ── Timestamp ─────────────────────────────────────────────────────────────
   client_timestamp: string;
 }

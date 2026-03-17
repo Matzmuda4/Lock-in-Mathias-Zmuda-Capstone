@@ -84,6 +84,10 @@ def paragraph_stagnation(batches: list[dict[str, Any]]) -> float:
 # ── Pace estimation ───────────────────────────────────────────────────────────
 
 
+_REGRESSION_ABS_MIN_PX: float = 50.0   # minimum absolute scroll to count as regression event
+_REGRESSION_FRAC_THRESH: float = 0.50  # neg_sum > 50% of abs_sum → major regression
+
+
 def estimate_window_wpm(
     batches: list[dict[str, Any]],
     paragraph_word_counts: dict[str, int],
@@ -95,8 +99,28 @@ def estimate_window_wpm(
 
     pace_available is True only when:
     - >= _PACE_MIN_PARAGRAPHS distinct paragraph IDs observed, AND
-    - >= _PACE_MIN_EFF_S effective (focused + low-idle) seconds.
+    - >= _PACE_MIN_EFF_S effective (focused + low-idle) seconds, AND
+    - The window contains NO major regression event.
+
+    Regression gate: if any single batch has scroll_neg > 50% of scroll_abs
+    AND scroll_abs > 50 px, the user is navigating (re-read + re-advance), not
+    reading linearly.  All paragraph IDs in the window are then untrustworthy
+    as a WPM proxy — the same paragraphs appear both during backtrack and
+    re-advance, inflating the estimate by 3–6×.
     """
+    # Regression gate: check every batch for a major backward scroll event
+    for b in batches:
+        abs_sum = b.get("scroll_delta_abs_sum", 0.0)
+        neg_sum = b.get("scroll_delta_neg_sum", 0.0)
+        n_paragraphs_early = len({
+            bb["current_paragraph_id"]
+            for bb in batches
+            if bb.get("current_paragraph_id")
+        })
+        if abs_sum >= _REGRESSION_ABS_MIN_PX and neg_sum >= _REGRESSION_FRAC_THRESH * abs_sum:
+            # Navigation event in window — pace estimate is unreliable
+            return 0.0, False, n_paragraphs_early
+
     seen_ids: set[str] = {
         b["current_paragraph_id"]
         for b in batches
@@ -123,6 +147,46 @@ def estimate_window_wpm(
 # ── Quality flag helpers ──────────────────────────────────────────────────────
 
 
+def is_at_end_of_document(batches: list[dict[str, Any]], threshold: float = 0.97) -> bool:
+    """
+    Returns True when the majority of the window is at the end of the document.
+
+    When the user has finished reading and is sitting at progress >= 0.97,
+    stagnation and scroll-absence are EXPECTED, not signs of distraction.
+    We suppress those signals to avoid penalising users for finishing.
+    """
+    if not batches:
+        return False
+    at_end = sum(
+        1 for b in batches if b.get("viewport_progress_ratio", 0.0) >= threshold
+    )
+    return at_end / len(batches) >= 0.60   # 60%+ of window at near-end
+
+
+def compute_scroll_capture_fault_rate(batches: list[dict[str, Any]]) -> float:
+    """
+    Detect genuine scroll-capture failures using consecutive batch comparisons.
+
+    A fault is: viewport_progress_ratio changed between two consecutive batches,
+    but no scroll events were recorded in the second batch.  This indicates the
+    scroll listener missed events — data is unreliable for that transition.
+
+    Reading pauses (no scroll + no progress change) are NOT faults.
+    """
+    n = len(batches)
+    if n < 2:
+        return 0.0
+    faults = 0
+    for i in range(1, n):
+        prev_prog = batches[i - 1].get("viewport_progress_ratio", 0.0)
+        curr_prog = batches[i].get("viewport_progress_ratio", 0.0)
+        scroll_abs = batches[i].get("scroll_delta_abs_sum", 0.0)
+        scroll_ev = batches[i].get("scroll_event_count", 0)
+        if scroll_abs < 0.1 and scroll_ev == 0 and abs(curr_prog - prev_prog) > 0.005:
+            faults += 1
+    return faults / (n - 1)
+
+
 def compute_quality_confidence_mult(batches: list[dict[str, Any]]) -> tuple[float, float, float, float]:
     """
     Compute data-quality rates and a combined confidence multiplier.
@@ -133,23 +197,27 @@ def compute_quality_confidence_mult(batches: list[dict[str, Any]]) -> tuple[floa
 
     Confidence penalties (multiplicative):
         - telemetry_fault (idle > 2s)       → ×0.5
-        - scroll_capture_fault              → ×0.7
+        - scroll_capture_fault (genuine)    → ×0.7  [window-context comparison]
         - paragraph_missing for all batches → ×0.7
+
+    scroll_capture_fault is now computed from consecutive progress comparisons
+    rather than the stored per-batch flag, which was a false positive every time
+    the user simply paused to read.
     """
     n = len(batches)
     if n == 0:
         return 0.0, 0.0, 0.0, 1.0
 
     tf = sum(1 for b in batches if b.get("telemetry_fault", False)) / n
-    scf = sum(1 for b in batches if b.get("scroll_capture_fault", False)) / n
+    scf = compute_scroll_capture_fault_rate(batches)
     pmf = sum(1 for b in batches if b.get("paragraph_missing_fault", b.get("current_paragraph_id") is None)) / n
 
     mult = 1.0
-    if tf > 0.3:   # more than 30% of batches had idle > 2s
+    if tf > 0.3:
         mult *= 0.5
-    if scf > 0.5:  # more than 50% of batches had no scroll events
+    if scf > 0.5:
         mult *= 0.7
-    if pmf > 0.7:  # more than 70% of batches missing paragraph id
+    if pmf > 0.7:
         mult *= 0.7
 
     return tf, scf, pmf, mult
@@ -237,7 +305,11 @@ def extract_features(
     burstiness = sv_std / max(sv_mean, _EPS) if sv_mean > 1e-6 else 0.0
 
     # Pace (gated)
-    base_wpm = baseline_wpm_effective if baseline_wpm_effective > 0 else 200.0
+    # Use 250 WPM as the population-average fallback when no calibration baseline
+    # exists.  200 WPM was too low — anyone reading at an average pace (~250 WPM)
+    # would score pace_ratio ≈ 1.25, just barely below SKIM_THRESHOLD, yet a
+    # small burst would push them over and fire a false skim signal.
+    base_wpm = baseline_wpm_effective if baseline_wpm_effective > 0 else 250.0
     win_wpm, pace_avail, n_paras = estimate_window_wpm(batches, paragraph_word_counts)
 
     if pace_avail and win_wpm > 0:
@@ -246,7 +318,15 @@ def extract_features(
     else:
         pace_ratio, pace_dev = 1.0, 0.0
 
+    # End-of-document: user has finished reading; stagnation/scroll-absence
+    # are expected here, not signs of distraction.
+    at_end = is_at_end_of_document(batches)
+
+    # Suppress stagnation when at end of document — we cannot tell "stuck"
+    # from "done" without this, and the false signal is severe.
     stag = compute_stagnation_ratio(batches)
+    if at_end:
+        stag = 0.0
 
     # Progress velocity (skimming fallback)
     prog_vel = compute_progress_velocity(batches)
@@ -279,4 +359,5 @@ def extract_features(
         scroll_capture_fault_rate=scf_rate,
         paragraph_missing_fault_rate=pmf_rate,
         quality_confidence_mult=qual_mult,
+        at_end_of_document=at_end,
     )

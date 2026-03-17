@@ -632,7 +632,7 @@ The LLM will later map these signals to probabilistic state labels:
 - **Focused**: low drift, low disruption, high engagement, good baseline match
 - **Drifting**: rising drift, high idle/blur, poor pace alignment
 - **Hyperfocused**: very fast pace, high scroll velocity, low idle (skimming risk)
-- **Fatigued**: slow pace, increasing regress/jitter, high stagnation
+- **Cognitive Overload**: slow pace, increasing regress/jitter, high stagnation
 
 ---
 

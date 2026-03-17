@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -179,7 +179,24 @@ async def _recompute_and_save(
         features, baseline, elapsed_min, prev_ema, prev_beta_ema
     )
 
-    return await upsert_drift_state(session.id, result, db)
+    # fetch_window returns payload dicts — query created_at separately for window bounds
+    window_end_at: Optional[datetime] = None
+    if batches:
+        ts_result = await db.execute(
+            text(
+                "SELECT MAX(created_at) FROM activity_events "
+                "WHERE session_id=:sid AND event_type='telemetry_batch' "
+                "AND created_at >= NOW() - INTERVAL '30 seconds'"
+            ),
+            {"sid": session.id},
+        )
+        window_end_at = ts_result.scalar()
+
+    return await upsert_drift_state(
+        session.id, result, db,
+        baseline_row=baseline_row,
+        window_end_at=window_end_at,
+    )
 
 
 # ── Shared session ownership check ───────────────────────────────────────────
@@ -432,7 +449,7 @@ class StatePacket(BaseModel):
     Structured payload prepared for the future LLM attentional-state classifier.
 
     The LLM will later map these signals to probabilistic state labels
-    (Focused / Drifting / Hyperfocused / Fatigued) and select an
+    (focused / drifting / hyperfocused / cognitive_overload) and select an
     intervention tier.  This endpoint produces the payload only — no LLM
     is invoked here.
     """

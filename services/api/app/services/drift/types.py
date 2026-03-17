@@ -70,6 +70,12 @@ class WindowFeatures:
     # Derived confidence multiplier applied by model (0..1)
     quality_confidence_mult: float = 1.0
 
+    # ── End-of-document flag ──────────────────────────────────────────────────
+    # True when >= 60% of the window has viewport_progress_ratio >= 0.97.
+    # When set, stagnation and high-idle signals are suppressed because the
+    # user has simply finished reading — not drifted.
+    at_end_of_document: bool = False
+
 
 @dataclass
 class ZScores:

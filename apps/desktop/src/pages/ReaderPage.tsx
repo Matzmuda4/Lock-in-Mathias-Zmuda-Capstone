@@ -390,6 +390,94 @@ function ExportCsvButton({ sessionId, token }: { sessionId: number; token: strin
   );
 }
 
+// ─── Adaptive assistant panel shell (adaptive mode only) ─────────────────────
+
+interface AssistantPanelProps {
+  panelRef: React.RefObject<HTMLDivElement>;
+  open: boolean;
+  onToggle: () => void;
+}
+
+function AssistantPanel({ panelRef, open, onToggle }: AssistantPanelProps) {
+  return (
+    <aside
+      id="assistant-panel-root"
+      data-testid="assistant-panel-root"
+      ref={panelRef}
+      className={`assistant-panel${open ? "" : " assistant-panel--collapsed"}`}
+      aria-label="Adaptive assistant panel"
+    >
+      <div className="assistant-panel__header">
+        <span className="assistant-panel__title">
+          {open ? "Assistant (Adaptive)" : ""}
+        </span>
+        <button
+          className="assistant-panel__toggle"
+          type="button"
+          aria-label={open ? "Collapse panel" : "Expand panel"}
+          onClick={onToggle}
+        >
+          {open ? "›" : "‹"}
+        </button>
+      </div>
+      {open && (
+        <div className="assistant-panel__body">
+          <p className="assistant-panel__placeholder">
+            Interventions will appear here.
+          </p>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+// ─── Dev-only Export Bundle button ───────────────────────────────────────────
+
+function ExportBundleButton({ sessionId, token }: { sessionId: number; token: string | null }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ folder: string; files: string[] } | null>(null);
+
+  const handleExport = async () => {
+    if (!token) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const resp = await fetch(
+        `${API_BASE_URL}/sessions/${sessionId}/export/bundle`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!resp.ok) {
+        console.error("Export bundle failed:", resp.status, await resp.text());
+        return;
+      }
+      const data = await resp.json();
+      setResult({ folder: data.folder, files: data.files });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "inline-flex", flexDirection: "column", gap: 4 }}>
+      <button
+        className="btn btn--ghost btn--sm export-btn"
+        type="button"
+        onClick={handleExport}
+        disabled={busy}
+      >
+        {busy ? "Exporting…" : "📦 Export Bundle"}
+      </button>
+      {result && (
+        <div style={{ fontSize: 10, color: "var(--text-muted)", maxWidth: 260, wordBreak: "break-all" }}>
+          <strong>Saved:</strong> {result.folder}
+          <br />
+          {result.files.join(", ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Dev-only debug panel ────────────────────────────────────────────────────
 
 import type { TelemetrySanityWarnings } from "../hooks/useTelemetry";
@@ -615,14 +703,24 @@ export function ReaderPage() {
 
   // Ref for the scrollable content area — passed to useTelemetry
   const contentRef = useRef<HTMLDivElement>(null);
+  // Ref for the adaptive assistant panel — panel zone detection
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Adaptive panel state (only meaningful in adaptive mode)
+  const isAdaptive = data?.session?.mode === "adaptive";
+  const [panelOpen, setPanelOpen] = useState(true);
 
   // Telemetry — active only while the session is in "active" status
   const isActive = data?.session?.status === "active";
+  const isPaused = data?.session?.status === "paused";
   const { lastBatch, collecting, warnings } = useTelemetry({
     sessionId,
     token,
     active: isActive,
     containerRef: contentRef,
+    sessionPaused: isPaused,
+    panelContainerRef: isAdaptive ? panelRef : undefined,
+    panelOpen: isAdaptive ? panelOpen : false,
   });
 
   useEffect(() => {
@@ -789,44 +887,62 @@ export function ReaderPage() {
         </div>
       </header>
 
-      {/* Content */}
-      <main className="reader-content" ref={contentRef}>
-        {isParsing && (
-          <div className="reader-notice">
-            <span className="spinner" />
-            <span>Document is still being parsed… check back in a moment.</span>
-          </div>
-        )}
-        {parseFailed && (
-          <div className="reader-notice reader-notice--error">
-            Parse failed. Go back to the dashboard to retry.
-          </div>
-        )}
-        {!isParsing && !parseFailed && chunks.length === 0 && (
-          <div className="reader-notice">No content was extracted from this document.</div>
-        )}
+      {/* Main content area + adaptive panel (side-by-side) */}
+      <div
+        id="reader-root"
+        data-testid="reader-root"
+        className={`reader-body${isAdaptive ? " reader-body--adaptive" : ""}`}
+      >
+        <main className="reader-content" ref={contentRef}>
+          {isParsing && (
+            <div className="reader-notice">
+              <span className="spinner" />
+              <span>Document is still being parsed… check back in a moment.</span>
+            </div>
+          )}
+          {parseFailed && (
+            <div className="reader-notice reader-notice--error">
+              Parse failed. Go back to the dashboard to retry.
+            </div>
+          )}
+          {!isParsing && !parseFailed && chunks.length === 0 && (
+            <div className="reader-notice">No content was extracted from this document.</div>
+          )}
 
-        {chunks.map((chunk, idx) => (
-          <ChunkCard
-            key={chunk.id}
-            chunk={chunk}
-            chunkIndex={idx}
-            docId={document_id}
-            token={token}
+          {chunks.map((chunk, idx) => (
+            <ChunkCard
+              key={chunk.id}
+              chunk={chunk}
+              chunkIndex={idx}
+              docId={document_id}
+              token={token}
+            />
+          ))}
+
+          {!allLoaded && !isParsing && (
+            <button className="btn btn--ghost btn--load-more" onClick={loadMore} disabled={loadingMore} type="button">
+              {loadingMore ? <span className="spinner" /> : "Load more"}
+            </button>
+          )}
+
+          {/* Export CSV — always visible in calibration, dev-only otherwise */}
+          {(isCalibration || DEV) && (
+            <ExportCsvButton sessionId={sessionId} token={token} />
+          )}
+
+          {/* Export Bundle (training data) — dev only */}
+          {DEV && <ExportBundleButton sessionId={sessionId} token={token} />}
+        </main>
+
+        {/* Adaptive assistant panel — mounted whenever mode=adaptive, never for baseline/calibration */}
+        {isAdaptive && (
+          <AssistantPanel
+            panelRef={panelRef}
+            open={panelOpen}
+            onToggle={() => setPanelOpen((o) => !o)}
           />
-        ))}
-
-        {!allLoaded && !isParsing && (
-          <button className="btn btn--ghost btn--load-more" onClick={loadMore} disabled={loadingMore} type="button">
-            {loadingMore ? <span className="spinner" /> : "Load more"}
-          </button>
         )}
-
-        {/* Export CSV — always visible in calibration, dev-only otherwise */}
-        {(isCalibration || DEV) && (
-          <ExportCsvButton sessionId={sessionId} token={token} />
-        )}
-      </main>
+      </div>
 
       {/* Dev debug panels */}
       {DEV && <DebugPanel batch={lastBatch} warnings={warnings} />}
@@ -835,6 +951,72 @@ export function ReaderPage() {
       <style>{`
         /* ── Layout ── */
         .reader { display:flex; flex-direction:column; min-height:100vh; }
+
+        /* reader-body is the flex row containing main content + optional panel */
+        .reader-body { display:flex; flex:1; overflow:hidden; }
+        .reader-body--adaptive .reader-content { flex:1; min-width:0; }
+
+        /* ── Adaptive assistant panel ── */
+        .assistant-panel {
+          width: 320px;
+          min-width: 320px;
+          background: var(--bg-surface);
+          border-left: 1px solid var(--border);
+          display: flex;
+          flex-direction: column;
+          transition: width 0.2s ease, min-width 0.2s ease;
+          overflow: hidden;
+          flex-shrink: 0;
+        }
+        .assistant-panel--collapsed {
+          width: 44px;
+          min-width: 44px;
+        }
+        .assistant-panel__header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 10px 12px;
+          border-bottom: 1px solid var(--border);
+          gap: 8px;
+          min-height: 44px;
+        }
+        .assistant-panel__title {
+          font-size: 12px;
+          font-weight: 600;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          flex: 1;
+        }
+        .assistant-panel__toggle {
+          background: none;
+          border: 1px solid var(--border);
+          border-radius: 4px;
+          color: var(--text-muted);
+          cursor: pointer;
+          font-size: 14px;
+          line-height: 1;
+          padding: 2px 6px;
+          flex-shrink: 0;
+        }
+        .assistant-panel__toggle:hover { color: var(--text); border-color: var(--text-muted); }
+        .assistant-panel__body {
+          flex: 1;
+          padding: 16px 12px;
+          overflow-y: auto;
+        }
+        .assistant-panel__placeholder {
+          font-size: 12px;
+          color: var(--text-muted);
+          font-style: italic;
+          margin: 0;
+          text-align: center;
+          padding-top: 24px;
+        }
 
         .reader-bar {
           background: var(--bg-surface);

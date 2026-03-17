@@ -55,8 +55,8 @@ disruption_score = sigmoid((disruption_raw − CENTER) / SCALE)
 disruption_raw = W_D_IDLE       × z_idle        # PRIMARY — see below
                + W_D_FOCUS      × z_focus_loss   # explicit disengagement
                + W_D_STAGNATION × z_stagnation   # stuck on same paragraph
-               + W_D_PACE       × z_pace         # too fast or too slow
-               + W_D_SKIM       × z_skim         # asymmetric fast-skim
+               + W_D_PACE       × z_pace         # (zeroed — W_D_PACE = 0.0)
+               + W_D_SKIM       × z_skim         # asymmetric fast-skim only
                + W_D_REGRESS    × z_regress      # comprehension-difficulty proxy
                + W_D_JITTER     × z_jitter       # restlessness/erratic scroll
                + W_D_BURSTINESS × z_burstiness   # burst scroll instability
@@ -72,10 +72,12 @@ Research basis for signal ordering:
   3. Stagnation on paragraph  (W_D_STAGNATION = 0.12)
      Rayner (1998, Psych. Bull.) — abnormally long dwell on a single region
      indicates comprehension difficulty or zoning-out.
-  4. Pace deviation  (W_D_PACE = 0.15) + Skim  (W_D_SKIM = 0.18)
+  4. Skim  (W_D_SKIM = 0.18) — asymmetric fast-skim signal only.
      Just & Carpenter (1980) — reading rate is tightly coupled to cognitive
-     processing depth. Skimming (impulsive fast forward) AND crawling (stuck)
-     both signal attentional anomaly. Skim receives an asymmetric extra weight.
+     processing depth. Skimming (fast forward beyond 1.6× baseline) signals
+     attentional anomaly.  Pace deviation (W_D_PACE) is intentionally zeroed:
+     reading SLOWER than calibration on harder academic text is normal, not
+     distraction, and was causing false disruption spikes for legitimate readers.
   5. Regress rate  (W_D_REGRESS = 0.10)
      Rayner & Pollatsek (1989) — high regressive saccade rate correlates with
      reading difficulty / comprehension failure. Weighted below idle because
@@ -97,8 +99,12 @@ ENGAGEMENT SCORE (multiplicative — skimming cannot hide behind calmness)
 engagement = calm × (0.80 × pace_align + 0.20 × progress_boost)
 
 calm       = (1 − z_idle/3) × (1 − z_focus_loss/3)   ∈ [0, 1]
-pace_align = 1 − max(z_pace, z_skim) / 3              ∈ [0, 1]  if pace_available
+pace_align = 1 − z_skim / 3                           ∈ [0, 1]  if pace_available
            = 0.5 (neutral)                             if pace not yet measurable
+
+pace_align uses z_skim ONLY (not z_pace).  Reading SLOWER than calibration on
+harder academic text gives z_skim = 0 → pace_align = 1.0 (no penalty).
+Only genuinely fast skimming (> 1.6× baseline) reduces pace_align.
 
 The multiplicative design ensures:
   • Skimming (low pace_align) reduces engagement even when the user is calm
@@ -144,8 +150,8 @@ from app.services.drift.types import DriftResult, WindowFeatures, ZScores
 
 # Natural time-on-task decay rate
 # BETA0 = 0.03 → drift ≈ 3% at 1 min, 9% at 3 min, 26% at 10 min
-BETA0: float = 0.03
-BETA_MIN: float = 0.02    # floor: even perfect engagement can't eliminate decay
+BETA0: float = 0.01
+BETA_MIN: float = 0.01    # floor: even perfect engagement can't eliminate decay
 BETA_MAX: float = 0.65    # ceiling: extreme distraction / full idle
 BETA_EMA_ALPHA: float = 0.20  # 50% convergence in ~3 steps (6 s) — responsive
 
@@ -161,11 +167,14 @@ Z_POS_CAP: float = 3.0
 
 # Disruption sigmoid parameters: sigmoid((raw - CENTER) / SCALE)
 # CENTER = 0.35 means disruption_raw must exceed 0.35 to score > 0.5
-DISRUPT_CENTER: float = 0.35
+DISRUPT_CENTER: float = 0.4
 DISRUPT_SCALE: float = 0.25
 
 # Skimming thresholds
-SKIM_THRESHOLD: float = 1.3   # pace_ratio > this triggers asymmetric skim signal
+# 1.6× baseline is required to trigger the skim signal.  1.3× was too sensitive:
+# a user reading at a slightly brisk pace (normal variation) would exceed it.
+# With a 250 WPM fallback and 1.6 threshold, skim only fires above ~400 WPM.
+SKIM_THRESHOLD: float = 1.6   # pace_ratio > this triggers asymmetric skim signal
 SKIM_SCALE: float = 0.5       # (pace_ratio - 1) / this → z_skim
 
 # Disruption component weights (W_D_X × z_X → disruption_raw)
@@ -173,8 +182,8 @@ SKIM_SCALE: float = 0.5       # (pace_ratio - 1) / this → z_skim
 W_D_IDLE: float = 0.22        # PRIMARY — never reduced by baseline variability
 W_D_FOCUS: float = 0.18       # explicit disengagement
 W_D_STAGNATION: float = 0.12  # stuck on paragraph
-W_D_PACE: float = 0.15        # pace deviation (too fast or too slow)
-W_D_SKIM: float = 0.18        # asymmetric fast-skim signal
+W_D_PACE: float = 0.0         # ZEROED: z_skim handles fast; slow = harder text, not distraction
+W_D_SKIM: float = 0.18        # asymmetric fast-skim signal (only above 1.6× baseline)
 W_D_REGRESS: float = 0.10     # high back-scroll rate
 W_D_JITTER: float = 0.08      # erratic direction changes
 W_D_BURSTINESS: float = 0.05  # burst scroll instability
@@ -214,6 +223,23 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
     """
     b = baseline
 
+    # At end of document, idle is expected — the user has finished reading.
+    # Suppress idle, stagnation, and scroll-absence signals completely so the
+    # model does not penalise readers for being done.
+    if features.at_end_of_document:
+        return ZScores(
+            z_idle=0.0,
+            z_focus_loss=z_pos(features.focus_loss_rate, 0.0, 0.08),
+            z_jitter=0.0,
+            z_regress=0.0,
+            z_pause=0.0,
+            z_stagnation=0.0,
+            z_mouse=0.0,
+            z_pace=0.0,
+            z_skim=0.0,
+            z_burstiness=0.0,
+        )
+
     # Realistic fallbacks for uncalibrated users:
     # readers are idle ~35% of 2-second windows between scrolls
     z_idle = z_pos(
@@ -224,17 +250,28 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
 
     z_focus = z_pos(features.focus_loss_rate, 0.0, 0.08)
 
-    z_jitter = z_pos(
-        features.scroll_jitter_mean,
-        b.get("scroll_jitter_mean", 0.10),
-        max(b.get("scroll_jitter_std", 0.10), 0.05),
-    )
+    # When calibration text produced zero jitter/regression (short linear text
+    # with no backtracking), storing 0.0 makes any real-session jitter or
+    # regression produce z = value / 0.05 → z = 3.0 (max) even for tiny values.
+    # Use the population defaults as a floor so calibration artifacts don't
+    # hypersensitise the model.
+    jitter_mean_b = b.get("scroll_jitter_mean", 0.10)
+    if jitter_mean_b == 0.0:
+        jitter_mean_b = 0.10   # population default: 10% direction-change rate
+    jitter_std_b = max(b.get("scroll_jitter_std", 0.10), 0.05)
+    if b.get("scroll_jitter_std", None) is not None and b.get("scroll_jitter_std") == 0.0:
+        jitter_std_b = 0.10
 
-    z_regress = z_pos(
-        features.regress_rate_mean,
-        b.get("regress_rate_mean", 0.05),
-        max(b.get("regress_rate_std", 0.06), 0.03),
-    )
+    z_jitter = z_pos(features.scroll_jitter_mean, jitter_mean_b, jitter_std_b)
+
+    regress_mean_b = b.get("regress_rate_mean", 0.05)
+    if regress_mean_b == 0.0:
+        regress_mean_b = 0.05  # population default: 5% backward-scroll rate
+    regress_std_b = max(b.get("regress_rate_std", 0.06), 0.03)
+    if b.get("regress_rate_std", None) is not None and b.get("regress_rate_std") == 0.0:
+        regress_std_b = 0.06
+
+    z_regress = z_pos(features.regress_rate_mean, regress_mean_b, regress_std_b)
 
     z_pause = z_pos(
         features.scroll_pause_mean,
@@ -242,8 +279,15 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
         max(b.get("idle_seconds_std", 1.0), 0.5),
     )
 
-    # Stagnation: personalized expected fraction from para_dwell_median_s
-    stagnation_mu = min(max(b.get("para_dwell_median_s", 10.0) / 30.0, 0.05), 0.80)
+    # Stagnation: expected fraction of window on one paragraph.
+    # Use (median + 0.5 × IQR) as the reference rather than just the median,
+    # because reading harder text naturally causes longer-than-calibration dwell
+    # and should not be penalised as "stuck".
+    # IQR captures intra-session variability: if the user sometimes dwells 6s
+    # and sometimes 2s, the expected fraction should be generous.
+    para_median = b.get("para_dwell_median_s", 10.0)
+    para_iqr = b.get("para_dwell_iqr_s", 3.0)
+    stagnation_mu = min(max((para_median + 0.5 * para_iqr) / 30.0, 0.08), 0.80)
     z_stagnation = z_pos(features.stagnation_ratio, stagnation_mu, 0.15)
 
     # Mouse: skip when stationary
@@ -347,13 +391,16 @@ def compute_engagement_score(z: ZScores, features: WindowFeatures) -> float:
     engagement = calm × (0.80 × pace_align + marker_boost)
 
     calm       = (1 - z_idle/CAP) × (1 - z_focus_loss/CAP)
-    pace_align = 1 - max(z_pace, z_skim)/CAP   if pace_available else 0.5 (neutral)
+    pace_align = 1 - z_skim/CAP   if pace_available else 0.5 (neutral)
+
+    pace_align uses z_skim ONLY.  Reading slower than calibration (harder text)
+    gives z_skim=0 → pace_align=1.0.  Only fast skimming (>1.6×) reduces it.
 
     The multiplicative design ensures:
     - Skimming (bad pace_align) → engagement reduced even when calm is high
     - Distracted (calm → 0) → engagement → 0 regardless of pace
     - Focused steady reading → engagement ≈ 0.4 (moderate: no pace available yet)
-    - Focused + on-pace → engagement ≈ 0.7
+    - Focused + on-pace or slower → engagement ≈ 0.80
     """
     calm = (
         (1.0 - min(z.z_idle / Z_POS_CAP, 1.0))
@@ -361,10 +408,27 @@ def compute_engagement_score(z: ZScores, features: WindowFeatures) -> float:
     )
 
     if features.pace_available:
-        worst_pace_z = max(z.z_pace, z.z_skim)
-        pace_align = 1.0 - min(worst_pace_z / Z_POS_CAP, 1.0)
+        # Use z_skim only — reading SLOWER than calibration is normal on harder
+        # text and must not reduce pace_align.  z_skim is 0 unless the user is
+        # scrolling faster than 1.6× their calibration pace.
+        pace_align = 1.0 - min(z.z_skim / Z_POS_CAP, 1.0)
     else:
-        pace_align = 0.5  # neutral when no evidence yet
+        # Pace is unavailable (regression gate fired, early window, etc.).
+        # Use scroll direction quality to set pace_align on a continuum:
+        #
+        #  Steady FORWARD scroll  z_regress≈0   → pace_align=0.65 (positive)
+        #  Mixed re-reading        z_regress≈1.5 → pace_align=0.50 (neutral)
+        #  Fast BACKWARD scroll    z_regress=3.0 → pace_align=0.35 (slightly negative)
+        #
+        # Fast backward scrolling is a weak distraction signal (boredom /
+        # cognitive fatigue); it must not masquerade as engagement.  True
+        # recovery happens when pace becomes available again (steady reading).
+        _SCROLL_ACTIVE: float = 0.005  # normalised velocity ≈ 3 px/s
+        if features.scroll_velocity_norm_mean > _SCROLL_ACTIVE:
+            regress_ratio = min(z.z_regress / Z_POS_CAP, 1.0)
+            pace_align = 0.65 - regress_ratio * 0.30  # [0.35, 0.65]
+        else:
+            pace_align = 0.50  # stationary — no directional evidence
 
     progress_boost = min(1.0, features.progress_markers_count / 2.0)
     score = calm * (0.80 * pace_align + 0.20 * progress_boost)
@@ -507,10 +571,13 @@ def compute_drift_result(
     confidence = base_confidence * features.quality_confidence_mult
 
     # ── C2: Faster re-engagement: increase EMA alpha when engagement is high
-    # When the user shows sustained engagement (score > 0.6), allow beta to
-    # drop faster by using a higher EMA alpha temporarily.
+    # When the user shows engagement > 0.50, allow beta to drop faster.
+    # Threshold 0.50 means only STEADY FORWARD scrolling (z_regress≈0,
+    # pace_align=0.65 → engagement≈0.52) or normal reading (engagement≈0.80)
+    # trigger rapid recovery.  Fast backward scrolling (pace_align=0.35,
+    # engagement≈0.28) does NOT trigger this — drift continues to rise or hold.
     effective_ema_alpha = BETA_EMA_ALPHA
-    if engagement_score > 0.60 and prev_beta_ema > BETA0 * 2:
+    if engagement_score > 0.50 and prev_beta_ema > BETA0 * 2:
         effective_ema_alpha = min(0.40, BETA_EMA_ALPHA * 2)
 
     # Beta: baseline decay + disruption boost - engagement dampening

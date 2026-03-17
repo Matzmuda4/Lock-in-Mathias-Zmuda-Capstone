@@ -40,6 +40,8 @@
  *   viewport_height_px            window.innerHeight
  *   viewport_width_px             window.innerWidth
  *   reader_container_height_px    scrollable container clientHeight
+ *   ui_context                    READ_MAIN | PANEL_OPEN | PANEL_INTERACTING | USER_PAUSED
+ *   interaction_zone              reader | panel | other
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -223,6 +225,9 @@ const WINDOW_S = 2.0;
 const MAX_PAUSE_CAP_S = 60;
 const DEV = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV ?? false;
 
+export type UiContext = "READ_MAIN" | "PANEL_OPEN" | "PANEL_INTERACTING" | "USER_PAUSED";
+export type InteractionZone = "reader" | "panel" | "other";
+
 export interface UseTelemetryOptions {
   sessionId: number;
   token: string | null;
@@ -230,6 +235,16 @@ export interface UseTelemetryOptions {
   active: boolean;
   /** Ref to the scrollable reader container element. */
   containerRef: React.RefObject<HTMLElement | null>;
+  /** Whether the session is currently paused (sets ui_context=USER_PAUSED). */
+  sessionPaused?: boolean;
+  /**
+   * Ref to the adaptive side panel container.
+   * When provided, events inside this element set interaction_zone="panel".
+   * Only pass for adaptive-mode sessions.
+   */
+  panelContainerRef?: React.RefObject<HTMLElement | null>;
+  /** Whether the side panel is currently open/visible (adaptive mode only). */
+  panelOpen?: boolean;
 }
 
 export interface UseTelemetryReturn {
@@ -246,6 +261,9 @@ export function useTelemetry({
   token,
   active,
   containerRef,
+  sessionPaused = false,
+  panelContainerRef,
+  panelOpen = false,
 }: UseTelemetryOptions): UseTelemetryReturn {
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -289,6 +307,12 @@ export function useTelemetry({
   // Track how many consecutive batches had no paragraph — for warning
   const missingParaBatches = useRef<number>(0);
 
+  // ── Interaction zone tracking (Phase 8 — panel telemetry) ────────────────
+  // Zone of the most recent interaction in this 2s window.
+  const lastInteractionZone = useRef<InteractionZone>("reader");
+  // True if any interaction happened in the panel during this window.
+  const panelInteractedInWindow = useRef<boolean>(false);
+
   // ── Exposed to UI ──────────────────────────────────────────────────────────
   const [lastBatch, setLastBatch] = useState<TelemetryBatch | null>(null);
   const [warnings, setWarnings] = useState<TelemetrySanityWarnings | null>(null);
@@ -311,6 +335,10 @@ export function useTelemetry({
 
     // Reset window start for next idle computation
     windowStart.current = Date.now();
+
+    // Reset zone tracking for the next window
+    lastInteractionZone.current = "reader";
+    panelInteractedInWindow.current = false;
   }, [containerRef]);
 
   // ── Flush: build and send one batch ───────────────────────────────────────
@@ -400,6 +428,19 @@ export function useTelemetry({
 
     prevProgressRatio.current = viewportProgress;
 
+    // ── Phase 8: ui_context + interaction_zone ────────────────────────────
+    const interactionZone: InteractionZone = lastInteractionZone.current;
+    let uiCtx: UiContext;
+    if (sessionPaused) {
+      uiCtx = "USER_PAUSED";
+    } else if (panelInteractedInWindow.current) {
+      uiCtx = "PANEL_INTERACTING";
+    } else if (panelOpen) {
+      uiCtx = "PANEL_OPEN";
+    } else {
+      uiCtx = "READ_MAIN";
+    }
+
     const batch: TelemetryBatch = {
       session_id: sessionId,
       scroll_delta_sum: scrollDeltaSum.current,
@@ -422,6 +463,8 @@ export function useTelemetry({
       viewport_height_px: window.innerHeight,
       viewport_width_px: window.innerWidth,
       reader_container_height_px: container ? container.clientHeight : window.innerHeight,
+      ui_context: uiCtx,
+      interaction_zone: interactionZone,
       client_timestamp: new Date().toISOString(),
     };
 
@@ -437,7 +480,7 @@ export function useTelemetry({
     setLastBatch(batch);
     setWarnings(sanity);
     resetAccumulators();
-  }, [sessionId, containerRef, resetAccumulators]);
+  }, [sessionId, containerRef, resetAccumulators, sessionPaused, panelOpen]);
 
   // ── Event listeners ────────────────────────────────────────────────────────
   // A2 / A6: The scroll container (`<main ref={contentRef}>`) may not exist yet
@@ -533,6 +576,33 @@ export function useTelemetry({
       window.removeEventListener("focus", onFocus);
     };
   }, [containerRef]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Phase 8: Panel interaction zone detection ─────────────────────────────
+  // Attach event listeners to the panel container (adaptive sessions only).
+  // Any click, mousemove, or keydown inside the panel sets zone="panel".
+  // This effect re-runs when panelContainerRef becomes available.
+  useEffect(() => {
+    const panel = panelContainerRef?.current;
+    if (!panel) return;
+
+    const onPanelEvent = () => {
+      if (!activeRef.current) return;
+      lastInteractionZone.current = "panel";
+      panelInteractedInWindow.current = true;
+      lastInteraction.current = Date.now();
+    };
+
+    panel.addEventListener("click", onPanelEvent);
+    panel.addEventListener("mousemove", onPanelEvent, { passive: true });
+    panel.addEventListener("keydown", onPanelEvent);
+
+    return () => {
+      panel.removeEventListener("click", onPanelEvent);
+      panel.removeEventListener("mousemove", onPanelEvent);
+      panel.removeEventListener("keydown", onPanelEvent);
+    };
+  // Intentionally depends on the ref identity — re-runs when panel mounts
+  }, [panelContainerRef?.current]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── A3/A6: IntersectionObserver — improved fallback + retry on late mount ──
   // The container element may be null on the first effect run if the page is
