@@ -25,6 +25,10 @@ _VALID_EVENT_TYPES = frozenset(
         "blur",
         "focus",
         "heartbeat",
+        # Explicit user interaction with the adaptive side panel.
+        # Signals that idle time in a window is intentional engagement,
+        # not distraction — used by the drift model to dampen z_idle.
+        "panel_interaction",
     }
 )
 

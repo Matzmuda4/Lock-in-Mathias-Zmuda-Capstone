@@ -242,11 +242,18 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
 
     # Realistic fallbacks for uncalibrated users:
     # readers are idle ~35% of 2-second windows between scrolls
-    z_idle = z_pos(
+    z_idle_raw = z_pos(
         features.idle_ratio_mean,
         b.get("idle_ratio_mean", 0.35),
         max(b.get("idle_ratio_std", 0.20), 0.08),
     )
+
+    # Panel-interaction dampening: when the user is genuinely engaging with
+    # the adaptive side panel, idleness is intentional — not distraction.
+    # Scale z_idle down linearly with panel_interaction_share, capped at 80%
+    # suppression so a fully panel-engaged window still registers mild idle.
+    panel_damp = 1.0 - min(features.panel_interaction_share, 0.80)
+    z_idle = z_idle_raw * panel_damp
 
     z_focus = z_pos(features.focus_loss_rate, 0.0, 0.08)
 

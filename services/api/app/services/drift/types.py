@@ -76,6 +76,12 @@ class WindowFeatures:
     # user has simply finished reading — not drifted.
     at_end_of_document: bool = False
 
+    # ── Panel interaction share ────────────────────────────────────────────────
+    # Fraction of batches in this window where ui_context == "PANEL_INTERACTING"
+    # or interaction_zone == "panel".  When > 0, the model dampens z_idle because
+    # idleness during genuine panel engagement is intentional, not distraction.
+    panel_interaction_share: float = 0.0
+
 
 @dataclass
 class ZScores:

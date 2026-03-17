@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { useTelemetry } from "../hooks/useTelemetry";
+import { activityService } from "../services/activityService";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { documentService, type Chunk } from "../services/documentService";
 import { sessionService, type Session, type SessionReaderData } from "../services/sessionService";
@@ -396,9 +397,20 @@ interface AssistantPanelProps {
   panelRef: React.RefObject<HTMLDivElement>;
   open: boolean;
   onToggle: () => void;
+  onInteract: () => void;
 }
 
-function AssistantPanel({ panelRef, open, onToggle }: AssistantPanelProps) {
+function AssistantPanel({ panelRef, open, onToggle, onInteract }: AssistantPanelProps) {
+  const [interactCount, setInteractCount] = useState(0);
+  const [flash, setFlash] = useState(false);
+
+  const handleInteract = () => {
+    setInteractCount((c) => c + 1);
+    setFlash(true);
+    setTimeout(() => setFlash(false), 400);
+    onInteract();
+  };
+
   return (
     <aside
       id="assistant-panel-root"
@@ -409,7 +421,7 @@ function AssistantPanel({ panelRef, open, onToggle }: AssistantPanelProps) {
     >
       <div className="assistant-panel__header">
         <span className="assistant-panel__title">
-          {open ? "Assistant (Adaptive)" : ""}
+          {open ? "Assistant" : ""}
         </span>
         <button
           className="assistant-panel__toggle"
@@ -422,9 +434,31 @@ function AssistantPanel({ panelRef, open, onToggle }: AssistantPanelProps) {
       </div>
       {open && (
         <div className="assistant-panel__body">
-          <p className="assistant-panel__placeholder">
-            Interventions will appear here.
-          </p>
+          {/* ── Interaction button ───────────────────────────────────────── */}
+          <div className="panel-section">
+            <p className="panel-section__label">Panel Interaction</p>
+            <p className="panel-section__hint">
+              Press when you are actively engaging with the system — this
+              tells the model that idle time here is intentional, not drift.
+            </p>
+            <button
+              type="button"
+              className={`panel-interact-btn${flash ? " panel-interact-btn--flash" : ""}`}
+              onClick={handleInteract}
+            >
+              ⚡ Interaction
+              {interactCount > 0 && (
+                <span className="panel-interact-btn__count">{interactCount}</span>
+              )}
+            </button>
+          </div>
+
+          {/* ── Placeholder for future interventions ─────────────────────── */}
+          <div className="panel-section panel-section--muted">
+            <p className="assistant-panel__placeholder">
+              Interventions will appear here.
+            </p>
+          </div>
         </div>
       )}
     </aside>
@@ -713,6 +747,15 @@ export function ReaderPage() {
   // Telemetry — active only while the session is in "active" status
   const isActive = data?.session?.status === "active";
   const isPaused = data?.session?.status === "paused";
+
+  // Panel interaction handler — fires a named event so the drift model
+  // can recognise that idle time during panel engagement is intentional.
+  const handlePanelInteract = useCallback(() => {
+    if (!token || !isActive) return;
+    activityService.postEvent(token, sessionId, "panel_interaction", {
+      panel_open: panelOpen,
+    });
+  }, [token, sessionId, isActive, panelOpen]);
   const { lastBatch, collecting, warnings } = useTelemetry({
     sessionId,
     token,
@@ -940,6 +983,7 @@ export function ReaderPage() {
             panelRef={panelRef}
             open={panelOpen}
             onToggle={() => setPanelOpen((o) => !o)}
+            onInteract={handlePanelInteract}
           />
         )}
       </div>
@@ -954,12 +998,17 @@ export function ReaderPage() {
 
         /* reader-body is the flex row containing main content + optional panel */
         .reader-body { display:flex; flex:1; overflow:hidden; }
-        .reader-body--adaptive .reader-content { flex:1; min-width:0; }
+        .reader-body--adaptive .reader-content {
+          flex: 1;
+          min-width: 0;
+          max-width: none;
+          margin: 0;
+        }
 
         /* ── Adaptive assistant panel ── */
         .assistant-panel {
-          width: 320px;
-          min-width: 320px;
+          width: 400px;
+          min-width: 400px;
           background: var(--bg-surface);
           border-left: 1px solid var(--border);
           display: flex;
@@ -1016,6 +1065,65 @@ export function ReaderPage() {
           margin: 0;
           text-align: center;
           padding-top: 24px;
+        }
+        .panel-section {
+          margin-bottom: 20px;
+        }
+        .panel-section--muted {
+          opacity: 0.6;
+        }
+        .panel-section__label {
+          font-size: 11px;
+          font-weight: 700;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          margin: 0 0 6px;
+        }
+        .panel-section__hint {
+          font-size: 12px;
+          color: var(--text-muted);
+          line-height: 1.5;
+          margin: 0 0 12px;
+        }
+        .panel-interact-btn {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          width: 100%;
+          padding: 10px 14px;
+          background: var(--bg);
+          border: 1.5px solid var(--border);
+          border-radius: 8px;
+          color: var(--text);
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.15s, border-color 0.15s, transform 0.1s;
+          justify-content: center;
+        }
+        .panel-interact-btn:hover {
+          background: var(--bg-hover, rgba(0,0,0,0.04));
+          border-color: var(--accent, #4f6ef7);
+        }
+        .panel-interact-btn:active {
+          transform: scale(0.97);
+        }
+        .panel-interact-btn--flash {
+          background: var(--accent-subtle, rgba(79,110,247,0.12));
+          border-color: var(--accent, #4f6ef7);
+        }
+        .panel-interact-btn__count {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          background: var(--accent, #4f6ef7);
+          color: #fff;
+          font-size: 11px;
+          font-weight: 700;
+          border-radius: 20px;
+          padding: 1px 7px;
+          min-width: 20px;
         }
 
         .reader-bar {
@@ -1087,7 +1195,7 @@ export function ReaderPage() {
 
         /* ── Content column ── */
         .reader-content {
-          max-width: 90ch;
+          max-width: 95ch;
           width: 100%;
           margin: 0 auto;
           padding: 48px 24px 100px;
@@ -1100,11 +1208,11 @@ export function ReaderPage() {
 
         /* Text — larger, more readable */
         .chunk__p {
-          font-size: 18px;
+          font-size: 19px;
           line-height: 1.75;
           color: var(--text);
           margin: 0;
-          max-width: 75ch;
+          max-width: 85ch;
         }
 
         /* Headings */

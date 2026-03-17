@@ -63,4 +63,26 @@ export const activityService = {
       return null;
     }
   },
+
+  /**
+   * POST /activity
+   * Sends a single named activity event (e.g. "panel_interaction").
+   * Silently swallows network errors.
+   */
+  async postEvent(
+    token: string,
+    sessionId: number,
+    eventType: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<void> {
+    try {
+      await apiRequest("/activity", {
+        method: "POST",
+        token,
+        body: { session_id: sessionId, event_type: eventType, payload },
+      });
+    } catch {
+      // telemetry must never crash the reader
+    }
+  },
 };

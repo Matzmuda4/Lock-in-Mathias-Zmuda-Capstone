@@ -187,6 +187,29 @@ def compute_scroll_capture_fault_rate(batches: list[dict[str, Any]]) -> float:
     return faults / (n - 1)
 
 
+def compute_panel_interaction_share(batches: list[dict[str, Any]]) -> float:
+    """
+    Fraction of batches in the window where the user was actively engaged
+    with the adaptive side panel.
+
+    A batch counts if:
+      - ui_context == "PANEL_INTERACTING"  (explicit button press or panel click), OR
+      - interaction_zone == "panel"        (mouse/keyboard in panel area)
+
+    Used by the drift model to dampen z_idle — idle time during genuine panel
+    engagement does not imply attention drift.
+    """
+    n = len(batches)
+    if n == 0:
+        return 0.0
+    panel_batches = sum(
+        1 for b in batches
+        if b.get("ui_context") == "PANEL_INTERACTING"
+        or b.get("interaction_zone") == "panel"
+    )
+    return panel_batches / n
+
+
 def compute_quality_confidence_mult(batches: list[dict[str, Any]]) -> tuple[float, float, float, float]:
     """
     Compute data-quality rates and a combined confidence multiplier.
@@ -334,6 +357,9 @@ def extract_features(
     # Data-quality flags and confidence multiplier
     tf_rate, scf_rate, pmf_rate, qual_mult = compute_quality_confidence_mult(batches)
 
+    # Panel interaction share — used to dampen z_idle for justified panel dwell
+    panel_share = compute_panel_interaction_share(batches)
+
     return WindowFeatures(
         n_batches=n,
         scroll_velocity_norm_mean=sv_mean,
@@ -360,4 +386,5 @@ def extract_features(
         paragraph_missing_fault_rate=pmf_rate,
         quality_confidence_mult=qual_mult,
         at_end_of_document=at_end,
+        panel_interaction_share=panel_share,
     )
