@@ -1,4 +1,4 @@
-# Lock-In — Training Data Pipeline
+# Lock-In — Training Data Pipeline (classify branch)
 
 This folder holds the training-data export pipeline for the Lock-In LLM attentional-state classifier.
 
@@ -122,4 +122,104 @@ Optional.  Columns: `chunk_index`, `chunk_type`, `word_count`, `page_start`, `pa
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
   http://localhost:8000/exports/users/me/baseline | jq
+```
+
+---
+
+## Consolidated training export (NEW — classify branch)
+
+The `/training/packets/export` endpoints produce a **single flat file** across
+all sessions — the primary input for PEFT/QLoRA fine-tuning.
+
+### Folder layout
+
+```
+training/
+├── data/                         ← git-ignored; consolidated export files
+│   ├── packets_user_1_20260225T120000.csv
+│   └── packets_user_1_20260225T120000.jsonl
+└── exports/                      ← git-ignored; per-session bundles
+    └── user_{uid}/session_{sid}/
+        ├── session_meta.json
+        ├── baseline.json
+        ├── state_packets.jsonl
+        ├── telemetry_batches.csv
+        ├── events.csv
+        └── document_chunks.csv
+```
+
+### Quick-start
+
+```bash
+# Export all your packets to a CSV (default)
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/training/packets/export" | jq
+
+# Export as JSONL with debug fields
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/training/packets/export?format=jsonl&include_debug=true" | jq
+
+# Download the CSV directly
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/training/packets/export?download=true" \
+  -o training_data.csv
+
+# Export specific sessions only
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/training/packets/export?session_ids=42,43,44" | jq
+
+# Filter by session mode
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/training/packets/export?mode=adaptive" | jq
+
+# POST variant (body-driven, good for many session IDs)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"session_ids":[42,43],"format":"jsonl","include_debug":false}' \
+  http://localhost:8000/training/packets/export | jq
+```
+
+### Packet cadence
+
+A state packet is written to `session_state_packets` every **exactly 10 seconds**
+of active reading (every 5th telemetry batch at 2-second cadence).  Paused
+sessions do not generate packets.  Each packet is self-contained:
+
+- `baseline_snapshot` — calibration baseline at packet creation time
+- `features` — 30-second rolling feature vector (scroll, idle, pace, etc.)
+- `z_scores` — normalised deviations vs baseline
+- `drift` — model output (NOT training labels — must be labelled separately)
+- `ui_aggregates` — UI context distributions (panel vs reader, etc.)
+- `session_id`, `user_id`, `document_id`, `session_mode` — identity
+
+### Stable CSV columns (schema v2.0.0)
+
+| Group | Example columns |
+|---|---|
+| Identifiers | `session_id`, `user_id`, `document_id`, `packet_seq`, `session_mode` |
+| Baseline | `bl_wpm_effective`, `bl_idle_ratio_mean`, `bl_regress_rate_mean` |
+| Features | `feat_idle_ratio_mean`, `feat_scroll_burstiness`, `feat_pace_available` |
+| Z-scores | `z_idle`, `z_focus_loss`, `z_skim`, `z_burstiness` |
+| Drift | `drift_ema`, `disruption_score`, `engagement_score` (not labels) |
+| UI | `panel_share_30s`, `reader_share_30s`, `iz_panel_share_30s` |
+| Lossless | `packet_json` (full JSON of the packet row) |
+
+### Using in Colab
+
+```python
+import pandas as pd
+import json
+
+# Load CSV
+df = pd.read_csv("packets_user_1_20260225T120000.csv")
+
+# Expand baseline from lossless JSON if you need extra fields
+df["_pj"] = df["packet_json"].apply(json.loads)
+df["bl_full"] = df["_pj"].apply(lambda x: x.get("baseline_snapshot", {}).get("baseline_json", {}))
+
+# The drift_ema column is a model output — do NOT use as labels.
+# Add your own attentional-state labels before fine-tuning.
+df["label"] = None  # TODO: label manually or with a weak-supervision approach
+
+print(df[["session_id","packet_seq","feat_idle_ratio_mean","z_idle","drift_ema","label"]].head())
 ```

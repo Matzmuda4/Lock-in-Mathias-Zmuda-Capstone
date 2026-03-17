@@ -1,20 +1,22 @@
 """
-Persistence helpers for drift state — Phase 7.
+Persistence helpers for drift state — Phase 7 / classify branch.
 
 The session_drift_states table is a simple key-value store keyed by session_id.
 We upsert on every drift recompute.
 
 session_state_packets is an append-only hypertable storing full state packets
-every ~10 s (same cadence as session_drift_history).  These packets are the
-primary training-data source exported by the classify pipeline.
+every exactly 10 s (every 5th telemetry batch at 2s cadence).  These packets
+are the primary training-data source exported by the classify pipeline.
 
-Each packet is self-contained: it includes the embedded baseline_snapshot so
-it can be used for training without a separate baseline join.
+Each packet is self-contained: it embeds the baseline_snapshot, session context
+(user_id, document_id, session_mode), and ui_context/interaction_zone aggregates
+so it can be used for training without any additional joins.
 """
 
 from __future__ import annotations
 
 import dataclasses
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -29,9 +31,42 @@ from app.db.models import (
 )
 from app.services.drift.types import DriftResult
 
-# Append to history every N upserts (~10 seconds at 2s batches = every 5th update)
+# Exactly one packet per 5 telemetry batches (5 × 2 s = 10 s cadence).
 _HISTORY_EVERY_N: int = 5
 _upsert_counters: dict[int, int] = {}
+
+
+def _compute_ui_aggregates(batches: list[dict[str, Any]]) -> dict[str, float]:
+    """
+    Aggregate ui_context and interaction_zone fields across the window batches.
+
+    Returns fractions (0.0–1.0) for each discrete value so the training row
+    captures the distribution of UI states over the 30-second window.
+    """
+    n = len(batches) or 1  # avoid div-by-zero
+
+    ui_ctx_counts: Counter = Counter()
+    iz_counts: Counter = Counter()
+    for b in batches:
+        ui = b.get("ui_context") or "READ_MAIN"
+        iz = b.get("interaction_zone") or "reader"
+        ui_ctx_counts[ui] += 1
+        iz_counts[iz] += 1
+
+    panel_states = {"PANEL_OPEN", "PANEL_INTERACTING"}
+    panel_share = sum(ui_ctx_counts[s] for s in panel_states) / n
+
+    return {
+        "ui_read_main_share_30s": ui_ctx_counts["READ_MAIN"] / n,
+        "ui_panel_open_share_30s": ui_ctx_counts["PANEL_OPEN"] / n,
+        "ui_panel_interacting_share_30s": ui_ctx_counts["PANEL_INTERACTING"] / n,
+        "ui_user_paused_share_30s": ui_ctx_counts["USER_PAUSED"] / n,
+        "panel_share_30s": panel_share,
+        "reader_share_30s": ui_ctx_counts["READ_MAIN"] / n,
+        "iz_reader_share_30s": iz_counts["reader"] / n,
+        "iz_panel_share_30s": iz_counts["panel"] / n,
+        "iz_other_share_30s": iz_counts["other"] / n,
+    }
 
 
 async def upsert_drift_state(
@@ -40,21 +75,26 @@ async def upsert_drift_state(
     db: AsyncSession,
     baseline_row: Optional[UserBaseline] = None,
     window_end_at: Optional[datetime] = None,
+    session_context: Optional[dict[str, Any]] = None,
+    batches: Optional[list[dict[str, Any]]] = None,
 ) -> SessionDriftState:
     """
     Insert or update the drift state row for a session (latest snapshot).
 
     Also appends rows to session_drift_history and session_state_packets every
-    ~10 seconds (_HISTORY_EVERY_N calls) to preserve the full trajectory.
+    exactly 10 seconds (_HISTORY_EVERY_N = 5 calls) to preserve the full
+    trajectory.
 
     Parameters
     ----------
     baseline_row : optional UserBaseline ORM row for the session's user.
-        When provided, a baseline_snapshot is embedded in the state packet for
-        self-contained training data (no separate baseline join required).
+        Embedded in the state packet for self-contained training data.
     window_end_at : optional timestamp of the newest telemetry batch in the
-        30 s window that produced this drift result.  Used to compute
-        window_start_at = window_end_at - 30 s.  Falls back to now() if absent.
+        30 s window.  window_start_at = window_end_at − 30 s.
+    session_context : optional dict with {user_id, document_id, session_mode}.
+        Embedded in packet_json so each packet is fully self-contained.
+    batches : optional list of raw batch dicts from the rolling window.
+        Used to compute ui_context / interaction_zone aggregates for the packet.
     """
     now = datetime.now(timezone.utc)
 
@@ -92,9 +132,10 @@ async def upsert_drift_state(
         row.last_window_ends_at = now
         row.updated_at = now
 
-    # ── Append to history and state-packet tables every ~10 seconds ──────
+    # ── Append to history and state-packet tables every exactly 10 seconds ──
+    # Counter starts at 0; first packet fires after the 5th batch (10 s).
     _upsert_counters[session_id] = _upsert_counters.get(session_id, 0) + 1
-    if _upsert_counters[session_id] % _HISTORY_EVERY_N == 1:
+    if _upsert_counters[session_id] % _HISTORY_EVERY_N == 0:
         db.add(SessionDriftHistory(
             session_id=session_id,
             created_at=now,
@@ -125,7 +166,12 @@ async def upsert_drift_state(
             packet_seq=next_seq,
             window_start_at=w_start,
             window_end_at=w_end,
-            packet_json=_build_packet_json(result, baseline_row),
+            packet_json=_build_packet_json(
+                result,
+                baseline_row=baseline_row,
+                session_context=session_context,
+                batches=batches or [],
+            ),
         ))
 
     await db.flush()
@@ -135,12 +181,16 @@ async def upsert_drift_state(
 def _build_packet_json(
     result: DriftResult,
     baseline_row: Optional[UserBaseline] = None,
+    session_context: Optional[dict[str, Any]] = None,
+    batches: Optional[list[dict[str, Any]]] = None,
 ) -> dict:
     """
     Serialise a DriftResult into a self-contained dict for storage.
 
-    Embeds a baseline_snapshot so each packet can be used for training
-    without a separate join to user_baselines.
+    Embeds:
+    - baseline_snapshot  (so no user_baselines join required)
+    - session_context    (user_id, document_id, session_mode)
+    - ui_aggregates      (ui_context / interaction_zone distributions over 30 s)
     """
     baseline_json: dict[str, Any] = baseline_row.baseline_json if baseline_row else {}
     wpm_eff = baseline_json.get("wpm_effective") or baseline_json.get("wpm_gross") or 0.0
@@ -157,7 +207,16 @@ def _build_packet_json(
         "baseline_valid": baseline_valid,
     }
 
+    ctx = session_context or {}
+    ui_agg = _compute_ui_aggregates(batches or [])
+
     return {
+        # ── Session identity ─────────────────────────────────────────────
+        "session_id": ctx.get("session_id"),
+        "user_id": ctx.get("user_id"),
+        "document_id": ctx.get("document_id"),
+        "session_mode": ctx.get("session_mode"),
+        # ── Drift state ───────────────────────────────────────────────────
         "drift": {
             "drift_level": result.drift_level,
             "drift_ema": result.drift_ema,
@@ -169,10 +228,16 @@ def _build_packet_json(
             "pace_ratio": result.pace_ratio,
             "pace_available": result.pace_available,
         },
+        # ── Window features (full dataclass → dict) ───────────────────────
         "features": dataclasses.asdict(result.features),
+        # ── Z-scores vs baseline ──────────────────────────────────────────
         "z_scores": dataclasses.asdict(result.z_scores),
+        # ── Debug breakdown (optional, toggled by include_debug) ──────────
         "debug": result.beta_components,
+        # ── Calibration baseline (self-contained for training) ────────────
         "baseline_snapshot": baseline_snapshot,
+        # ── UI context aggregates over the 30-second window ───────────────
+        "ui_aggregates": ui_agg,
     }
 
 

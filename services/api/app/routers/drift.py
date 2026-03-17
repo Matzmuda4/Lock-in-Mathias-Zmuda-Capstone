@@ -196,6 +196,13 @@ async def _recompute_and_save(
         session.id, result, db,
         baseline_row=baseline_row,
         window_end_at=window_end_at,
+        session_context={
+            "session_id": session.id,
+            "user_id": session.user_id,
+            "document_id": session.document_id,
+            "session_mode": session.mode,
+        },
+        batches=batches,
     )
 
 

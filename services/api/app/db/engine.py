@@ -37,6 +37,7 @@ async def init_db() -> None:
     settings.parsed_cache_dir.mkdir(parents=True, exist_ok=True)
     settings.exports_dir.mkdir(parents=True, exist_ok=True)
     settings.training_exports_dir.mkdir(parents=True, exist_ok=True)
+    settings.training_data_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1 — TimescaleDB extension (needs DDL outside a transaction block)
     raw_dsn = settings.database_url.replace("postgresql+asyncpg", "postgresql")
