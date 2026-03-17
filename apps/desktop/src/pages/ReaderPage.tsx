@@ -1195,7 +1195,7 @@ export function ReaderPage() {
 
         /* ── Content column ── */
         .reader-content {
-          max-width: 95ch;
+          max-width: 85ch;
           width: 100%;
           margin: 0 auto;
           padding: 48px 24px 100px;
