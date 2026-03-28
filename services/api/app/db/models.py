@@ -347,6 +347,42 @@ class SessionDriftHistory(Base):
     pace_ratio: Mapped[Optional[float]] = mapped_column(nullable=True)
 
 
+class SessionStatePacket(Base):
+    """
+    Append-only hypertable storing full state packets every ~10 seconds.
+
+    Each row is a serialised snapshot of the drift pipeline output at one
+    point in time, including window features, z-scores, drift state, and
+    the user's baseline snapshot (self-contained for training).
+
+    TimescaleDB requires the partition column (created_at) in the PK.
+    """
+
+    __tablename__ = "session_state_packets"
+    __table_args__ = (
+        PrimaryKeyConstraint("session_id", "created_at"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Monotonically increasing counter per session (0-indexed).
+    packet_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Bounds of the 30s rolling telemetry window used to produce this packet.
+    window_start_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    window_end_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Full packet JSON: features, z_scores, drift state, debug components,
+    # and embedded baseline_snapshot (self-contained for training).
+    packet_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
 # ─── End Phase 7 ──────────────────────────────────────────────────────────────
 
 

@@ -283,10 +283,19 @@ class TestDataQualityGuardrails:
         assert mult == pytest.approx(0.5)
 
     def test_scroll_capture_fault_reduces_confidence(self) -> None:
-        """If > 50% of batches have scroll_capture_fault, mult *= 0.7."""
-        batches = [_batch(scroll_capture_fault=True) for _ in range(10)]
+        """
+        scroll_capture_fault is detected from consecutive progress changes
+        without scroll events — NOT from the stored per-batch flag.
+        If > 50% of transitions have this pattern, mult *= 0.7.
+        """
+        # Build batches where progress advances but no scroll events recorded
+        batches = [
+            {**_batch(scroll_abs=0.0, event_count=0, progress=0.10 + i * 0.02),
+             "scroll_capture_fault": False}   # stored flag is irrelevant now
+            for i in range(10)
+        ]
         _, scf, _, mult = compute_quality_confidence_mult(batches)
-        assert scf == 1.0
+        assert scf > 0.5
         assert mult == pytest.approx(0.7)
 
     def test_paragraph_missing_fault_reduces_confidence(self) -> None:

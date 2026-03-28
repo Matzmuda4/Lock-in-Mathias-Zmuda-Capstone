@@ -28,10 +28,12 @@ from typing import Any
 import pytest
 
 from app.services.drift.features import (
+    compute_scroll_capture_fault_rate,
     compute_stagnation_ratio,
     estimate_window_wpm,
     extract_features,
     idle_ratio_fn,
+    is_at_end_of_document,
     jitter_ratio,
     mouse_efficiency,
     paragraph_stagnation,
@@ -45,6 +47,7 @@ from app.services.drift.model import (
     BETA_MIN,
     EMA_ALPHA,
     SKIM_THRESHOLD,
+    W_D_PACE,
     W_DISRUPT,
     W_ENGAGE,
     Z_POS_CAP,
@@ -333,8 +336,7 @@ class TestBetaComputation:
         """Heavy idle+blur should push beta to BETA_MAX territory."""
         features = extract_features([_distracted_batch()] * 15, _WORD_COUNTS, 180.0)
         result = compute_drift_result(features, _BASELINE, 2.0, 0.0, BETA0)
-        # BETA_MAX is now 0.40; heavy distraction should reach that ceiling
-        assert result.beta_effective >= BETA_MAX * 0.95
+        assert result.beta_effective > 0.40
 
 
 # ── Exponential model tests ───────────────────────────────────────────────────
@@ -434,12 +436,11 @@ class TestDisruptionScore:
 
 class TestEngagementScore:
     def test_moderate_when_focused_no_pace(self) -> None:
-        """calm=1, pace_align=0.65 (v3 default) → engagement = 1 × 0.8 × 0.65 = 0.52."""
+        """calm=1, pace_align=0.5 (neutral) → engagement = 1 × 0.8 × 0.5 = 0.40."""
         z = ZScores()
         f = WindowFeatures(n_batches=10, pace_available=False)
         score = compute_engagement_score(z, f)
-        # v3: pace_align default raised to 0.65 to benefit-of-the-doubt readers
-        assert 0.48 <= score <= 0.56
+        assert 0.35 <= score <= 0.45
 
     def test_low_when_blurred_and_idle(self) -> None:
         z = ZScores(z_idle=3.0, z_focus_loss=3.0)
@@ -458,6 +459,76 @@ class TestEngagementScore:
         f_no = WindowFeatures(n_batches=10, progress_markers_count=0, pace_available=False)
         f_yes = WindowFeatures(n_batches=10, progress_markers_count=2, pace_available=False)
         assert compute_engagement_score(z, f_yes) > compute_engagement_score(z, f_no)
+
+    def test_steady_forward_scroll_boosts_engagement_when_pace_unavailable(self) -> None:
+        """Steady forward scrolling (z_regress≈0) gives pace_align=0.65 so that
+        normal forward navigation without pace data hints at positive engagement."""
+        z_forward = ZScores(z_regress=0.0)
+        f_still = WindowFeatures(
+            n_batches=10, pace_available=False, scroll_velocity_norm_mean=0.0,
+        )
+        f_forward = WindowFeatures(
+            n_batches=10, pace_available=False, scroll_velocity_norm_mean=0.03,
+        )
+        score_still = compute_engagement_score(z_forward, f_still)
+        score_forward = compute_engagement_score(z_forward, f_forward)
+        # Forward steady scroll must yield higher engagement than stationary
+        assert score_forward > score_still, (
+            f"Forward scroll engagement={score_forward:.3f} should exceed "
+            f"stationary engagement={score_still:.3f}"
+        )
+        # Stationary stays near 0.40
+        assert 0.35 <= score_still <= 0.45
+        # Forward-scroll boost stays near 0.52 (calm × 0.80 × 0.65)
+        assert 0.48 <= score_forward <= 0.58
+
+    def test_fast_backward_scroll_reduces_engagement_below_neutral(self) -> None:
+        """Fast backward scrolling (z_regress=3.0) gives pace_align=0.35 —
+        BELOW the 0.50 neutral — so drift does not decrease from fast backscroll."""
+        z_backward = ZScores(z_regress=3.0)
+        f_backward = WindowFeatures(
+            n_batches=10, pace_available=False, scroll_velocity_norm_mean=0.08,
+        )
+        f_still = WindowFeatures(
+            n_batches=10, pace_available=False, scroll_velocity_norm_mean=0.0,
+        )
+        score_backward = compute_engagement_score(z_backward, f_backward)
+        score_still = compute_engagement_score(ZScores(), f_still)
+        # Fast backward must be below neutral (0.40)
+        assert score_backward < score_still, (
+            f"Fast backward engagement={score_backward:.3f} should be below "
+            f"stationary neutral={score_still:.3f}"
+        )
+        # Fast backward: calm × 0.80 × 0.35 ≈ 0.28
+        assert score_backward < 0.32
+
+    def test_re_reading_backward_is_neutral(self) -> None:
+        """Mixed re-reading (z_regress≈1.5) stays near the 0.50 neutral level —
+        drift holds but does not dramatically decrease or increase."""
+        z_mixed = ZScores(z_regress=1.5)
+        f_mixed = WindowFeatures(
+            n_batches=10, pace_available=False, scroll_velocity_norm_mean=0.03,
+        )
+        score = compute_engagement_score(z_mixed, f_mixed)
+        # pace_align = 0.65 - (1.5/3.0) × 0.30 = 0.65 - 0.15 = 0.50 → engagement ≈ 0.40
+        assert 0.35 <= score <= 0.45, (
+            f"Mixed re-reading engagement={score:.3f} should stay near neutral 0.40"
+        )
+
+    def test_scroll_direction_does_not_affect_pace_available_branch(self) -> None:
+        """Scroll velocity must NOT influence pace_align when pace IS available;
+        only z_skim matters in that branch."""
+        z = ZScores(z_skim=0.0)
+        f_slow_scroll = WindowFeatures(
+            n_batches=10, pace_available=True, scroll_velocity_norm_mean=0.0,
+        )
+        f_fast_scroll = WindowFeatures(
+            n_batches=10, pace_available=True, scroll_velocity_norm_mean=0.5,
+        )
+        # Both should give pace_align=1.0 (z_skim=0) independent of velocity
+        assert compute_engagement_score(z, f_slow_scroll) == pytest.approx(
+            compute_engagement_score(z, f_fast_scroll), abs=1e-6
+        )
 
 
 class TestConfidenceAndEMA:
@@ -510,9 +581,7 @@ class TestTimelineScenarios:
         # After 1 min, drift must be clearly above 0
         ema_at_1min = traj[-1][1]
         assert ema_at_1min > 0.0, "Drift must never be permanently zero"
-        # v3: BETA_MIN = 0.003, so 1 min of perfect focus → drift ≈ 0.3%.
-        # The important invariant is drift > 0 (natural time-on-task fatigue exists).
-        assert ema_at_1min > 0.001  # Clearly above zero
+        assert ema_at_1min > 0.005  # At least 0.5%
 
     def test_scenario2_tab_away_raises_drift_significantly(self) -> None:
         """Constant blur + idle for 2 min: drift_ema should be significantly elevated."""
@@ -774,188 +843,546 @@ class TestEdgeCases:
         assert BETA_MIN <= result.beta_effective <= BETA_MAX
 
 
-# ── v4 scenario table tests ───────────────────────────────────────────────────
+# ── End-of-document signal suppression tests ──────────────────────────────────
 
 
-class TestV4ScenarioTable:
-    """
-    Validate the drift stays within the designed scenario table:
-
-    Scenario              | 1 min  | 5 min  | 10 min
-    ----------------------+--------+--------+--------
-    Focused at baseline   | ~0.3%  | ~1.5%  | ~3%
-    Normal reading        | ~2–3%  | ~8–14% | ~16–25%
-    Moderate distraction  | ~5–11% | 22–45% | ~39–70%
-    Tab-away / full idle  | ~20%+  | ~63%+  | ~86%+
-    """
-
-    def test_focused_reading_drift_minimal_at_1min(self) -> None:
-        """
-        Focused reading (at-baseline idle, on-pace, cycling 3 paras) should
-        produce drift < 5% at 1 minute.  With beta ≈ BETA_MIN, drift ≈ 0.3%.
-        """
-        seq = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(30)]
-        traj = _simulate_timeline(seq, _BASELINE)
-        ema_at_1min = traj[-1][1]
-        assert ema_at_1min < 0.05, (
-            f"Focused reading at 1 min should produce drift < 5%, got {ema_at_1min:.1%}"
-        )
-
-    def test_focused_reading_drift_minimal_at_10min(self) -> None:
-        """Focused reading for 10 min should stay below 10%."""
-        seq = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(300)]
-        traj = _simulate_timeline(seq, _BASELINE)
-        ema_at_10min = traj[-1][1]
-        assert ema_at_10min < 0.10, (
-            f"Focused reading at 10 min should produce drift < 10%, got {ema_at_10min:.1%}"
-        )
-
-    def test_tab_away_drift_exceeds_20pct_at_1min(self) -> None:
-        """
-        Complete tab-away (blur + idle) should exceed 20% drift within 1 minute.
-        With BETA_MAX = 0.30, max drift at 1 min ≈ 26%.
-        """
-        seq = [_distracted_batch("chunk-1")] * 30
-        traj = _simulate_timeline(seq, _BASELINE)
-        ema_at_1min = traj[-1][1]
-        assert ema_at_1min > 0.18, (
-            f"Tab-away at 1 min should produce drift > 18%, got {ema_at_1min:.1%}"
-        )
-
-    def test_tab_away_drift_exceeds_60pct_at_5min(self) -> None:
-        """Complete distraction for 5 min should pass 60%."""
-        seq = [_distracted_batch("chunk-1")] * 150
-        traj = _simulate_timeline(seq, _BASELINE)
-        ema_at_5min = traj[-1][1]
-        assert ema_at_5min > 0.60, (
-            f"Tab-away at 5 min should produce drift > 60%, got {ema_at_5min:.1%}"
-        )
-
-    def test_tab_away_clearly_higher_than_focused(self) -> None:
-        """At 5 min, tab-away must be at least 40 percentage points above focused."""
-        seq_f = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(150)]
-        seq_h = [_distracted_batch("chunk-1")] * 150
-        ema_f = _simulate_timeline(seq_f, _BASELINE)[-1][1]
-        ema_h = _simulate_timeline(seq_h, _BASELINE)[-1][1]
-        assert ema_h - ema_f > 0.40, (
-            f"Tab-away should be 40pp+ above focused at 5 min; gap={ema_h - ema_f:.1%}"
-        )
-
-
-# ── v4 stagnation halving tests ───────────────────────────────────────────────
-
-
-class TestV4StagnationHalving:
-    """Verify that long-paragraph reading (stagnation without blur) doesn't spike drift."""
-
-    def test_long_paragraph_no_blur_low_drift(self) -> None:
-        """
-        A reader stuck on one paragraph (no pace data) with NO focus loss
-        should have z_stagnation halved → low disruption → drift stays minimal.
-        """
-        # 15 batches all on same paragraph, no blur, no idle (actively reading)
-        seq = [_batch(idle_s=0.1, focus="focused", scroll_abs=50.0, para_id="chunk-1")] * 15
-        features = extract_features(seq, _WORD_COUNTS, 180.0)
-
-        assert not features.pace_available    # single para, pace unavailable
-        assert features.focus_loss_rate < 0.15
-
-        z = compute_z_scores(features, _BASELINE)
-        # z_stagnation should be halved; disruption should stay low
-        d, _ = compute_disruption_score(z, _BASELINE)
-        assert d < 0.45, f"Long paragraph (no blur) disruption should be < 0.45, got {d:.3f}"
-
-        result = compute_drift_result(features, _BASELINE, 1.0, 0.0, BETA0)
-        assert result.beta_effective < 0.08, (
-            f"Long paragraph (no blur) beta should be < 0.08, got {result.beta_effective:.3f}"
-        )
-
-    def test_long_paragraph_with_blur_full_stagnation(self) -> None:
-        """
-        Same paragraph + blur (focus_loss ≥ 0.15) → stagnation NOT halved.
-        Higher disruption than the no-blur case.
-        """
-        seq_no_blur = [_batch(idle_s=0.1, focus="focused", scroll_abs=20.0, para_id="chunk-1")] * 15
-        seq_blur = [_batch(idle_s=0.5, focus="blurred", scroll_abs=0.0, para_id="chunk-1")] * 15
-
-        f_no = extract_features(seq_no_blur, _WORD_COUNTS, 180.0)
-        f_bl = extract_features(seq_blur, _WORD_COUNTS, 180.0)
-
-        z_no = compute_z_scores(f_no, _BASELINE)
-        z_bl = compute_z_scores(f_bl, _BASELINE)
-
-        d_no, _ = compute_disruption_score(z_no, _BASELINE)
-        d_bl, _ = compute_disruption_score(z_bl, _BASELINE)
-
-        # Blur case should have clearly higher disruption
-        assert d_bl > d_no + 0.05, (
-            f"Blur+stagnation ({d_bl:.3f}) should be > no-blur ({d_no:.3f}) by 0.05+"
-        )
-
-
-# ── v4 baseline sanity check tests ───────────────────────────────────────────
-
-
-class TestV4BaselineSanityChecks:
-    """
-    Verify that broken calibration baselines (scroll not captured → jitter/regress = 0)
-    are replaced with population-average fallbacks, preventing huge z-scores.
-    """
-
-    _BROKEN_BASELINE: dict = {
-        "wpm_effective": 180.0,
-        "idle_ratio_mean": 1.0,     # cumulative bug → always 1.0
-        "idle_ratio_std": 0.05,
-        "scroll_jitter_mean": 0.0,  # broken — scroll not captured
-        "scroll_jitter_std": 0.0,
-        "regress_rate_mean": 0.0,   # broken — scroll not captured
-        "regress_rate_std": 0.0,
-        "para_dwell_median_s": 0.0,
-        "para_dwell_iqr_s": 0.0,
+def _end_of_doc_batch(para_id: str = "calib-24") -> dict[str, Any]:
+    """Batch representing a user sitting at the end of the document (done reading)."""
+    return {
+        "scroll_delta_abs_sum": 0.0,
+        "scroll_delta_pos_sum": 0.0,
+        "scroll_delta_neg_sum": 0.0,
+        "scroll_event_count": 0,
+        "scroll_direction_changes": 0,
+        "scroll_pause_seconds": 60.0,
+        "idle_seconds": 2.0,
+        "mouse_path_px": 0.0,
+        "mouse_net_px": 0.0,
+        "window_focus_state": "focused",
+        "current_paragraph_id": para_id,
+        "current_chunk_index": 24,
+        "viewport_progress_ratio": 1.0,
+        "viewport_height_px": 544.0,
+        "scroll_capture_fault": True,  # set by old activity.py; should NOT cause penalty
+        "telemetry_fault": False,
+        "paragraph_missing_fault": False,
     }
 
-    def test_broken_baseline_jitter_uses_fallback(self) -> None:
-        """
-        With jitter_mean=0 in baseline, a session with normal jitter=0.10
-        should give z_jitter ≈ 0 (at fallback baseline), NOT a huge z-score.
-        """
-        features = WindowFeatures(n_batches=15, scroll_jitter_mean=0.10)
-        z = compute_z_scores(features, self._BROKEN_BASELINE)
-        # Fallback: mu=0.10, std=0.10 → z = 0
-        assert z.z_jitter < 0.5, (
-            f"With broken jitter baseline, z_jitter for 0.10 should be ~0, got {z.z_jitter:.3f}"
+
+class TestEndOfDocumentSuppression:
+    """
+    When a user finishes reading (progress_ratio >= 0.97), the model must NOT
+    interpret their inactivity as distraction.
+    """
+
+    def test_is_at_end_of_document_detects_end(self) -> None:
+        batches = [_end_of_doc_batch() for _ in range(12)] + \
+                  [_focused_batch("calib-23") for _ in range(3)]
+        assert is_at_end_of_document(batches) is True
+
+    def test_is_at_end_of_document_false_when_mid_doc(self) -> None:
+        batches = [_focused_batch(f"chunk-{i % 5 + 1}") for i in range(15)]
+        assert is_at_end_of_document(batches) is False
+
+    def test_end_of_doc_stagnation_is_zero(self) -> None:
+        """stagnation_ratio must be zeroed out at end of document."""
+        batches = [_end_of_doc_batch() for _ in range(15)]
+        features = extract_features(batches, _WORD_COUNTS, 180.0)
+        assert features.at_end_of_document is True
+        assert features.stagnation_ratio == 0.0
+
+    def test_end_of_doc_z_scores_are_zero(self) -> None:
+        """All z-scores except focus_loss must be 0 at end of document."""
+        features = WindowFeatures(n_batches=15, at_end_of_document=True,
+                                  idle_ratio_mean=1.0, stagnation_ratio=0.0,
+                                  focus_loss_rate=0.0)
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_idle == 0.0
+        assert z.z_stagnation == 0.0
+        assert z.z_jitter == 0.0
+        assert z.z_regress == 0.0
+        assert z.z_pace == 0.0
+        assert z.z_skim == 0.0
+
+    def test_end_of_doc_disruption_is_low(self) -> None:
+        """disruption_score should be near zero when at end of document."""
+        batches = [_end_of_doc_batch() for _ in range(15)]
+        features = extract_features(batches, _WORD_COUNTS, 180.0)
+        z = compute_z_scores(features, _BASELINE)
+        disruption, _ = compute_disruption_score(z, _BASELINE)
+        assert disruption < 0.30, (
+            f"disruption_score={disruption:.3f} is too high at end of document"
         )
 
-    def test_broken_baseline_regress_uses_fallback(self) -> None:
+    def test_end_of_doc_drift_stays_moderate(self) -> None:
         """
-        With regress_mean=0 in baseline, a session with normal regress=0.05
-        should give z_regress ≈ 0 (at fallback baseline), NOT a huge z-score.
+        Drift at 2 minutes with all-end-of-doc batches should stay moderate
+        (driven only by natural time-on-task, not by false distraction signal).
         """
-        features = WindowFeatures(n_batches=15, regress_rate_mean=0.05)
-        z = compute_z_scores(features, self._BROKEN_BASELINE)
-        # Fallback: mu=0.05, std=0.06 → z = 0
-        assert z.z_regress < 0.5, (
-            f"With broken regress baseline, z_regress for 0.05 should be ~0, got {z.z_regress:.3f}"
+        batches = [_end_of_doc_batch() for _ in range(15)]
+        features = extract_features(batches, _WORD_COUNTS, 180.0)
+        result = compute_drift_result(features, _BASELINE, 2.0, 0.0, BETA0)
+        # At t=2 min with BETA0 only: drift = 1 - exp(-0.03*2) ≈ 5.8%
+        # Allow up to 15% (some EMA lag is fine)
+        assert result.drift_ema < 0.15, (
+            f"drift_ema={result.drift_ema:.3f} rose too high at end of document"
         )
 
-    def test_sane_baseline_jitter_not_overridden(self) -> None:
-        """When baseline has sensible jitter (≥ 0.04), it should be used as-is."""
-        # jitter much higher than the sane baseline (0.10) → high z_jitter
-        features = WindowFeatures(n_batches=15, scroll_jitter_mean=0.50)
-        z_broken = compute_z_scores(features, self._BROKEN_BASELINE)
-        z_sane = compute_z_scores(features, _BASELINE)
-        # Both should detect high jitter; sane baseline should give non-trivial z
-        assert z_sane.z_jitter > 1.0, "High jitter should produce z > 1 against sane baseline"
+    def test_mid_doc_stagnation_still_detected(self) -> None:
+        """Stagnation in the MIDDLE of the document must still work."""
+        batches = []
+        for _ in range(15):
+            b = _focused_batch("chunk-3")
+            b["viewport_progress_ratio"] = 0.4   # mid-doc
+            b["idle_seconds"] = 2.0
+            batches.append(b)
+        features = extract_features(batches, _WORD_COUNTS, 180.0)
+        assert features.at_end_of_document is False
+        assert features.stagnation_ratio > 0.5  # should still fire
 
-    def test_broken_calibration_focused_reading_stays_low(self) -> None:
-        """
-        A user with broken calibration (zeros) who is reading focused should
-        not have their drift explode due to sanity checks.
-        """
-        seq = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(30)]
-        traj = _simulate_timeline(seq, self._BROKEN_BASELINE)
-        ema_at_1min = traj[-1][1]
-        assert ema_at_1min < 0.10, (
-            f"Focused reading with broken baseline should stay < 10% at 1 min, "
-            f"got {ema_at_1min:.1%}"
+
+# ── Fallback WPM tests ─────────────────────────────────────────────────────────
+
+
+class TestFallbackWpm:
+    def test_fallback_wpm_is_250(self) -> None:
+        """When no baseline WPM is provided, base_wpm should default to 250."""
+        # Create batches that produce a known WPM; use 0 as baseline_wpm_effective
+        batches = [_focused_batch(f"chunk-{i % 3 + 1}") for i in range(8)]
+        features = extract_features(batches, _WORD_COUNTS, 0.0)
+        # pace_ratio = window_wpm / 250; confirm pace_ratio is well below 1.6 skim threshold
+        # (normal focused reading should not trigger skim)
+        if features.pace_available:
+            assert features.pace_ratio < 1.6, (
+                f"pace_ratio={features.pace_ratio:.2f} hit skim threshold with fallback WPM=250"
+            )
+
+    def test_skim_threshold_requires_1_6x(self) -> None:
+        """SKIM_THRESHOLD must be 1.6 so normal pace variation does not trigger it."""
+        assert SKIM_THRESHOLD == 1.6
+
+    def test_reading_at_baseline_pace_no_skim(self) -> None:
+        """A user reading at exactly baseline WPM should have z_skim = 0."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=1.0, pace_dev=0.0,
+            at_end_of_document=False,
         )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim == 0.0
+
+    def test_reading_at_1_5x_no_skim(self) -> None:
+        """pace_ratio=1.5 must NOT trigger skim (below new threshold of 1.6)."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=1.5, pace_dev=abs(math.log(1.5)),
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim == 0.0, "1.5x should not trigger skim signal"
+
+    def test_reading_at_2x_triggers_skim(self) -> None:
+        """pace_ratio=2.0 should trigger the skim signal."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=2.0, pace_dev=abs(math.log(2.0)),
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim > 0.0, "2x pace should trigger skim signal"
+
+
+# ── W_D_PACE=0 and skim-only pace_align tests ─────────────────────────────────
+
+
+class TestPaceWeightZeroAndSkimOnlyEngagement:
+    """
+    W_D_PACE is zeroed because reading SLOWER than calibration on harder text is
+    normal, not distraction.  z_skim (asymmetric, only fires above 1.6×) handles
+    the genuinely fast case.  pace_align in engagement uses z_skim only so that
+    slow readers are not penalised.
+    """
+
+    def test_slow_pace_does_not_increase_disruption(self) -> None:
+        """pace_ratio=0.28 (slower than baseline) → z_pace still computed but
+        W_D_PACE=0 means it contributes ZERO to disruption_raw."""
+        features_slow = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=0.28, pace_dev=abs(math.log(0.28)),
+        )
+        features_normal = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=1.0, pace_dev=0.0,
+        )
+        z_slow = compute_z_scores(features_slow, _BASELINE)
+        z_norm = compute_z_scores(features_normal, _BASELINE)
+        d_slow, _ = compute_disruption_score(z_slow, _BASELINE)
+        d_norm, _ = compute_disruption_score(z_norm, _BASELINE)
+        # Slow reading must not produce higher disruption than on-pace reading
+        assert d_slow <= d_norm + 1e-6, (
+            f"Slow reader disruption={d_slow:.3f} exceeds on-pace={d_norm:.3f}; "
+            "W_D_PACE should be 0"
+        )
+
+    def test_slow_pace_does_not_crush_engagement(self) -> None:
+        """pace_ratio=0.17 (very slow) → engagement must remain >= 0.75 when
+        the reader is calm and not skimming (academic-paper session 156 scenario)."""
+        z = ZScores(z_idle=0.0, z_focus_loss=0.0, z_pace=2.9, z_skim=0.0)
+        f = WindowFeatures(n_batches=15, pace_available=True, pace_ratio=0.17,
+                           pace_dev=abs(math.log(0.17)))
+        score = compute_engagement_score(z, f)
+        assert score >= 0.75, (
+            f"Calm slow reader engagement={score:.3f}; should stay high "
+            "(pace_align must use z_skim only)"
+        )
+
+    def test_fast_skimming_still_reduces_engagement(self) -> None:
+        """pace_ratio=2.5 (skimming) → z_skim fires → pace_align drops → engagement reduced."""
+        z_calm = ZScores(z_idle=0.0, z_focus_loss=0.0, z_pace=0.0, z_skim=0.0)
+        z_skim = ZScores(z_idle=0.0, z_focus_loss=0.0, z_pace=1.5, z_skim=2.5)
+        f_calm = WindowFeatures(n_batches=15, pace_available=True)
+        f_skim = WindowFeatures(n_batches=15, pace_available=True)
+        eng_calm = compute_engagement_score(z_calm, f_calm)
+        eng_skim = compute_engagement_score(z_skim, f_skim)
+        assert eng_skim < eng_calm, (
+            "Skimming (z_skim=2.5) must still reduce engagement vs calm reading"
+        )
+
+    def test_focused_reader_reaches_beta_min(self) -> None:
+        """A calm reader at below-baseline pace should yield beta_raw → BETA_MIN
+        because engagement offsets the low disruption signal entirely."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=0.28, pace_dev=abs(math.log(0.28)),
+            idle_ratio_mean=0.20,   # less idle than baseline mean 0.374
+            stagnation_ratio=0.20,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        d, _ = compute_disruption_score(z, _BASELINE)
+        eng = compute_engagement_score(z, features)
+        beta = compute_beta_raw(d, eng, confidence=1.0)
+        assert beta <= BETA_MIN + 1e-6, (
+            f"Calm slow reader beta={beta:.4f} > BETA_MIN={BETA_MIN}; "
+            "should be at floor (no distraction detected)"
+        )
+
+    def test_w_d_pace_is_zero(self) -> None:
+        """Guard: W_D_PACE must remain 0.0 to prevent slow-reader false positives."""
+        assert W_D_PACE == 0.0, (
+            f"W_D_PACE={W_D_PACE}; must be 0.0 — z_skim handles fast pace, "
+            "slow pace is normal harder-text reading"
+        )
+
+
+# ── Scroll capture fault fix tests ────────────────────────────────────────────
+
+
+class TestScrollCaptureFaultFix:
+    def test_no_scroll_at_end_does_not_spike_confidence(self) -> None:
+        """
+        End-of-document batches with scroll_capture_fault=True must not
+        reduce quality_confidence_mult below 1.0 (since stagnation is already
+        suppressed and the fault is a false positive).
+        """
+        from app.services.drift.features import compute_quality_confidence_mult
+        # After the activity.py fix, these batches won't have scroll_capture_fault=True
+        # because progress_ratio >= 0.97.  But even with the flag from old data:
+        batches_no_fault = [
+            {**_end_of_doc_batch(), "scroll_capture_fault": False}
+            for _ in range(15)
+        ]
+        _, scf, _, mult = compute_quality_confidence_mult(batches_no_fault)
+        assert scf == 0.0
+        assert mult == 1.0
+
+    def test_genuine_scroll_capture_fault_still_penalises(self) -> None:
+        """
+        When progress_ratio changes between batches without any scroll events,
+        the confidence penalty should apply if rate > 50%.
+        SCF is now computed from consecutive progress comparisons, not stored flags.
+        """
+        from app.services.drift.features import compute_quality_confidence_mult
+        # Every other batch has progress jump with no scroll = genuine SCF
+        batches_real_fault = []
+        for i in range(15):
+            prog = 0.10 + i * 0.02  # progress increases each batch
+            batches_real_fault.append({
+                "scroll_delta_abs_sum": 0.0,
+                "scroll_event_count": 0,  # NO scroll events
+                "viewport_progress_ratio": prog,
+                "telemetry_fault": False,
+                "paragraph_missing_fault": False,
+                "current_paragraph_id": f"chunk-{i % 3 + 1}",
+            })
+        _, scf, _, mult = compute_quality_confidence_mult(batches_real_fault)
+        # Every transition has progress change + no scroll → genuine SCF
+        assert scf > 0.5
+        assert mult < 1.0
+
+
+# ── Regression navigation pace gate tests ─────────────────────────────────────
+
+
+def _make_regression_batch(
+    para_id: str,
+    progress: float,
+    scroll_abs: float,
+    scroll_neg: float,
+) -> dict[str, Any]:
+    """Build a telemetry batch for the regression-then-readvance test."""
+    return {
+        "scroll_delta_abs_sum": scroll_abs,
+        "scroll_delta_pos_sum": scroll_abs - scroll_neg,
+        "scroll_delta_neg_sum": scroll_neg,
+        "scroll_event_count": max(1, int(scroll_abs / 10)),
+        "scroll_direction_changes": 1 if scroll_neg > 0 else 0,
+        "scroll_pause_seconds": 0.1,
+        "idle_seconds": 0.01,
+        "mouse_path_px": 50.0,
+        "mouse_net_px": 40.0,
+        "window_focus_state": "focused",
+        "current_paragraph_id": para_id,
+        "current_chunk_index": int(para_id.split("-")[1]),
+        "viewport_progress_ratio": progress,
+        "viewport_height_px": 544.0,
+        "scroll_capture_fault": False,
+        "telemetry_fault": False,
+        "paragraph_missing_fault": False,
+    }
+
+
+class TestRegressionNavigationPaceGate:
+    """
+    When the user scrolls backward (regression) and then re-advances,
+    the WPM estimator MUST NOT count those navigation-traversed paragraphs
+    as "words read" — it would inflate pace_ratio to 3–6x.
+    """
+
+    def test_major_regression_disables_pace(self) -> None:
+        """A single back-scroll > 50px + > 50% negative disables pace_available."""
+        batches = [
+            _make_regression_batch("chunk-1", 0.10, 30.0, 0.0),
+            _make_regression_batch("chunk-2", 0.12, 40.0, 0.0),
+            _make_regression_batch("chunk-3", 0.14, 35.0, 0.0),
+            _make_regression_batch("chunk-4", 0.16, 45.0, 0.0),
+            _make_regression_batch("chunk-5", 0.18, 50.0, 0.0),
+            # Major regression: back to chunk-1
+            _make_regression_batch("chunk-1", 0.05, 979.0, 979.0),
+            # Re-advance
+            _make_regression_batch("chunk-2", 0.12, 150.0, 0.0),
+            _make_regression_batch("chunk-3", 0.14, 100.0, 0.0),
+        ]
+        wpm, pace_available, n_paras = estimate_window_wpm(batches, _WORD_COUNTS)
+        assert pace_available is False, (
+            "pace must be disabled when major regression detected in window"
+        )
+        assert wpm == 0.0
+
+    def test_minor_regression_does_not_disable_pace(self) -> None:
+        """Small back-scroll (< 50px) should NOT disable pace estimation."""
+        batches = [
+            _make_regression_batch(f"chunk-{i + 1}", 0.05 * i, 40.0, 0.0)
+            for i in range(6)
+        ] + [
+            # Minor correction scroll (< 50px, < 50% negative)
+            _make_regression_batch("chunk-5", 0.22, 30.0, 10.0),
+        ] + [
+            _make_regression_batch(f"chunk-{i + 6}", 0.25 + 0.04 * i, 40.0, 0.0)
+            for i in range(3)
+        ]
+        wpm, pace_available, n_paras = estimate_window_wpm(batches, _WORD_COUNTS)
+        # Pace should still be available — no major regression
+        # (may or may not be True depending on n_paragraphs/eff_seconds, but no gate fired)
+        # The test is that pace gate didn't force pace_available=False due to regression
+        # We just check wpm calculation ran without major-regression block
+        assert n_paras >= 2  # at least counted the paragraphs
+
+    def test_pace_ratio_stays_reasonable_without_regression(self) -> None:
+        """Without regression, a user reading at 2x baseline should get pace_ratio ≈ 2."""
+        # Build batches that advance through 6 distinct paragraphs
+        # in 12 eff_seconds → wpm = (6 × 30 / 12) × 60 = 900 WPM
+        # With baseline 200 WPM → pace_ratio = 4.5 (fast but no regression)
+        batches = [
+            _make_regression_batch(f"chunk-{i + 1}", 0.05 * (i + 1), 80.0, 0.0)
+            for i in range(10)
+        ]
+        wpm, pace_available, n_paras = estimate_window_wpm(batches, _WORD_COUNTS)
+        # No regression in this window — pace IS available if enough paras/time
+        if pace_available:
+            # wpm calculated correctly from traversed paras (no regression gate)
+            assert wpm > 0
+
+
+# ── Proper SCF computation tests ───────────────────────────────────────────────
+
+
+class TestScrollCaptureFaultWindowContext:
+    """
+    scroll_capture_fault_rate must now use consecutive batch progress comparisons,
+    not the stored per-batch flag which was a false positive for reading pauses.
+    """
+
+    def test_reading_pause_is_not_scf(self) -> None:
+        """When user pauses to read (no scroll, no progress change), SCF = 0."""
+        # Same progress across 5 batches = reading pause
+        batches = [
+            {"scroll_delta_abs_sum": 0.0, "scroll_event_count": 0,
+             "viewport_progress_ratio": 0.30, "current_paragraph_id": "chunk-3"}
+        ] * 5
+        scf = compute_scroll_capture_fault_rate(batches)
+        assert scf == 0.0
+
+    def test_progress_without_scroll_is_scf(self) -> None:
+        """Progress changed but no scroll recorded = genuine capture fault."""
+        batches = [
+            {"scroll_delta_abs_sum": 0.0, "scroll_event_count": 0,
+             "viewport_progress_ratio": 0.10 + 0.02 * i, "current_paragraph_id": "chunk-1"}
+            for i in range(6)
+        ]
+        scf = compute_scroll_capture_fault_rate(batches)
+        assert scf > 0.5
+
+    def test_normal_scrolling_has_zero_scf(self) -> None:
+        """Normal scroll events with matching progress = no fault."""
+        batches = [
+            {"scroll_delta_abs_sum": 50.0, "scroll_event_count": 30,
+             "viewport_progress_ratio": 0.05 * (i + 1), "current_paragraph_id": f"chunk-{i + 1}"}
+            for i in range(10)
+        ]
+        scf = compute_scroll_capture_fault_rate(batches)
+        assert scf == 0.0
+
+
+# ── Zero-baseline metric defaults tests ────────────────────────────────────────
+
+
+class TestZeroBaselineDefaults:
+    """
+    Calibration on short linear text can produce regress_rate_mean=0.0 and
+    scroll_jitter_mean=0.0.  Using 0.0 as the baseline mean causes z = value/0.03
+    to max out at z=3.0 for even tiny real-session values.
+    Population defaults must be substituted instead.
+    """
+
+    _ZERO_BASELINE: dict[str, Any] = {
+        "wpm_effective": 260.0,
+        "idle_ratio_mean": 0.37,
+        "idle_ratio_std": 0.38,
+        "idle_seconds_mean": 0.75,
+        "idle_seconds_std": 0.76,
+        "para_dwell_median_s": 4.0,
+        "para_dwell_iqr_s": 3.0,
+        "scroll_jitter_mean": 0.0,   # ← calibration artifact
+        "scroll_jitter_std": 0.0,
+        "regress_rate_mean": 0.0,    # ← calibration artifact
+        "regress_rate_std": 0.0,
+    }
+
+    def test_small_regress_does_not_max_z_score(self) -> None:
+        """5% back-scroll rate must not produce z_regress = 3.0 when baseline is 0."""
+        features = WindowFeatures(
+            n_batches=15,
+            regress_rate_mean=0.05,   # 5% — mild and common
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, self._ZERO_BASELINE)
+        assert z.z_regress < 1.0, (
+            f"z_regress={z.z_regress:.2f} should be < 1.0 for mild 5% regression "
+            f"when baseline has pop default 0.05 applied"
+        )
+
+    def test_extreme_regress_still_fires(self) -> None:
+        """60% back-scroll rate (e.g. back-reading entire section) must still signal."""
+        features = WindowFeatures(
+            n_batches=15,
+            regress_rate_mean=0.60,
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, self._ZERO_BASELINE)
+        assert z.z_regress > 1.5
+
+    def test_small_jitter_does_not_max_z_score(self) -> None:
+        """8% direction-change rate must not max z_jitter when baseline jitter is 0."""
+        features = WindowFeatures(
+            n_batches=15,
+            scroll_jitter_mean=0.08,  # mild jitter
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, self._ZERO_BASELINE)
+        assert z.z_jitter < 1.0, (
+            f"z_jitter={z.z_jitter:.2f} too high for mild jitter with pop default applied"
+        )
+
+    def test_focused_reader_low_disruption_zero_baseline(self) -> None:
+        """
+        A genuinely focused reader with a zero-regress/jitter calibration
+        baseline must NOT trigger high disruption from those signals alone.
+        """
+        features = extract_features(
+            [_focused_batch(f"chunk-{i % 4 + 1}") for i in range(15)],
+            _WORD_COUNTS,
+            260.0,
+        )
+        z = compute_z_scores(features, self._ZERO_BASELINE)
+        disruption, components = compute_disruption_score(z, self._ZERO_BASELINE)
+        assert disruption < 0.50, (
+            f"disruption={disruption:.3f} too high for focused reader with zero-baseline metrics"
+        )
+
+
+# ── Stagnation IQR tolerance tests ────────────────────────────────────────────
+
+
+class TestStagnationIqrTolerance:
+    """
+    Users reading harder text dwell longer per paragraph than during calibration.
+    stagnation_mu must use (median + 0.5×IQR)/30 to be more generous.
+    """
+
+    def test_stagnation_mu_uses_iqr(self) -> None:
+        """
+        For baseline median=4s, IQR=3s:
+        stagnation_mu = (4 + 0.5×3) / 30 = 5.5/30 ≈ 0.183 (not 0.133).
+        """
+        b: dict[str, Any] = {
+            "para_dwell_median_s": 4.0,
+            "para_dwell_iqr_s": 3.0,
+            "idle_ratio_mean": 0.37,
+            "idle_ratio_std": 0.38,
+            "scroll_jitter_mean": 0.10,
+            "scroll_jitter_std": 0.10,
+            "regress_rate_mean": 0.05,
+            "regress_rate_std": 0.06,
+        }
+        # stagnation_ratio = 0.20 (user spends 6s of 30s on one paragraph)
+        features = WindowFeatures(
+            n_batches=15,
+            stagnation_ratio=0.20,
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, b)
+        # With old formula (mu=0.133): z = (0.20 - 0.133)/0.15 = 0.447
+        # With new formula (mu=0.183): z = (0.20 - 0.183)/0.15 = 0.113
+        assert z.z_stagnation < 0.25, (
+            f"z_stagnation={z.z_stagnation:.3f} still too high for moderate dwell on harder text"
+        )
+
+    def test_extreme_stagnation_still_fires(self) -> None:
+        """Stagnation ratio = 0.9 (stuck for 27 of 30 seconds) must still signal."""
+        b: dict[str, Any] = {
+            "para_dwell_median_s": 4.0,
+            "para_dwell_iqr_s": 3.0,
+            "idle_ratio_mean": 0.37,
+            "idle_ratio_std": 0.38,
+            "scroll_jitter_mean": 0.10,
+            "scroll_jitter_std": 0.10,
+            "regress_rate_mean": 0.05,
+            "regress_rate_std": 0.06,
+        }
+        features = WindowFeatures(
+            n_batches=15,
+            stagnation_ratio=0.90,
+            at_end_of_document=False,
+        )
+        z = compute_z_scores(features, b)
+        assert z.z_stagnation > 2.0

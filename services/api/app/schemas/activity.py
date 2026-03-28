@@ -86,6 +86,14 @@ class ActivityBatchCreate(BaseModel):
     # clientHeight of the scrollable reader container.
     reader_container_height_px: Optional[float] = Field(default=None, ge=0)
 
+    # ── UI context (Phase 8 — adaptive panel telemetry) ─────────────────────
+    # Describes the reader UI state at flush time.
+    # Values: READ_MAIN | PANEL_OPEN | PANEL_INTERACTING | USER_PAUSED
+    ui_context: Optional[str] = None
+    # DOM zone of the most recent user interaction in this window.
+    # Values: reader | panel | other
+    interaction_zone: Optional[str] = None
+
     # ── Timestamp ───────────────────────────────────────────────────────────
     # ISO-8601 timestamp from the client; server uses now() if absent.
     client_timestamp: Optional[str] = None

@@ -310,7 +310,7 @@ const s: Record<string, React.CSSProperties> = {
   },
   doc: {
     width: "100%",
-    maxWidth: "72ch",
+    maxWidth: "85ch",
   },
   para: {
     fontSize: 19,

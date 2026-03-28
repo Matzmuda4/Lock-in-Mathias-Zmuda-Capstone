@@ -2,6 +2,11 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Resolved once at import time so it's stable regardless of cwd.
+# services/api/app/core/config.py → up 5 levels → repo root
+# (core → app → api → services → repo root)
+_REPO_ROOT: Path = Path(__file__).resolve().parent.parent.parent.parent.parent
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -29,6 +34,12 @@ class Settings(BaseSettings):
     parsed_cache_dir: Path = Path("parsed_cache")
     # Telemetry CSV exports (git-ignored)
     exports_dir: Path = Path("exports")
+    # Training data exports — stored at repo root training/exports/ (git-ignored)
+    # Override via TRAINING_EXPORTS_DIR env var if needed.
+    training_exports_dir: Path = _REPO_ROOT / "training" / "exports"
+    # Consolidated training datasets (CSV / JSONL) written by training_export router.
+    # Override via TRAINING_DATA_DIR env var if needed.
+    training_data_dir: Path = _REPO_ROOT / "training" / "data"
 
 
 settings = Settings()
