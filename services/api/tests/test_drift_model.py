@@ -992,6 +992,191 @@ class TestFallbackWpm:
         assert z.z_skim > 0.0, "2x pace should trigger skim signal"
 
 
+# ── z_skim burst-scroll dampening tests ───────────────────────────────────────
+
+
+class TestSkimBurstScrollDampening:
+    """
+    z_skim must be suppressed when a fast pace_ratio is contradicted by context
+    signals that indicate a brief localised scroll burst rather than sustained
+    engaged reading:
+
+    1. Idle dampening: high idle_ratio_mean in the same 30s window means the
+       fast scroll occupied only a fraction of the window.  A genuine hyperfocused
+       reader scrolls continuously (idle stays low).
+
+    2. Stagnation gate: genuine fast reading advances through multiple paragraphs.
+       High stagnation_ratio while apparently scrolling fast means the user stayed
+       on one paragraph — contradicting the pace signal.
+
+    The 'repositioning scroll' pattern (tab away → come back → quickly scroll to
+    find place) is the primary false-positive this fixes.
+    """
+
+    def test_low_idle_genuine_hyperfocus_skim_preserved(self) -> None:
+        """Low idle + fast pace = genuine hyperfocus — z_skim must not be dampened."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=2.5, pace_dev=abs(math.log(2.5)),
+            idle_ratio_mean=0.20,   # very low idle — scrolling most of the window
+            stagnation_ratio=0.30,  # advancing through paragraphs
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim > 2.0, (
+            f"Low-idle fast reading (idle=0.20) should preserve z_skim; got {z.z_skim:.3f}"
+        )
+
+    def test_high_idle_burst_scroll_skim_suppressed(self) -> None:
+        """High idle + fast pace = brief scroll burst — z_skim must be strongly dampened."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=4.5, pace_dev=abs(math.log(4.5)),
+            idle_ratio_mean=0.71,   # 71% idle — typical of repositioning burst
+            stagnation_ratio=0.50,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim < 1.0, (
+            f"Burst scroll (idle=0.71, pace=4.5) should strongly dampen z_skim; "
+            f"got {z.z_skim:.3f}"
+        )
+
+    def test_extreme_idle_burst_scroll_skim_near_zero(self) -> None:
+        """Very high idle (0.90+) with fast pace must produce near-zero z_skim."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=3.0, pace_dev=abs(math.log(3.0)),
+            idle_ratio_mean=0.90,
+            stagnation_ratio=0.40,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim < 0.20, (
+            f"Extreme idle (0.90) must suppress z_skim to near-zero; got {z.z_skim:.3f}"
+        )
+
+    def test_idle_dampening_is_smooth_not_binary(self) -> None:
+        """Dampening must be a smooth gradient — idle=0.60 should be between full and zero."""
+        low_idle = WindowFeatures(
+            n_batches=15, pace_available=True, pace_ratio=2.5,
+            idle_ratio_mean=0.20, stagnation_ratio=0.30,
+        )
+        mid_idle = WindowFeatures(
+            n_batches=15, pace_available=True, pace_ratio=2.5,
+            idle_ratio_mean=0.60, stagnation_ratio=0.30,
+        )
+        high_idle = WindowFeatures(
+            n_batches=15, pace_available=True, pace_ratio=2.5,
+            idle_ratio_mean=0.85, stagnation_ratio=0.30,
+        )
+        z_low = compute_z_scores(low_idle, _BASELINE)
+        z_mid = compute_z_scores(mid_idle, _BASELINE)
+        z_high = compute_z_scores(high_idle, _BASELINE)
+        assert z_low.z_skim > z_mid.z_skim > z_high.z_skim, (
+            "z_skim must decrease monotonically as idle increases"
+        )
+
+    def test_high_stagnation_suppresses_skim(self) -> None:
+        """High stagnation_ratio (0.87) with fast pace must suppress z_skim."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=4.5, pace_dev=abs(math.log(4.5)),
+            idle_ratio_mean=0.25,   # low idle — not suppressed by idle gate
+            stagnation_ratio=0.87,  # stuck on one paragraph — contradicts fast pace
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim < 1.0, (
+            f"High stagnation (0.87) with fast pace should suppress z_skim; "
+            f"got {z.z_skim:.3f}"
+        )
+
+    def test_full_stagnation_zeroes_skim(self) -> None:
+        """stagnation_ratio=1.0 (entire window on one paragraph) must zero z_skim."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=3.0, pace_dev=abs(math.log(3.0)),
+            idle_ratio_mean=0.20,
+            stagnation_ratio=1.0,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim == pytest.approx(0.0, abs=0.01), (
+            f"stagnation=1.0 must zero z_skim; got {z.z_skim:.3f}"
+        )
+
+    def test_combined_high_idle_and_high_stagnation_zeroes_skim(self) -> None:
+        """Both gates active simultaneously (session 170 p14/p47 pattern) → z_skim ≈ 0."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=4.49,
+            idle_ratio_mean=0.71,   # p14 actual value
+            stagnation_ratio=0.87,  # p14 actual value
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim < 0.20, (
+            f"p14-like burst (idle=0.71, stag=0.87, pace=4.49) must yield z_skim≈0; "
+            f"got {z.z_skim:.3f}"
+        )
+
+    def test_clean_hyperfocus_session170_p72_preserved(self) -> None:
+        """p72 from session 170 had idle=0.28, pace=2.53, stag=0.50 — must stay hyperfocused."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=True,
+            pace_ratio=2.53,
+            idle_ratio_mean=0.28,   # p72 actual: low idle, genuine reading
+            stagnation_ratio=0.50,
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim > 2.0, (
+            f"Clean hyperfocus (idle=0.28, pace=2.53) must preserve z_skim; "
+            f"got {z.z_skim:.3f}"
+        )
+
+    def test_dampening_does_not_affect_pace_unavailable_low_velocity(self) -> None:
+        """When pace_available=False and scroll velocity is below the skim threshold,
+        z_skim must remain 0.  The velocity fallback only fires above 1.6× baseline."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=False,
+            pace_ratio=1.0,
+            idle_ratio_mean=0.10,
+            stagnation_ratio=0.10,
+            scroll_velocity_norm_mean=0.0,  # no scrolling → well below threshold
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim == 0.0, (
+            "z_skim must be 0 when pace_available=False and scroll velocity is at rest"
+        )
+
+    def test_velocity_fallback_fires_for_fast_backward_scroll(self) -> None:
+        """When pace_available=False and scroll velocity > 1.6× baseline, z_skim must
+        fire via the scroll-velocity fallback (catches frantic non-linear scrolling)."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=False,
+            # 3× baseline velocity (0.010 from _BASELINE default) → sv_ratio=3.0
+            scroll_velocity_norm_mean=0.030,
+            idle_ratio_mean=0.10,      # low idle → idle_damp = 1.0
+            stagnation_ratio=0.30,     # low stag → stag_damp = 1.0
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim > 0.0, (
+            "Frantic fast scrolling (3× baseline, pace_unavailable) must trigger z_skim "
+            "via velocity fallback"
+        )
+        # sv_ratio=3.0 → z_skim_raw=(3.0-1.0)/(SKIM_SCALE*2)=(2.0/1.0)=2.0; no dampening
+        assert z.z_skim == pytest.approx(2.0, abs=0.01)
+
+    def test_velocity_fallback_suppressed_by_high_stagnation(self) -> None:
+        """High stagnation (acute thrash on 1 paragraph) must suppress the velocity
+        fallback — stag_damp zeroes z_skim just as it does for forward skimming."""
+        features = WindowFeatures(
+            n_batches=15, pace_available=False,
+            scroll_velocity_norm_mean=0.030,  # 3× baseline → would fire without gate
+            idle_ratio_mean=0.10,
+            stagnation_ratio=1.0,   # entire window on one paragraph → stag_damp = 0
+        )
+        z = compute_z_scores(features, _BASELINE)
+        assert z.z_skim == pytest.approx(0.0, abs=0.01), (
+            "High stagnation must suppress velocity fallback z_skim (same gate as forward skim)"
+        )
+
+
 # ── W_D_PACE=0 and skim-only pace_align tests ─────────────────────────────────
 
 

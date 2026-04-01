@@ -6,6 +6,9 @@ POST /exports/sessions                          — batch export many sessions
 GET  /exports/users/me/baseline                 — quick baseline inspection
 
 All endpoints enforce auth + ownership.  Files are written to training/exports/.
+Pass ``?append_to_master=1`` to also append state packets into
+``TrainingData/unlabelled.jsonl`` and write the user baseline to
+``TrainingData/baselines/user_{uid}_baseline.json``.
 """
 
 from __future__ import annotations
@@ -21,15 +24,29 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.deps import get_current_user
 from app.db.models import Session, User, UserBaseline
 from app.db.session import get_db
 from app.services.exports.service import ExportResult, export_session_bundle, zip_folder
+from app.services.training_export.master_append import (
+    MasterAppendResult,
+    append_session_to_master,
+)
 
 router = APIRouter(tags=["exports"])
 
 
 # ── Response schemas ──────────────────────────────────────────────────────────
+
+
+class MasterAppendInfo(BaseModel):
+    master_jsonl_path: str
+    appended_packet_count: int
+    skipped_packet_count: int
+    baseline_path: str
+    baseline_ref: str
+    baseline_embedded_in_packet: bool
 
 
 class ExportBundleResponse(BaseModel):
@@ -40,6 +57,7 @@ class ExportBundleResponse(BaseModel):
     state_packet_count: int
     telemetry_batch_count: int
     event_count: int
+    master_append: Optional[MasterAppendInfo] = None
 
 
 class BatchExportRequest(BaseModel):
@@ -75,7 +93,20 @@ async def _get_owned_session(
     return row
 
 
-def _result_to_response(result: ExportResult) -> ExportBundleResponse:
+def _result_to_response(
+    result: ExportResult,
+    master: Optional[MasterAppendResult] = None,
+) -> ExportBundleResponse:
+    master_info: Optional[MasterAppendInfo] = None
+    if master is not None:
+        master_info = MasterAppendInfo(
+            master_jsonl_path=str(master.master_jsonl_path),
+            appended_packet_count=master.appended_packet_count,
+            skipped_packet_count=master.skipped_packet_count,
+            baseline_path=str(master.baseline_path),
+            baseline_ref=master.baseline_ref,
+            baseline_embedded_in_packet=master.baseline_embedded_in_packet,
+        )
     return ExportBundleResponse(
         session_id=result.session_id,
         user_id=result.user_id,
@@ -84,6 +115,7 @@ def _result_to_response(result: ExportResult) -> ExportBundleResponse:
         state_packet_count=result.state_packet_count,
         telemetry_batch_count=result.telemetry_batch_count,
         event_count=result.event_count,
+        master_append=master_info,
     )
 
 
@@ -105,21 +137,45 @@ async def export_session_bundle_endpoint(
         default=None,
         description="Optional label for the labelling run, stored in session_meta.json",
     ),
+    append_to_master: bool = Query(
+        default=False,
+        description=(
+            "If true, append this session's state packets to "
+            "TrainingData/unlabelled.jsonl and write the user baseline to "
+            "TrainingData/baselines/user_{uid}_baseline.json. "
+            "Deduplication ensures packets are never appended twice."
+        ),
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     """
     Write the full training-data bundle for *session_id* to
-    `training/exports/user_{uid}/session_{sid}/`.
+    ``training/exports/user_{uid}/session_{sid}/``.
 
-    Returns a JSON summary of written files.  Pass `?download=1` to receive
+    Returns a JSON summary of written files.  Pass ``?download=1`` to receive
     the bundle as a ZIP archive (application/zip).
+
+    Pass ``?append_to_master=1`` to additionally append state packets into the
+    master ``TrainingData/unlabelled.jsonl`` for LLM labelling.  The response
+    will include a ``master_append`` object with paths and counts.
 
     Ownership enforced: you can only export your own sessions.
     """
     await _get_owned_session(session_id, current_user.id, db)
 
-    result = await export_session_bundle(current_user.id, session_id, db, protocol_tag=protocol_tag)
+    result = await export_session_bundle(
+        current_user.id, session_id, db, protocol_tag=protocol_tag
+    )
+
+    master_result: Optional[MasterAppendResult] = None
+    if append_to_master:
+        master_result = append_session_to_master(
+            export_folder=result.folder,
+            master_dir=settings.training_master_dir,
+            user_id=current_user.id,
+            session_id=session_id,
+        )
 
     if download:
         zip_path = zip_folder(result.folder)
@@ -133,7 +189,7 @@ async def export_session_bundle_endpoint(
             },
         )
 
-    return _result_to_response(result)
+    return _result_to_response(result, master=master_result)
 
 
 @router.post(

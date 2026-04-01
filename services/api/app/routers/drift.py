@@ -10,6 +10,7 @@ every telemetry batch.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 from datetime import datetime, timedelta, timezone
@@ -192,7 +193,7 @@ async def _recompute_and_save(
         )
         window_end_at = ts_result.scalar()
 
-    return await upsert_drift_state(
+    drift_row, packet_info = await upsert_drift_state(
         session.id, result, db,
         baseline_row=baseline_row,
         window_end_at=window_end_at,
@@ -204,6 +205,69 @@ async def _recompute_and_save(
         },
         batches=batches,
     )
+
+    # ── Fire classifier when a state packet was written this cycle ────────────
+    # packet_info is non-None every ~10 seconds (every 5th telemetry batch).
+    # The classification runs as a background asyncio task so it never blocks
+    # the 2-second telemetry batch cycle.  Failures are logged and swallowed —
+    # drift monitoring continues unaffected if the classifier is unavailable.
+    if packet_info is not None:
+        from app.services.classifier.registry import get_classifier, get_cache, is_available
+        if is_available():
+            asyncio.create_task(
+                _run_classification(session.id, packet_info),
+                name=f"classify-{session.id}-{packet_info.packet_seq}",
+            )
+
+    return drift_row
+
+
+# ── Background classification task ───────────────────────────────────────────
+
+
+async def _run_classification(
+    session_id: int,
+    packet_info: Any,
+) -> None:
+    """
+    Asyncio background task: format the packet, call the classifier,
+    and store the result in the in-memory cache.
+
+    Designed to be fire-and-forget via asyncio.create_task().
+    Never raises — all exceptions are caught and logged so drift
+    monitoring is never affected by classifier availability.
+    """
+    from app.services.classifier.formatter import format_for_llm
+    from app.services.classifier.registry import get_cache, get_classifier
+
+    clf = get_classifier()
+    if clf is None:
+        return
+
+    try:
+        llm_input = format_for_llm(
+            packet_json=packet_info.packet_json,
+            packet_seq=packet_info.packet_seq,
+            window_start_at=packet_info.window_start_at,
+            window_end_at=packet_info.window_end_at,
+        )
+        result = await clf.classify(llm_input)
+        get_cache().put(session_id, packet_info.packet_seq, result)
+        log.debug(
+            "[classify] session=%d seq=%d primary=%s latency=%dms parse_ok=%s",
+            session_id,
+            packet_info.packet_seq,
+            result.primary_state,
+            result.latency_ms,
+            result.parse_ok,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "[classify] session=%d seq=%d failed: %s",
+            session_id,
+            packet_info.packet_seq,
+            exc,
+        )
 
 
 # ── Shared session ownership check ───────────────────────────────────────────

@@ -310,7 +310,6 @@ const s: Record<string, React.CSSProperties> = {
   },
   doc: {
     width: "100%",
-    maxWidth: "85ch",
   },
   para: {
     fontSize: 19,
@@ -318,6 +317,9 @@ const s: Record<string, React.CSSProperties> = {
     color: "#e5e5e5",
     marginBottom: "1.6em",
     fontFamily: "'Inter', system-ui, sans-serif",
+    maxWidth: "85ch",
+    marginLeft: "auto",
+    marginRight: "auto",
   },
   debug: {
     position: "fixed",

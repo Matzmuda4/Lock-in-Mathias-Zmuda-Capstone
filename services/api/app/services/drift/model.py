@@ -177,6 +177,20 @@ DISRUPT_SCALE: float = 0.25
 SKIM_THRESHOLD: float = 1.6   # pace_ratio > this triggers asymmetric skim signal
 SKIM_SCALE: float = 0.5       # (pace_ratio - 1) / this → z_skim
 
+# z_skim dampening thresholds — suppress burst-scroll false positives
+# A genuine hyperfocused reader scrolls continuously (low idle, multiple paragraphs).
+# A burst-scroller (repositioning after tab-switch, skipping a section in ~5s)
+# produces the same high pace_ratio but with high idle and/or high stagnation in
+# the same 30-second window, which physically contradicts sustained fast reading.
+#
+# Idle dampening:  no effect below idle=0.40, fully suppressed at idle=0.80.
+_SKIM_IDLE_DAMP_LO: float = 0.40
+_SKIM_IDLE_DAMP_HI: float = 0.80
+# Stagnation dampening: fast reading must advance through multiple paragraphs.
+# No effect below stagnation=0.65, fully suppressed at stagnation=0.85.
+_SKIM_STAG_DAMP_LO: float = 0.65
+_SKIM_STAG_DAMP_HI: float = 0.85
+
 # Disruption component weights (W_D_X × z_X → disruption_raw)
 # Ordered by research-backed importance (see module docstring)
 W_D_IDLE: float = 0.22        # PRIMARY — never reduced by baseline variability
@@ -271,12 +285,25 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
 
     z_jitter = z_pos(features.scroll_jitter_mean, jitter_mean_b, jitter_std_b)
 
-    regress_mean_b = b.get("regress_rate_mean", 0.05)
-    if regress_mean_b == 0.0:
-        regress_mean_b = 0.05  # population default: 5% backward-scroll rate
-    regress_std_b = max(b.get("regress_rate_std", 0.06), 0.03)
-    if b.get("regress_rate_std", None) is not None and b.get("regress_rate_std") == 0.0:
-        regress_std_b = 0.06
+    # Calibration texts are read once, forward, without comprehension pressure,
+    # so regress_rate_mean is always near-zero in the baseline — even for
+    # users who naturally re-read occasionally.  Any non-trivial re-reading in
+    # a real session would trip z_regress to maximum immediately, treating
+    # normal focus effort as cognitive overload.
+    #
+    # Apply a hard floor of 0.05 so light re-reading (≤5% of batches going
+    # backward) registers as zero signal.  Only re-reading that is clearly
+    # above a typical reader's natural rate starts to elevate z_regress.
+    #
+    # z_regress calibration with floor=0.05, std_floor=0.06:
+    #   5%  regress → z = 0.00  (normal — no signal)
+    #  10%  regress → z = 0.83  (mild — trying to focus)
+    #  15%  regress → z = 1.67  (moderate — real effort)
+    #  20%  regress → z = 2.50  (strong — likely overload)
+    #  ≥19% regress → z = 3.00  (cap — clear overload)
+    _REGRESS_MU_FLOOR = 0.05
+    regress_mean_b = max(b.get("regress_rate_mean", _REGRESS_MU_FLOOR), _REGRESS_MU_FLOOR)
+    regress_std_b = max(b.get("regress_rate_std", 0.06), 0.06)
 
     z_regress = z_pos(features.regress_rate_mean, regress_mean_b, regress_std_b)
 
@@ -318,12 +345,46 @@ def compute_z_scores(features: WindowFeatures, baseline: dict[str, Any]) -> ZSco
         )
         z_pace_val = min(Z_POS_CAP, features.pace_dev / (pace_scale + _EPS))
 
-    # Skimming asymmetric signal
-    z_skim_val = (
+    # Skimming asymmetric signal — raw value from pace_ratio
+    z_skim_raw = (
         min(Z_POS_CAP, (features.pace_ratio - 1.0) / SKIM_SCALE)
         if features.pace_available and features.pace_ratio > SKIM_THRESHOLD
         else 0.0
     )
+
+    # Idle dampening: burst-scrollers (repositioning after a tab-switch, or
+    # skipping a boring section in ~5s) produce the same high pace_ratio as a
+    # genuinely hyperfocused reader but spend most of the window idle.  If
+    # idle_ratio_mean is high in the same 30s window, the fast scroll was brief
+    # and localised — not sustained engaged reading.  Smooth linear suppression.
+    idle_damp = 1.0 - min(
+        1.0,
+        max(0.0, (features.idle_ratio_mean - _SKIM_IDLE_DAMP_LO)
+                 / (_SKIM_IDLE_DAMP_HI - _SKIM_IDLE_DAMP_LO)),
+    )
+
+    # Stagnation gate: genuine hyperfocused reading must advance through multiple
+    # paragraphs.  Spending >85% of the window on a single paragraph while
+    # apparently scrolling fast indicates a localised burst, not sustained reading.
+    stag_damp = 1.0 - min(
+        1.0,
+        max(0.0, (features.stagnation_ratio - _SKIM_STAG_DAMP_LO)
+                 / (_SKIM_STAG_DAMP_HI - _SKIM_STAG_DAMP_LO)),
+    )
+
+    z_skim_val = z_skim_raw * idle_damp * stag_damp
+
+    # Scroll-velocity fallback: catches excessive speed in ANY direction when
+    # pace estimation is unavailable (regression gate fired, insufficient evidence).
+    # Uses a gentler scale (2× SKIM_SCALE) so the signal rises gradually — the
+    # same idle_damp and stag_damp gates as forward skim are applied, excluding
+    # acute single-paragraph thrashing (stag_damp → 0).
+    if not features.pace_available:
+        _bl_sv = b.get("scroll_velocity_norm_mean", 0.010)
+        _sv_ratio = features.scroll_velocity_norm_mean / max(_bl_sv, _EPS)
+        if _sv_ratio > SKIM_THRESHOLD:
+            _sv_z_raw = min(Z_POS_CAP, (_sv_ratio - 1.0) / (SKIM_SCALE * 2.0))
+            z_skim_val = max(z_skim_val, _sv_z_raw * idle_damp * stag_damp)
 
     z_burstiness = z_pos(features.scroll_burstiness, 1.0, 0.5)
 
@@ -419,6 +480,12 @@ def compute_engagement_score(z: ZScores, features: WindowFeatures) -> float:
         # text and must not reduce pace_align.  z_skim is 0 unless the user is
         # scrolling faster than 1.6× their calibration pace.
         pace_align = 1.0 - min(z.z_skim / Z_POS_CAP, 1.0)
+        # Regression drag: when the pace gate still passes but backward scrolling
+        # is elevated (subtle per-batch regression), reduce engagement.  A reader
+        # doing 20 %+ backward scrolling is actively struggling even if no single
+        # batch individually tripped the regression gate.
+        regress_drag = min(z.z_regress / Z_POS_CAP, 1.0) * 0.25
+        pace_align = max(0.0, pace_align - regress_drag)
     else:
         # Pace is unavailable (regression gate fired, early window, etc.).
         # Use scroll direction quality to set pace_align on a continuum:
@@ -436,6 +503,11 @@ def compute_engagement_score(z: ZScores, features: WindowFeatures) -> float:
             pace_align = 0.65 - regress_ratio * 0.30  # [0.35, 0.65]
         else:
             pace_align = 0.50  # stationary — no directional evidence
+        # Velocity fallback drag: when the scroll-speed fallback fired (frantic
+        # non-linear scrolling), it also suppresses engagement.
+        if z.z_skim > 0.0:
+            skim_drag = min(z.z_skim / Z_POS_CAP, 1.0) * 0.15
+            pace_align = max(0.0, pace_align - skim_drag)
 
     progress_boost = min(1.0, features.progress_markers_count / 2.0)
     score = calm * (0.80 * pace_align + 0.20 * progress_boost)

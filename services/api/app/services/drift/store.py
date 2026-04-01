@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -34,6 +35,18 @@ from app.services.drift.types import DriftResult
 # Exactly one packet per 5 telemetry batches (5 × 2 s = 10 s cadence).
 _HISTORY_EVERY_N: int = 5
 _upsert_counters: dict[int, int] = {}
+
+
+@dataclass
+class PacketWrittenInfo:
+    """
+    Returned by upsert_drift_state when a SessionStatePacket was written
+    this cycle.  Carries everything the classifier needs to build its input.
+    """
+    packet_json:     dict[str, Any]
+    packet_seq:      int
+    window_start_at: datetime
+    window_end_at:   datetime
 
 
 def _compute_ui_aggregates(batches: list[dict[str, Any]]) -> dict[str, float]:
@@ -77,7 +90,7 @@ async def upsert_drift_state(
     window_end_at: Optional[datetime] = None,
     session_context: Optional[dict[str, Any]] = None,
     batches: Optional[list[dict[str, Any]]] = None,
-) -> SessionDriftState:
+) -> tuple[SessionDriftState, Optional[PacketWrittenInfo]]:
     """
     Insert or update the drift state row for a session (latest snapshot).
 
@@ -95,6 +108,13 @@ async def upsert_drift_state(
         Embedded in packet_json so each packet is fully self-contained.
     batches : optional list of raw batch dicts from the rolling window.
         Used to compute ui_context / interaction_zone aggregates for the packet.
+
+    Returns
+    -------
+    (SessionDriftState, PacketWrittenInfo | None)
+        PacketWrittenInfo is non-None only on the cycle where a state packet
+        was written (every 5th call).  The caller uses it to fire the
+        classifier without coupling this persistence layer to the LLM service.
     """
     now = datetime.now(timezone.utc)
 
@@ -135,6 +155,8 @@ async def upsert_drift_state(
     # ── Append to history and state-packet tables every exactly 10 seconds ──
     # Counter starts at 0; first packet fires after the 5th batch (10 s).
     _upsert_counters[session_id] = _upsert_counters.get(session_id, 0) + 1
+    packet_info: Optional[PacketWrittenInfo] = None
+
     if _upsert_counters[session_id] % _HISTORY_EVERY_N == 0:
         db.add(SessionDriftHistory(
             session_id=session_id,
@@ -159,6 +181,13 @@ async def upsert_drift_state(
         w_end = window_end_at or now
         w_start = w_end - timedelta(seconds=30)
 
+        pkt_json = _build_packet_json(
+            result,
+            baseline_row=baseline_row,
+            session_context=session_context,
+            batches=batches or [],
+        )
+
         # Store full state packet for training-data export
         db.add(SessionStatePacket(
             session_id=session_id,
@@ -166,16 +195,21 @@ async def upsert_drift_state(
             packet_seq=next_seq,
             window_start_at=w_start,
             window_end_at=w_end,
-            packet_json=_build_packet_json(
-                result,
-                baseline_row=baseline_row,
-                session_context=session_context,
-                batches=batches or [],
-            ),
+            packet_json=pkt_json,
         ))
 
+        # Signal to the caller that a packet was written this cycle so it
+        # can fire the classifier without this persistence layer needing to
+        # know anything about the LLM service.
+        packet_info = PacketWrittenInfo(
+            packet_json=pkt_json,
+            packet_seq=next_seq,
+            window_start_at=w_start,
+            window_end_at=w_end,
+        )
+
     await db.flush()
-    return row
+    return row, packet_info
 
 
 def _build_packet_json(

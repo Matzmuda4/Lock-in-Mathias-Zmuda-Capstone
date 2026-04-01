@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24  # 24 hours
 
+    # ── Classifier (Phase 9) ──────────────────────────────────────────────────
+    # Set CLASSIFY_ENABLED=true in .env once the Ollama adapter is ready.
+    # Set CLASSIFY_USE_MOCK=true during development to use MockClassifier.
+    classify_enabled: bool = False
+    classify_use_mock: bool = False
+    ollama_url: str = "http://localhost:11434"
+    ollama_classifier_model: str = "lock-in-classifier"
+
     # File storage — relative to wherever the API process runs
     upload_dir: Path = Path("uploads")
     # Extracted images and docling artifacts (git-ignored)
@@ -40,6 +48,9 @@ class Settings(BaseSettings):
     # Consolidated training datasets (CSV / JSONL) written by training_export router.
     # Override via TRAINING_DATA_DIR env var if needed.
     training_data_dir: Path = _REPO_ROOT / "training" / "data"
+    # Master append directory — unlabelled.jsonl + per-user baselines.
+    # Override via TRAINING_MASTER_DIR env var if needed.
+    training_master_dir: Path = _REPO_ROOT / "TrainingData"
 
 
 settings = Settings()

@@ -467,25 +467,43 @@ function AssistantPanel({ panelRef, open, onToggle, onInteract }: AssistantPanel
 
 // ─── Dev-only Export Bundle button ───────────────────────────────────────────
 
+interface ExportBundleResult {
+  folder: string;
+  files: string[];
+  state_packet_count: number;
+  master_append?: {
+    master_jsonl_path: string;
+    appended_packet_count: number;
+    skipped_packet_count: number;
+    baseline_path: string;
+    baseline_ref: string;
+    baseline_embedded_in_packet: boolean;
+  } | null;
+}
+
 function ExportBundleButton({ sessionId, token }: { sessionId: number; token: string | null }) {
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ folder: string; files: string[] } | null>(null);
+  const [result, setResult] = useState<ExportBundleResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const handleExport = async () => {
     if (!token) return;
     setBusy(true);
     setResult(null);
+    setError(null);
     try {
       const resp = await fetch(
-        `${API_BASE_URL}/sessions/${sessionId}/export/bundle`,
+        `${API_BASE_URL}/sessions/${sessionId}/export/bundle?append_to_master=1`,
         { headers: { Authorization: `Bearer ${token}` } },
       );
       if (!resp.ok) {
-        console.error("Export bundle failed:", resp.status, await resp.text());
+        const msg = await resp.text();
+        console.error("Export bundle failed:", resp.status, msg);
+        setError(`Export failed (${resp.status})`);
         return;
       }
-      const data = await resp.json();
-      setResult({ folder: data.folder, files: data.files });
+      const data: ExportBundleResult = await resp.json();
+      setResult(data);
     } finally {
       setBusy(false);
     }
@@ -501,11 +519,31 @@ function ExportBundleButton({ sessionId, token }: { sessionId: number; token: st
       >
         {busy ? "Exporting…" : "📦 Export Bundle"}
       </button>
+      {error && (
+        <div style={{ fontSize: 10, color: "var(--error, #e55)", maxWidth: 260 }}>
+          {error}
+        </div>
+      )}
       {result && (
-        <div style={{ fontSize: 10, color: "var(--text-muted)", maxWidth: 260, wordBreak: "break-all" }}>
-          <strong>Saved:</strong> {result.folder}
-          <br />
-          {result.files.join(", ")}
+        <div style={{ fontSize: 10, color: "var(--text-muted)", maxWidth: 280, wordBreak: "break-all" }}>
+          <div><strong>Bundle:</strong> {result.folder}</div>
+          <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
+            {result.files.join(", ")}
+          </div>
+          {result.master_append && (
+            <div style={{ marginTop: 4, borderTop: "1px solid var(--border)", paddingTop: 4 }}>
+              <div>
+                <strong>Master JSONL:</strong>{" "}
+                {result.master_append.appended_packet_count} packets appended
+                {result.master_append.skipped_packet_count > 0 &&
+                  ` (${result.master_append.skipped_packet_count} skipped — already present)`}
+              </div>
+              <div style={{ marginTop: 2 }}>{result.master_append.master_jsonl_path}</div>
+              <div style={{ marginTop: 2 }}>
+                <strong>Baseline:</strong> {result.master_append.baseline_path}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1195,7 +1233,6 @@ export function ReaderPage() {
 
         /* ── Content column ── */
         .reader-content {
-          max-width: 85ch;
           width: 100%;
           margin: 0 auto;
           padding: 48px 24px 100px;
@@ -1204,15 +1241,30 @@ export function ReaderPage() {
         }
 
         /* ── Chunk base ── */
-        .chunk { margin-bottom: 28px; }
+        /* Chunk wrapper — constrain ALL content (headings, paragraphs, figures)
+           to the same 85ch column. font-size:19px ensures ch is calculated at
+           the reading font size, matching calibration and adaptive mode exactly. */
+        .chunk {
+          margin-bottom: 28px;
+          max-width: 85ch;
+          font-size: 19px;
+          margin-left: auto;
+          margin-right: auto;
+        }
 
-        /* Text — larger, more readable */
+        /* Adaptive mode: left-align the chunk block flush against the panel */
+        .reader-body--adaptive .chunk {
+          margin-left: 0;
+          margin-right: 0;
+        }
+
+        /* Text */
         .chunk__p {
           font-size: 19px;
           line-height: 1.75;
           color: var(--text);
           margin: 0;
-          max-width: 85ch;
+          max-width: 100%;
         }
 
         /* Headings */
