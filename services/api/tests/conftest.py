@@ -123,6 +123,16 @@ def init_test_db() -> None:
         ]:
             async with eng.begin() as c:
                 await c.execute(text(f"ALTER TABLE session_state_packets {col_sql}"))
+        # session_attentional_states hypertable (RF classifier output)
+        async with eng.begin() as c:
+            await c.execute(
+                text(
+                    "SELECT create_hypertable("
+                    "  'session_attentional_states', 'created_at',"
+                    "  if_not_exists => TRUE"
+                    ")"
+                )
+            )
         await eng.dispose()
 
     asyncio.run(_setup())
@@ -146,6 +156,7 @@ def clean_tables() -> None:
             await conn.execute("DELETE FROM session_drift_states")
             await conn.execute("DELETE FROM session_drift_history")
             await conn.execute("DELETE FROM session_state_packets")
+            await conn.execute("DELETE FROM session_attentional_states")
             await conn.execute("DELETE FROM model_outputs")
             await conn.execute("DELETE FROM interventions")
             await conn.execute("DELETE FROM sessions")

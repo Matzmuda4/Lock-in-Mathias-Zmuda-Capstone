@@ -145,3 +145,15 @@ async def init_db() -> None:
             await conn.execute(
                 text(f"ALTER TABLE session_state_packets {col_sql}")
             )
+
+    # Step 6 — session_attentional_states hypertable (RF classifier output)
+    # The table is created by create_all above; convert it to a hypertable here.
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "SELECT create_hypertable("
+                "  'session_attentional_states', 'created_at',"
+                "  if_not_exists => TRUE"
+                ")"
+            )
+        )

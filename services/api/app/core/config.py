@@ -28,11 +28,18 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24  # 24 hours
 
-    # ── Classifier (Phase 9) ──────────────────────────────────────────────────
-    # Set CLASSIFY_ENABLED=true in .env once the Ollama adapter is ready.
-    # Set CLASSIFY_USE_MOCK=true during development to use MockClassifier.
+    # ── Classifier (Phase 9 — RF production classifier) ───────────────────────
+    # CLASSIFY_ENABLED=true  → activate classifier pipeline
+    # CLASSIFY_USE_MOCK=true → use MockClassifier (no pkl required, for CI/dev)
+    # CLASSIFY_USE_RF=true   → use RFClassifier (default production path)
+    # RF_MODEL_PATH          → path to rf_classifier_v2.pkl
+    #                          defaults to repo_root/rf_classifier_v2.pkl
     classify_enabled: bool = False
     classify_use_mock: bool = False
+    classify_use_rf: bool = True
+    rf_model_path: Path = _REPO_ROOT / "rf_classifier_v2.pkl"
+
+    # Legacy Ollama settings — retained for the intervention LLM (future work)
     ollama_url: str = "http://localhost:11434"
     ollama_classifier_model: str = "lock-in-classifier"
 

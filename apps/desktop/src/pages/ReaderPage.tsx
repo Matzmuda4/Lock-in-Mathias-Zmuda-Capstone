@@ -7,6 +7,7 @@ import { calibrationService, type BaselineData } from "../services/calibrationSe
 import { documentService, type Chunk } from "../services/documentService";
 import { sessionService, type Session, type SessionReaderData } from "../services/sessionService";
 import { driftService, driftColor, type DriftState, type DriftDebug } from "../services/driftService";
+import { classificationService, STATE_COLORS, STATE_LABELS, type AttentionalState } from "../services/classificationService";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -639,6 +640,73 @@ function DriftMeter({
   );
 }
 
+// ─── Attentional state meter ──────────────────────────────────────────────────
+
+/**
+ * Displays the RF classifier's 4-state probability distribution beside the
+ * drift meter in the top bar.
+ *
+ * Shows a compact bar for each state scaled to the probability [0,1].
+ * The primary state label is highlighted.  A spinner is shown while the
+ * first full-window packet has not yet been classified (< ~30 s).
+ */
+function AttentionalStateMeter({
+  state,
+}: {
+  state: AttentionalState | null;
+}) {
+  if (!state) {
+    return (
+      <div className="attn-meter attn-meter--pending" title="Waiting for first full-window classification (~30s)">
+        <span className="attn-meter__label">State</span>
+        <span className="attn-meter__waiting">…</span>
+      </div>
+    );
+  }
+
+  const { distribution, primary_state, confidence } = state;
+  const entries = Object.entries(distribution) as [string, number][];
+
+  return (
+    <div
+      className="attn-meter"
+      title={`Primary: ${STATE_LABELS[primary_state]} (${(confidence * 100).toFixed(0)}%)\n${state.rationale}`}
+    >
+      <span className="attn-meter__label">State</span>
+      <div className="attn-meter__bars">
+        {entries.map(([stateKey, prob]) => (
+          <div
+            key={stateKey}
+            className={`attn-meter__bar${stateKey === primary_state ? " attn-meter__bar--primary" : ""}`}
+            title={`${STATE_LABELS[stateKey]}: ${(prob * 100).toFixed(1)}%`}
+          >
+            <div
+              className="attn-meter__bar-fill"
+              style={{
+                height: `${Math.max(3, prob * 28)}px`,
+                background: STATE_COLORS[stateKey],
+                opacity: stateKey === primary_state ? 1 : 0.45,
+              }}
+            />
+            <span
+              className="attn-meter__bar-label"
+              style={{ color: stateKey === primary_state ? STATE_COLORS[stateKey] : undefined }}
+            >
+              {STATE_LABELS[stateKey].slice(0, 3)}
+            </span>
+          </div>
+        ))}
+      </div>
+      <span
+        className="attn-meter__primary"
+        style={{ color: STATE_COLORS[primary_state] }}
+      >
+        {STATE_LABELS[primary_state]}
+      </span>
+    </div>
+  );
+}
+
 // ─── Drift debug panel (DEV only) ────────────────────────────────────────────
 
 function DriftDebugPanel({
@@ -754,6 +822,9 @@ export function ReaderPage() {
   // Drift state — polled every 3 s while active
   const [driftState, setDriftState] = useState<DriftState | null>(null);
 
+  // Attentional state — polled every 10 s (matches classifier cadence)
+  const [attentionalState, setAttentionalState] = useState<AttentionalState | null>(null);
+
   const timerDisplay = useElapsedTimer(data?.session ?? null);
   // Raw seconds for calibration finish-condition logic
   const [timerSeconds, setTimerSeconds] = useState(0);
@@ -825,6 +896,24 @@ export function ReaderPage() {
     poll();
     const id = setInterval(poll, 3000);
     return () => clearInterval(id);
+  }, [token, sessionId, isActive]);
+
+  // Poll attentional-state classification every 10 s (RF classifier cadence).
+  // Returns null for the first ~30 s (window not full yet) — shown as "…" in the meter.
+  useEffect(() => {
+    if (!token || !isActive) return;
+    const poll = async () => {
+      try {
+        const result = await classificationService.getAttentionalState(token, sessionId);
+        if (result) setAttentionalState(result);
+      } catch {
+        // Unexpected errors are silently swallowed — classification is non-critical
+      }
+    };
+    // Delay initial poll by 30 s — no point polling before the first full window
+    const initialDelay = setTimeout(poll, 30_000);
+    const id = setInterval(poll, 10_000);
+    return () => { clearTimeout(initialDelay); clearInterval(id); };
   }, [token, sessionId, isActive]);
 
   const loadMore = useCallback(async () => {
@@ -948,6 +1037,9 @@ export function ReaderPage() {
         <div className="reader-bar__right">
           <span className="reader-bar__timer">{timerDisplay}</span>
           <DriftMeter drift={driftState} showConfidence={DEV} />
+          {!isCalibration && (
+            <AttentionalStateMeter state={attentionalState} />
+          )}
           {DEV && (
             <span className={`telemetry-badge${collecting ? " telemetry-badge--on" : ""}`}>
               ⊙ Telemetry: {collecting ? "ON" : "OFF"}
@@ -1210,6 +1302,62 @@ export function ReaderPage() {
         .drift-meter__pill--red    { background:#ef444422; color:#ef4444; border:1px solid #ef444444; }
         .drift-meter__conf { font-size:10px; color:var(--text-muted); }
         .drift-meter__baseline { font-size:10px; color:#22c55e; margin-left:4px; }
+
+        /* ── Attentional state meter ── */
+        .attn-meter {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          border-left: 1px solid var(--border);
+          padding-left: 10px;
+          margin-left: 4px;
+        }
+        .attn-meter__label {
+          color: var(--text-muted);
+          font-size: 11px;
+          white-space: nowrap;
+        }
+        .attn-meter--pending .attn-meter__waiting {
+          color: var(--text-muted);
+          font-size: 13px;
+          letter-spacing: 0.1em;
+        }
+        .attn-meter__bars {
+          display: flex;
+          align-items: flex-end;
+          gap: 3px;
+          height: 32px;
+        }
+        .attn-meter__bar {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 2px;
+          width: 20px;
+          cursor: default;
+        }
+        .attn-meter__bar-fill {
+          width: 100%;
+          border-radius: 2px 2px 0 0;
+          transition: height 0.4s ease;
+          min-height: 3px;
+        }
+        .attn-meter__bar-label {
+          font-size: 9px;
+          color: var(--text-muted);
+          font-family: var(--font-mono, monospace);
+          letter-spacing: 0;
+        }
+        .attn-meter__bar--primary .attn-meter__bar-label {
+          font-weight: 700;
+        }
+        .attn-meter__primary {
+          font-size: 11px;
+          font-weight: 700;
+          white-space: nowrap;
+          font-family: var(--font-mono, monospace);
+        }
 
         /* ── Telemetry indicator (dev-only) ── */
         .telemetry-badge {
