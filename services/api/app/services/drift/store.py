@@ -244,6 +244,33 @@ def _build_packet_json(
     ctx = session_context or {}
     ui_agg = _compute_ui_aggregates(batches or [])
 
+    # ── Reading position from the latest telemetry batch in the window ────────
+    # current_paragraph_id is set by the frontend renderer and identifies which
+    # DocumentChunk the user's viewport was centred on at the end of the window.
+    # This lets the intervention LLM look up the exact paragraph text without
+    # any additional queries — it maps directly to document_chunks.chunk_index.
+    _last_b: dict[str, Any] = (batches or [{}])[-1] if batches else {}
+    _text_modified_count: int = sum(
+        1 for b in (batches or []) if b.get("text_modified", False)
+    )
+    # current_chunk_index is the integer DocumentChunk.chunk_index emitted by
+    # the frontend renderer (data-chunk-index attribute).  It is the canonical
+    # key for paragraph lookup and avoids any string parsing of
+    # current_paragraph_id ("chunk-{db_pk}").
+    _chunk_idx_raw = _last_b.get("current_chunk_index")
+    reading_position: dict[str, Any] = {
+        "current_paragraph_id": _last_b.get("current_paragraph_id"),
+        "current_chunk_index": int(_chunk_idx_raw) if _chunk_idx_raw is not None else None,
+        "viewport_progress_ratio": float(
+            _last_b.get("viewport_progress_ratio") or 0.0
+        ),
+        # True when the reading layout was reformatted during this window.
+        # Signals the drift model and RF classifier that behavioural patterns
+        # may differ from the trained distribution — used for down-weighting.
+        "text_modified": _text_modified_count > 0,
+        "text_modified_batch_count": _text_modified_count,
+    }
+
     return {
         # ── Session identity ─────────────────────────────────────────────
         "session_id": ctx.get("session_id"),
@@ -272,6 +299,8 @@ def _build_packet_json(
         "baseline_snapshot": baseline_snapshot,
         # ── UI context aggregates over the 30-second window ───────────────
         "ui_aggregates": ui_agg,
+        # ── Reading position (intervention LLM text lookup key) ───────────
+        "reading_position": reading_position,
     }
 
 

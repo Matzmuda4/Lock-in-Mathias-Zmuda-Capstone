@@ -11,6 +11,7 @@ Responsibility split (SOLID — Single Responsibility):
   rf_classifier.py     → inference
   feature_extractor.py → feature vector construction
   registry.py          → singleton + in-memory cache
+  paragraph_fetcher.py → paragraph text window retrieval
 
 The intervention LLM query pattern expected by this schema:
 
@@ -22,6 +23,21 @@ The intervention LLM query pattern expected by this schema:
 
   → Returns the last 5 classifications in newest-first order, each row
     carrying a complete intervention_context ready for prompt assembly.
+
+intervention_context schema (extended):
+  {
+    "primary_state":       str,
+    "confidence":          float,          # max(distribution)
+    "distribution":        {state: float}, # all 4 probabilities
+    "ambiguous":           bool,           # top-2 gap < 0.15
+    "drift_level":         float,          # concurrent drift model output
+    "drift_ema":           float,
+    "engagement_score":    float,          # 0-1, complement of drift_level
+    "packet_seq":          int,
+    "session_id":          int,
+    "current_chunk_index": int | null,     # DocumentChunk.chunk_index
+    "text_window":         [str, ...],     # ≤3 paragraphs centred on chunk
+  }
 """
 
 from __future__ import annotations
@@ -41,24 +57,14 @@ async def save_attentional_state(
     result: ClassificationResult,
     packet_json: dict[str, Any],
     db: AsyncSession,
+    text_window: list[str] | None = None,
 ) -> SessionAttentionalState:
     """
     Persist one classifier result to session_attentional_states.
 
     Extends ClassificationResult.as_intervention_context() with the concurrent
-    drift state (drift_level, drift_ema) from the packet_json so the
-    intervention LLM has a single JSONB document containing everything it needs:
-
-      intervention_context = {
-        "primary_state":  str,
-        "confidence":     float,          # max(distribution)
-        "distribution":   {state: float}, # all 4 probabilities
-        "ambiguous":      bool,           # top-2 gap < 0.15
-        "drift_level":    float,          # concurrent drift model output
-        "drift_ema":      float,
-        "packet_seq":     int,
-        "session_id":     int,
-      }
+    drift state and the paragraph text window so the intervention LLM has a
+    single JSONB document containing everything it needs at prompt assembly.
 
     Parameters
     ----------
@@ -66,23 +72,32 @@ async def save_attentional_state(
     packet_seq   : monotonic packet counter for this session
     result       : ClassificationResult from the RF classifier
     packet_json  : raw packet as stored by store._build_packet_json()
-                   used to extract the concurrent drift snapshot
+                   used to extract drift snapshot and reading_position
     db           : active async SQLAlchemy session (caller must commit)
+    text_window  : ≤3 paragraph strings from paragraph_fetcher.fetch_text_window
+                   (empty list when the position is unknown or DB unreachable)
 
     Returns
     -------
     The newly added SessionAttentionalState ORM row (unflushed until caller commits).
     """
     dr: dict[str, Any] = packet_json.get("drift") or {}
-    drift_level = float(dr.get("drift_level", 0.0))
-    drift_ema   = float(dr.get("drift_ema",   0.0))
+    drift_level     = float(dr.get("drift_level",      0.0))
+    drift_ema       = float(dr.get("drift_ema",        0.0))
+    engagement_score = float(dr.get("engagement_score", 0.0))
 
-    # Extend the base intervention context with drift state and identifiers
+    rp: dict[str, Any] = packet_json.get("reading_position") or {}
+    current_chunk_index = rp.get("current_chunk_index")  # int | None
+
+    # Extend the base intervention context with all fields the LLM needs
     ctx = result.as_intervention_context()
-    ctx["drift_level"] = drift_level
-    ctx["drift_ema"]   = drift_ema
-    ctx["packet_seq"]  = packet_seq
-    ctx["session_id"]  = session_id
+    ctx["drift_level"]         = drift_level
+    ctx["drift_ema"]           = drift_ema
+    ctx["engagement_score"]    = engagement_score
+    ctx["packet_seq"]          = packet_seq
+    ctx["session_id"]          = session_id
+    ctx["current_chunk_index"] = current_chunk_index
+    ctx["text_window"]         = text_window or []
 
     row = SessionAttentionalState(
         session_id=session_id,

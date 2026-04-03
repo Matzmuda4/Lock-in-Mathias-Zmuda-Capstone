@@ -176,6 +176,29 @@ async def _recompute_and_save(
     # Attach progress markers
     features.progress_markers_count = progress_markers
 
+    # ── Text-modification down-weighting ──────────────────────────────────────
+    # When the reading layout was reformatted this window (text_modified=True in
+    # any telemetry batch), the user's behavioural patterns will temporarily
+    # deviate from the trained distribution — e.g. slower pace and more
+    # regressions are expected as they adjust to the new layout, not because
+    # they are drifting.  We reduce quality_confidence_mult proportionally so
+    # the drift model and RF classifier treat this window with lower confidence.
+    # This is analogous to the existing telemetry_fault_rate multiplier and is
+    # explicitly logged for thesis traceability.
+    _text_mod_count = sum(1 for b in batches if b.get("text_modified", False))
+    if _text_mod_count > 0:
+        _text_mod_share = _text_mod_count / max(len(batches), 1)
+        # Multiplier range: 1.0 (no modification) → 0.5 (fully modified window).
+        # The 0.4 coefficient was chosen so that a single modified batch (~7% of
+        # a 15-batch window) causes only a ~3% confidence reduction, while a
+        # fully modified window halves confidence.
+        _mod_mult = max(0.5, 1.0 - 0.4 * _text_mod_share)
+        features.quality_confidence_mult *= _mod_mult
+        log.debug(
+            "[drift] session=%d text_modified=%d/%d batches → confidence_mult=%.3f",
+            session.id, _text_mod_count, len(batches), features.quality_confidence_mult,
+        )
+
     result = compute_drift_result(
         features, baseline, elapsed_min, prev_ema, prev_beta_ema
     )
@@ -247,17 +270,26 @@ async def _run_classification(
     Never raises — all exceptions are caught and logged so drift monitoring
     is never blocked by classifier failures.
 
-    Two writes happen per invocation:
+    Three things happen per invocation:
       1. In-memory ClassificationCache.put()  — feeds /attentional-state endpoint.
-      2. session_attentional_states DB row    — feeds /history endpoint and the
-                                               future intervention LLM query layer.
+      2. Paragraph text window fetch           — reads ≤3 DocumentChunk rows using
+                                               the current_chunk_index embedded in
+                                               packet_json.reading_position.
+      3. session_attentional_states DB row    — feeds /history and the intervention
+                                               LLM.  Each row is fully self-contained:
+                                               state, drift, and text_window are all
+                                               stored in intervention_context JSONB so
+                                               the LLM needs no additional joins.
 
-    Intervention LLM integration (future):
-    Read the last N rows from session_attentional_states ordered by created_at
-    DESC and pass each row's intervention_context JSONB to the prompt builder.
-    No additional joins are needed — each row is fully self-contained.
+    Intervention LLM query pattern:
+      SELECT intervention_context
+      FROM session_attentional_states
+      WHERE session_id = :sid
+      ORDER BY created_at DESC LIMIT 3;
+      → Returns the last 3 classification windows with paragraph text included.
     """
     from app.services.classifier.classifier_store import save_attentional_state
+    from app.services.classifier.paragraph_fetcher import fetch_text_window
     from app.services.classifier.registry import get_cache, get_classifier
     from app.db.session import async_session_factory
 
@@ -271,17 +303,26 @@ async def _run_classification(
         # 1 — Update in-memory cache (serves the live /attentional-state endpoint)
         get_cache().put(session_id, packet_info.packet_seq, result)
 
-        # 2 — Persist to DB (serves /history and future intervention LLM).
-        # Background tasks have no injected DB session, so we open one directly
-        # via the session factory.
+        # 2 + 3 — Fetch paragraph text and persist to DB in the same session.
+        # current_chunk_index is the integer DocumentChunk.chunk_index embedded
+        # by store._build_packet_json from the last telemetry batch's
+        # current_chunk_index field (set by the frontend renderer).
+        rp: dict[str, Any] = packet_info.packet_json.get("reading_position") or {}
+        doc_id: int | None = packet_info.packet_json.get("document_id")
+        chunk_idx: int | None = rp.get("current_chunk_index")
+        text_window: list[str] = []
+
         try:
             async with async_session_factory() as db:
+                text_window = await fetch_text_window(doc_id, chunk_idx, db)
+
                 await save_attentional_state(
                     session_id=session_id,
                     packet_seq=packet_info.packet_seq,
                     result=result,
                     packet_json=packet_info.packet_json,
                     db=db,
+                    text_window=text_window,
                 )
                 await db.commit()
         except Exception as db_exc:  # noqa: BLE001
@@ -291,13 +332,16 @@ async def _run_classification(
             )
 
         log.debug(
-            "[classify] session=%d seq=%d primary=%s conf=%.3f latency=%dms persisted=True",
+            "[classify] session=%d seq=%d primary=%s conf=%.3f latency=%dms "
+            "chunk=%s text_paragraphs=%d persisted=True",
             session_id,
             packet_info.packet_seq,
             result.primary_state,
             max(result.focused, result.drifting,
                 result.hyperfocused, result.cognitive_overload),
             result.latency_ms,
+            chunk_idx,
+            len(text_window),
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(
