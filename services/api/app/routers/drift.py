@@ -10,6 +10,7 @@ every telemetry batch.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -179,7 +180,132 @@ async def _recompute_and_save(
         features, baseline, elapsed_min, prev_ema, prev_beta_ema
     )
 
-    return await upsert_drift_state(session.id, result, db)
+    # fetch_window returns payload dicts — query created_at separately for window bounds
+    window_end_at: Optional[datetime] = None
+    if batches:
+        ts_result = await db.execute(
+            text(
+                "SELECT MAX(created_at) FROM activity_events "
+                "WHERE session_id=:sid AND event_type='telemetry_batch' "
+                "AND created_at >= NOW() - INTERVAL '30 seconds'"
+            ),
+            {"sid": session.id},
+        )
+        window_end_at = ts_result.scalar()
+
+    drift_row, packet_info = await upsert_drift_state(
+        session.id, result, db,
+        baseline_row=baseline_row,
+        window_end_at=window_end_at,
+        session_context={
+            "session_id": session.id,
+            "user_id": session.user_id,
+            "document_id": session.document_id,
+            "session_mode": session.mode,
+        },
+        batches=batches,
+    )
+
+    # ── Fire classifier when a full-window state packet was written ────────────
+    # packet_info is non-None every ~10 s (every 5th telemetry batch at 2 s cadence).
+    # Full-window gate: only classify when n_batches >= 14 (≈ 28-second window).
+    # The live 30 s window yields at most 15 batches; 14 gives one batch of
+    # timing jitter tolerance while still ensuring a near-complete signal window.
+    # Classifying on partial windows would constitute distribution shift relative
+    # to the training data, which was labelled exclusively on mature windows.
+    # The background task is fire-and-forget — failures never block drift monitoring.
+    if packet_info is not None:
+        from app.services.classifier.registry import is_available
+        from app.services.classifier.feature_extractor import is_full_window
+        if is_available() and is_full_window(packet_info.packet_json):
+            asyncio.create_task(
+                _run_classification(session.id, packet_info),
+                name=f"classify-{session.id}-{packet_info.packet_seq}",
+            )
+        elif packet_info is not None:
+            n = (packet_info.packet_json.get("features") or {}).get("n_batches", 0)
+            log.debug(
+                "[classify] session=%d seq=%d skipped — window incomplete (%d/14 batches)",
+                session.id, packet_info.packet_seq, n,
+            )
+
+    return drift_row
+
+
+# ── Background classification task ───────────────────────────────────────────
+
+
+async def _run_classification(
+    session_id: int,
+    packet_info: Any,
+) -> None:
+    """
+    Asyncio background task: classify a full-window state packet, update the
+    in-memory cache, and persist the result to session_attentional_states.
+
+    Designed to be fire-and-forget via asyncio.create_task().
+    Never raises — all exceptions are caught and logged so drift monitoring
+    is never blocked by classifier failures.
+
+    Two writes happen per invocation:
+      1. In-memory ClassificationCache.put()  — feeds /attentional-state endpoint.
+      2. session_attentional_states DB row    — feeds /history endpoint and the
+                                               future intervention LLM query layer.
+
+    Intervention LLM integration (future):
+    Read the last N rows from session_attentional_states ordered by created_at
+    DESC and pass each row's intervention_context JSONB to the prompt builder.
+    No additional joins are needed — each row is fully self-contained.
+    """
+    from app.services.classifier.classifier_store import save_attentional_state
+    from app.services.classifier.registry import get_cache, get_classifier
+    from app.db.session import async_session_factory
+
+    clf = get_classifier()
+    if clf is None:
+        return
+
+    try:
+        result = await clf.classify(packet_info.packet_json)
+
+        # 1 — Update in-memory cache (serves the live /attentional-state endpoint)
+        get_cache().put(session_id, packet_info.packet_seq, result)
+
+        # 2 — Persist to DB (serves /history and future intervention LLM).
+        # Background tasks have no injected DB session, so we open one directly
+        # via the session factory.
+        try:
+            async with async_session_factory() as db:
+                await save_attentional_state(
+                    session_id=session_id,
+                    packet_seq=packet_info.packet_seq,
+                    result=result,
+                    packet_json=packet_info.packet_json,
+                    db=db,
+                )
+                await db.commit()
+        except Exception as db_exc:  # noqa: BLE001
+            log.warning(
+                "[classify] session=%d seq=%d DB write failed: %s",
+                session_id, packet_info.packet_seq, db_exc,
+            )
+
+        log.debug(
+            "[classify] session=%d seq=%d primary=%s conf=%.3f latency=%dms persisted=True",
+            session_id,
+            packet_info.packet_seq,
+            result.primary_state,
+            max(result.focused, result.drifting,
+                result.hyperfocused, result.cognitive_overload),
+            result.latency_ms,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "[classify] session=%d seq=%d failed: %s",
+            session_id,
+            packet_info.packet_seq,
+            exc,
+        )
 
 
 # ── Shared session ownership check ───────────────────────────────────────────
@@ -432,7 +558,7 @@ class StatePacket(BaseModel):
     Structured payload prepared for the future LLM attentional-state classifier.
 
     The LLM will later map these signals to probabilistic state labels
-    (Focused / Drifting / Hyperfocused / Fatigued) and select an
+    (focused / drifting / hyperfocused / cognitive_overload) and select an
     intervention tier.  This endpoint produces the payload only — no LLM
     is invoked here.
     """

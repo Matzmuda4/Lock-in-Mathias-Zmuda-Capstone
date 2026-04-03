@@ -36,6 +36,10 @@ async def init_db() -> None:
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     settings.parsed_cache_dir.mkdir(parents=True, exist_ok=True)
     settings.exports_dir.mkdir(parents=True, exist_ok=True)
+    settings.training_exports_dir.mkdir(parents=True, exist_ok=True)
+    settings.training_data_dir.mkdir(parents=True, exist_ok=True)
+    settings.training_master_dir.mkdir(parents=True, exist_ok=True)
+    (settings.training_master_dir / "baselines").mkdir(parents=True, exist_ok=True)
 
     # Step 1 — TimescaleDB extension (needs DDL outside a transaction block)
     raw_dsn = settings.database_url.replace("postgresql+asyncpg", "postgresql")
@@ -109,12 +113,46 @@ async def init_db() -> None:
                 )
             )
 
-    # Convert to hypertable (idempotent)
+    # Convert session_drift_history to hypertable (idempotent)
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 "SELECT create_hypertable("
                 "  'session_drift_history', 'created_at',"
+                "  if_not_exists => TRUE"
+                ")"
+            )
+        )
+
+    # Convert session_state_packets to hypertable (idempotent)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "SELECT create_hypertable("
+                "  'session_state_packets', 'created_at',"
+                "  if_not_exists => TRUE"
+                ")"
+            )
+        )
+
+    # Step 5 — Add new columns to session_state_packets (idempotent)
+    async with engine.begin() as conn:
+        for col_sql in [
+            "ADD COLUMN IF NOT EXISTS packet_seq INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN IF NOT EXISTS window_start_at TIMESTAMPTZ",
+            "ADD COLUMN IF NOT EXISTS window_end_at TIMESTAMPTZ",
+        ]:
+            await conn.execute(
+                text(f"ALTER TABLE session_state_packets {col_sql}")
+            )
+
+    # Step 6 — session_attentional_states hypertable (RF classifier output)
+    # The table is created by create_all above; convert it to a hypertable here.
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "SELECT create_hypertable("
+                "  'session_attentional_states', 'created_at',"
                 "  if_not_exists => TRUE"
                 ")"
             )

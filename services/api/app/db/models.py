@@ -347,7 +347,114 @@ class SessionDriftHistory(Base):
     pace_ratio: Mapped[Optional[float]] = mapped_column(nullable=True)
 
 
+class SessionStatePacket(Base):
+    """
+    Append-only hypertable storing full state packets every ~10 seconds.
+
+    Each row is a serialised snapshot of the drift pipeline output at one
+    point in time, including window features, z-scores, drift state, and
+    the user's baseline snapshot (self-contained for training).
+
+    TimescaleDB requires the partition column (created_at) in the PK.
+    """
+
+    __tablename__ = "session_state_packets"
+    __table_args__ = (
+        PrimaryKeyConstraint("session_id", "created_at"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Monotonically increasing counter per session (0-indexed).
+    packet_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Bounds of the 30s rolling telemetry window used to produce this packet.
+    window_start_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    window_end_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Full packet JSON: features, z_scores, drift state, debug components,
+    # and embedded baseline_snapshot (self-contained for training).
+    packet_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
 # ─── End Phase 7 ──────────────────────────────────────────────────────────────
+
+
+# ─── Attentional-state classifier output ──────────────────────────────────────
+
+
+class SessionAttentionalState(Base):
+    """
+    Append-only TimescaleDB hypertable — one row per RF classifier invocation.
+
+    Written every ~10 seconds (every full-window packet).  Provides the
+    intervention LLM with a queryable history of attentional states so it can:
+
+      • Detect sustained drift (e.g. 3 consecutive drifting classifications).
+      • Compute session-level state trajectories for post-session analysis.
+      • Build a sliding-window state context for the intervention prompt.
+
+    The intervention_context column stores the full dict produced by
+    ClassificationResult.as_intervention_context(), extended with the
+    concurrent drift state snapshot.  This is the single document the
+    intervention LLM reads — no additional joins required.
+
+    TimescaleDB: (session_id, created_at) composite PK required because
+    the partition column must appear in every unique/primary constraint.
+    """
+
+    __tablename__ = "session_attentional_states"
+    __table_args__ = (
+        PrimaryKeyConstraint("session_id", "created_at"),
+        Index("ix_sas_session_primary", "session_id", "primary_state"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Monotonically increasing packet counter (matches session_state_packets)
+    packet_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # ── Classifier output ───────────────────────────────────────────────────
+    primary_state: Mapped[str] = mapped_column(String(30), nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=0.0)
+
+    # Flat probability columns — indexed so the intervention LLM query layer
+    # can efficiently fetch "last N rows where primary_state = 'drifting'"
+    prob_focused: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    prob_drifting: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    prob_hyperfocused: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    prob_cognitive_overload: Mapped[float] = mapped_column(nullable=False, default=0.0)
+
+    # ── Concurrent drift snapshot ────────────────────────────────────────────
+    # These are the drift model values active at the time of classification.
+    # Stored flat so the intervention LLM can read all context without joins.
+    drift_level: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    drift_ema: Mapped[float] = mapped_column(nullable=False, default=0.0)
+
+    # ── Full intervention context (LLM-ready) ────────────────────────────────
+    # Contains: primary_state, confidence, distribution, ambiguous,
+    #           drift_level, drift_ema, packet_seq, session_id.
+    # The intervention LLM reads exactly this column — no other joins needed.
+    intervention_context: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    parse_ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+# ─── End attentional-state classifier output ──────────────────────────────────
 
 
 class Intervention(Base):

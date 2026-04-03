@@ -2,10 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { useTelemetry } from "../hooks/useTelemetry";
+import { activityService } from "../services/activityService";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { documentService, type Chunk } from "../services/documentService";
 import { sessionService, type Session, type SessionReaderData } from "../services/sessionService";
 import { driftService, driftColor, type DriftState, type DriftDebug } from "../services/driftService";
+import { classificationService, STATE_COLORS, STATE_LABELS, type AttentionalState } from "../services/classificationService";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -390,6 +392,165 @@ function ExportCsvButton({ sessionId, token }: { sessionId: number; token: strin
   );
 }
 
+// ─── Adaptive assistant panel shell (adaptive mode only) ─────────────────────
+
+interface AssistantPanelProps {
+  panelRef: React.RefObject<HTMLDivElement>;
+  open: boolean;
+  onToggle: () => void;
+  onInteract: () => void;
+}
+
+function AssistantPanel({ panelRef, open, onToggle, onInteract }: AssistantPanelProps) {
+  const [interactCount, setInteractCount] = useState(0);
+  const [flash, setFlash] = useState(false);
+
+  const handleInteract = () => {
+    setInteractCount((c) => c + 1);
+    setFlash(true);
+    setTimeout(() => setFlash(false), 400);
+    onInteract();
+  };
+
+  return (
+    <aside
+      id="assistant-panel-root"
+      data-testid="assistant-panel-root"
+      ref={panelRef}
+      className={`assistant-panel${open ? "" : " assistant-panel--collapsed"}`}
+      aria-label="Adaptive assistant panel"
+    >
+      <div className="assistant-panel__header">
+        <span className="assistant-panel__title">
+          {open ? "Assistant" : ""}
+        </span>
+        <button
+          className="assistant-panel__toggle"
+          type="button"
+          aria-label={open ? "Collapse panel" : "Expand panel"}
+          onClick={onToggle}
+        >
+          {open ? "›" : "‹"}
+        </button>
+      </div>
+      {open && (
+        <div className="assistant-panel__body">
+          {/* ── Interaction button ───────────────────────────────────────── */}
+          <div className="panel-section">
+            <p className="panel-section__label">Panel Interaction</p>
+            <p className="panel-section__hint">
+              Press when you are actively engaging with the system — this
+              tells the model that idle time here is intentional, not drift.
+            </p>
+            <button
+              type="button"
+              className={`panel-interact-btn${flash ? " panel-interact-btn--flash" : ""}`}
+              onClick={handleInteract}
+            >
+              ⚡ Interaction
+              {interactCount > 0 && (
+                <span className="panel-interact-btn__count">{interactCount}</span>
+              )}
+            </button>
+          </div>
+
+          {/* ── Placeholder for future interventions ─────────────────────── */}
+          <div className="panel-section panel-section--muted">
+            <p className="assistant-panel__placeholder">
+              Interventions will appear here.
+            </p>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+// ─── Dev-only Export Bundle button ───────────────────────────────────────────
+
+interface ExportBundleResult {
+  folder: string;
+  files: string[];
+  state_packet_count: number;
+  master_append?: {
+    master_jsonl_path: string;
+    appended_packet_count: number;
+    skipped_packet_count: number;
+    baseline_path: string;
+    baseline_ref: string;
+    baseline_embedded_in_packet: boolean;
+  } | null;
+}
+
+function ExportBundleButton({ sessionId, token }: { sessionId: number; token: string | null }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ExportBundleResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleExport = async () => {
+    if (!token) return;
+    setBusy(true);
+    setResult(null);
+    setError(null);
+    try {
+      const resp = await fetch(
+        `${API_BASE_URL}/sessions/${sessionId}/export/bundle?append_to_master=1`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!resp.ok) {
+        const msg = await resp.text();
+        console.error("Export bundle failed:", resp.status, msg);
+        setError(`Export failed (${resp.status})`);
+        return;
+      }
+      const data: ExportBundleResult = await resp.json();
+      setResult(data);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "inline-flex", flexDirection: "column", gap: 4 }}>
+      <button
+        className="btn btn--ghost btn--sm export-btn"
+        type="button"
+        onClick={handleExport}
+        disabled={busy}
+      >
+        {busy ? "Exporting…" : "📦 Export Bundle"}
+      </button>
+      {error && (
+        <div style={{ fontSize: 10, color: "var(--error, #e55)", maxWidth: 260 }}>
+          {error}
+        </div>
+      )}
+      {result && (
+        <div style={{ fontSize: 10, color: "var(--text-muted)", maxWidth: 280, wordBreak: "break-all" }}>
+          <div><strong>Bundle:</strong> {result.folder}</div>
+          <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
+            {result.files.join(", ")}
+          </div>
+          {result.master_append && (
+            <div style={{ marginTop: 4, borderTop: "1px solid var(--border)", paddingTop: 4 }}>
+              <div>
+                <strong>Master JSONL:</strong>{" "}
+                {result.master_append.appended_packet_count} packets appended
+                {result.master_append.skipped_packet_count > 0 &&
+                  ` (${result.master_append.skipped_packet_count} skipped — already present)`}
+              </div>
+              <div style={{ marginTop: 2 }}>{result.master_append.master_jsonl_path}</div>
+              <div style={{ marginTop: 2 }}>
+                <strong>Baseline:</strong> {result.master_append.baseline_path}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Dev-only debug panel ────────────────────────────────────────────────────
 
 import type { TelemetrySanityWarnings } from "../hooks/useTelemetry";
@@ -475,6 +636,73 @@ function DriftMeter({
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ─── Attentional state meter ──────────────────────────────────────────────────
+
+/**
+ * Displays the RF classifier's 4-state probability distribution beside the
+ * drift meter in the top bar.
+ *
+ * Shows a compact bar for each state scaled to the probability [0,1].
+ * The primary state label is highlighted.  A spinner is shown while the
+ * first full-window packet has not yet been classified (< ~30 s).
+ */
+function AttentionalStateMeter({
+  state,
+}: {
+  state: AttentionalState | null;
+}) {
+  if (!state) {
+    return (
+      <div className="attn-meter attn-meter--pending" title="Waiting for first full-window classification (~30s)">
+        <span className="attn-meter__label">State</span>
+        <span className="attn-meter__waiting">…</span>
+      </div>
+    );
+  }
+
+  const { distribution, primary_state, confidence } = state;
+  const entries = Object.entries(distribution) as [string, number][];
+
+  return (
+    <div
+      className="attn-meter"
+      title={`Primary: ${STATE_LABELS[primary_state]} (${(confidence * 100).toFixed(0)}%)\n${state.rationale}`}
+    >
+      <span className="attn-meter__label">State</span>
+      <div className="attn-meter__bars">
+        {entries.map(([stateKey, prob]) => (
+          <div
+            key={stateKey}
+            className={`attn-meter__bar${stateKey === primary_state ? " attn-meter__bar--primary" : ""}`}
+            title={`${STATE_LABELS[stateKey]}: ${(prob * 100).toFixed(1)}%`}
+          >
+            <div
+              className="attn-meter__bar-fill"
+              style={{
+                height: `${Math.max(3, prob * 28)}px`,
+                background: STATE_COLORS[stateKey],
+                opacity: stateKey === primary_state ? 1 : 0.45,
+              }}
+            />
+            <span
+              className="attn-meter__bar-label"
+              style={{ color: stateKey === primary_state ? STATE_COLORS[stateKey] : undefined }}
+            >
+              {STATE_LABELS[stateKey].slice(0, 3)}
+            </span>
+          </div>
+        ))}
+      </div>
+      <span
+        className="attn-meter__primary"
+        style={{ color: STATE_COLORS[primary_state] }}
+      >
+        {STATE_LABELS[primary_state]}
+      </span>
     </div>
   );
 }
@@ -594,6 +822,9 @@ export function ReaderPage() {
   // Drift state — polled every 3 s while active
   const [driftState, setDriftState] = useState<DriftState | null>(null);
 
+  // Attentional state — polled every 10 s (matches classifier cadence)
+  const [attentionalState, setAttentionalState] = useState<AttentionalState | null>(null);
+
   const timerDisplay = useElapsedTimer(data?.session ?? null);
   // Raw seconds for calibration finish-condition logic
   const [timerSeconds, setTimerSeconds] = useState(0);
@@ -615,14 +846,33 @@ export function ReaderPage() {
 
   // Ref for the scrollable content area — passed to useTelemetry
   const contentRef = useRef<HTMLDivElement>(null);
+  // Ref for the adaptive assistant panel — panel zone detection
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Adaptive panel state (only meaningful in adaptive mode)
+  const isAdaptive = data?.session?.mode === "adaptive";
+  const [panelOpen, setPanelOpen] = useState(true);
 
   // Telemetry — active only while the session is in "active" status
   const isActive = data?.session?.status === "active";
+  const isPaused = data?.session?.status === "paused";
+
+  // Panel interaction handler — fires a named event so the drift model
+  // can recognise that idle time during panel engagement is intentional.
+  const handlePanelInteract = useCallback(() => {
+    if (!token || !isActive) return;
+    activityService.postEvent(token, sessionId, "panel_interaction", {
+      panel_open: panelOpen,
+    });
+  }, [token, sessionId, isActive, panelOpen]);
   const { lastBatch, collecting, warnings } = useTelemetry({
     sessionId,
     token,
     active: isActive,
     containerRef: contentRef,
+    sessionPaused: isPaused,
+    panelContainerRef: isAdaptive ? panelRef : undefined,
+    panelOpen: isAdaptive ? panelOpen : false,
   });
 
   useEffect(() => {
@@ -646,6 +896,24 @@ export function ReaderPage() {
     poll();
     const id = setInterval(poll, 3000);
     return () => clearInterval(id);
+  }, [token, sessionId, isActive]);
+
+  // Poll attentional-state classification every 10 s (RF classifier cadence).
+  // Returns null for the first ~30 s (window not full yet) — shown as "…" in the meter.
+  useEffect(() => {
+    if (!token || !isActive) return;
+    const poll = async () => {
+      try {
+        const result = await classificationService.getAttentionalState(token, sessionId);
+        if (result) setAttentionalState(result);
+      } catch {
+        // Unexpected errors are silently swallowed — classification is non-critical
+      }
+    };
+    // Delay initial poll by 30 s — no point polling before the first full window
+    const initialDelay = setTimeout(poll, 30_000);
+    const id = setInterval(poll, 10_000);
+    return () => { clearTimeout(initialDelay); clearInterval(id); };
   }, [token, sessionId, isActive]);
 
   const loadMore = useCallback(async () => {
@@ -769,6 +1037,9 @@ export function ReaderPage() {
         <div className="reader-bar__right">
           <span className="reader-bar__timer">{timerDisplay}</span>
           <DriftMeter drift={driftState} showConfidence={DEV} />
+          {!isCalibration && (
+            <AttentionalStateMeter state={attentionalState} />
+          )}
           {DEV && (
             <span className={`telemetry-badge${collecting ? " telemetry-badge--on" : ""}`}>
               ⊙ Telemetry: {collecting ? "ON" : "OFF"}
@@ -789,44 +1060,63 @@ export function ReaderPage() {
         </div>
       </header>
 
-      {/* Content */}
-      <main className="reader-content" ref={contentRef}>
-        {isParsing && (
-          <div className="reader-notice">
-            <span className="spinner" />
-            <span>Document is still being parsed… check back in a moment.</span>
-          </div>
-        )}
-        {parseFailed && (
-          <div className="reader-notice reader-notice--error">
-            Parse failed. Go back to the dashboard to retry.
-          </div>
-        )}
-        {!isParsing && !parseFailed && chunks.length === 0 && (
-          <div className="reader-notice">No content was extracted from this document.</div>
-        )}
+      {/* Main content area + adaptive panel (side-by-side) */}
+      <div
+        id="reader-root"
+        data-testid="reader-root"
+        className={`reader-body${isAdaptive ? " reader-body--adaptive" : ""}`}
+      >
+        <main className="reader-content" ref={contentRef}>
+          {isParsing && (
+            <div className="reader-notice">
+              <span className="spinner" />
+              <span>Document is still being parsed… check back in a moment.</span>
+            </div>
+          )}
+          {parseFailed && (
+            <div className="reader-notice reader-notice--error">
+              Parse failed. Go back to the dashboard to retry.
+            </div>
+          )}
+          {!isParsing && !parseFailed && chunks.length === 0 && (
+            <div className="reader-notice">No content was extracted from this document.</div>
+          )}
 
-        {chunks.map((chunk, idx) => (
-          <ChunkCard
-            key={chunk.id}
-            chunk={chunk}
-            chunkIndex={idx}
-            docId={document_id}
-            token={token}
+          {chunks.map((chunk, idx) => (
+            <ChunkCard
+              key={chunk.id}
+              chunk={chunk}
+              chunkIndex={idx}
+              docId={document_id}
+              token={token}
+            />
+          ))}
+
+          {!allLoaded && !isParsing && (
+            <button className="btn btn--ghost btn--load-more" onClick={loadMore} disabled={loadingMore} type="button">
+              {loadingMore ? <span className="spinner" /> : "Load more"}
+            </button>
+          )}
+
+          {/* Export CSV — always visible in calibration, dev-only otherwise */}
+          {(isCalibration || DEV) && (
+            <ExportCsvButton sessionId={sessionId} token={token} />
+          )}
+
+          {/* Export Bundle (training data) — dev only */}
+          {DEV && <ExportBundleButton sessionId={sessionId} token={token} />}
+        </main>
+
+        {/* Adaptive assistant panel — mounted whenever mode=adaptive, never for baseline/calibration */}
+        {isAdaptive && (
+          <AssistantPanel
+            panelRef={panelRef}
+            open={panelOpen}
+            onToggle={() => setPanelOpen((o) => !o)}
+            onInteract={handlePanelInteract}
           />
-        ))}
-
-        {!allLoaded && !isParsing && (
-          <button className="btn btn--ghost btn--load-more" onClick={loadMore} disabled={loadingMore} type="button">
-            {loadingMore ? <span className="spinner" /> : "Load more"}
-          </button>
         )}
-
-        {/* Export CSV — always visible in calibration, dev-only otherwise */}
-        {(isCalibration || DEV) && (
-          <ExportCsvButton sessionId={sessionId} token={token} />
-        )}
-      </main>
+      </div>
 
       {/* Dev debug panels */}
       {DEV && <DebugPanel batch={lastBatch} warnings={warnings} />}
@@ -835,6 +1125,136 @@ export function ReaderPage() {
       <style>{`
         /* ── Layout ── */
         .reader { display:flex; flex-direction:column; min-height:100vh; }
+
+        /* reader-body is the flex row containing main content + optional panel */
+        .reader-body { display:flex; flex:1; overflow:hidden; }
+        .reader-body--adaptive .reader-content {
+          flex: 1;
+          min-width: 0;
+          max-width: none;
+          margin: 0;
+        }
+
+        /* ── Adaptive assistant panel ── */
+        .assistant-panel {
+          width: 400px;
+          min-width: 400px;
+          background: var(--bg-surface);
+          border-left: 1px solid var(--border);
+          display: flex;
+          flex-direction: column;
+          transition: width 0.2s ease, min-width 0.2s ease;
+          overflow: hidden;
+          flex-shrink: 0;
+        }
+        .assistant-panel--collapsed {
+          width: 44px;
+          min-width: 44px;
+        }
+        .assistant-panel__header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 10px 12px;
+          border-bottom: 1px solid var(--border);
+          gap: 8px;
+          min-height: 44px;
+        }
+        .assistant-panel__title {
+          font-size: 12px;
+          font-weight: 600;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          flex: 1;
+        }
+        .assistant-panel__toggle {
+          background: none;
+          border: 1px solid var(--border);
+          border-radius: 4px;
+          color: var(--text-muted);
+          cursor: pointer;
+          font-size: 14px;
+          line-height: 1;
+          padding: 2px 6px;
+          flex-shrink: 0;
+        }
+        .assistant-panel__toggle:hover { color: var(--text); border-color: var(--text-muted); }
+        .assistant-panel__body {
+          flex: 1;
+          padding: 16px 12px;
+          overflow-y: auto;
+        }
+        .assistant-panel__placeholder {
+          font-size: 12px;
+          color: var(--text-muted);
+          font-style: italic;
+          margin: 0;
+          text-align: center;
+          padding-top: 24px;
+        }
+        .panel-section {
+          margin-bottom: 20px;
+        }
+        .panel-section--muted {
+          opacity: 0.6;
+        }
+        .panel-section__label {
+          font-size: 11px;
+          font-weight: 700;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          margin: 0 0 6px;
+        }
+        .panel-section__hint {
+          font-size: 12px;
+          color: var(--text-muted);
+          line-height: 1.5;
+          margin: 0 0 12px;
+        }
+        .panel-interact-btn {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          width: 100%;
+          padding: 10px 14px;
+          background: var(--bg);
+          border: 1.5px solid var(--border);
+          border-radius: 8px;
+          color: var(--text);
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.15s, border-color 0.15s, transform 0.1s;
+          justify-content: center;
+        }
+        .panel-interact-btn:hover {
+          background: var(--bg-hover, rgba(0,0,0,0.04));
+          border-color: var(--accent, #4f6ef7);
+        }
+        .panel-interact-btn:active {
+          transform: scale(0.97);
+        }
+        .panel-interact-btn--flash {
+          background: var(--accent-subtle, rgba(79,110,247,0.12));
+          border-color: var(--accent, #4f6ef7);
+        }
+        .panel-interact-btn__count {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          background: var(--accent, #4f6ef7);
+          color: #fff;
+          font-size: 11px;
+          font-weight: 700;
+          border-radius: 20px;
+          padding: 1px 7px;
+          min-width: 20px;
+        }
 
         .reader-bar {
           background: var(--bg-surface);
@@ -883,6 +1303,62 @@ export function ReaderPage() {
         .drift-meter__conf { font-size:10px; color:var(--text-muted); }
         .drift-meter__baseline { font-size:10px; color:#22c55e; margin-left:4px; }
 
+        /* ── Attentional state meter ── */
+        .attn-meter {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          border-left: 1px solid var(--border);
+          padding-left: 10px;
+          margin-left: 4px;
+        }
+        .attn-meter__label {
+          color: var(--text-muted);
+          font-size: 11px;
+          white-space: nowrap;
+        }
+        .attn-meter--pending .attn-meter__waiting {
+          color: var(--text-muted);
+          font-size: 13px;
+          letter-spacing: 0.1em;
+        }
+        .attn-meter__bars {
+          display: flex;
+          align-items: flex-end;
+          gap: 3px;
+          height: 32px;
+        }
+        .attn-meter__bar {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 2px;
+          width: 20px;
+          cursor: default;
+        }
+        .attn-meter__bar-fill {
+          width: 100%;
+          border-radius: 2px 2px 0 0;
+          transition: height 0.4s ease;
+          min-height: 3px;
+        }
+        .attn-meter__bar-label {
+          font-size: 9px;
+          color: var(--text-muted);
+          font-family: var(--font-mono, monospace);
+          letter-spacing: 0;
+        }
+        .attn-meter__bar--primary .attn-meter__bar-label {
+          font-weight: 700;
+        }
+        .attn-meter__primary {
+          font-size: 11px;
+          font-weight: 700;
+          white-space: nowrap;
+          font-family: var(--font-mono, monospace);
+        }
+
         /* ── Telemetry indicator (dev-only) ── */
         .telemetry-badge {
           font-size:11px;
@@ -905,7 +1381,6 @@ export function ReaderPage() {
 
         /* ── Content column ── */
         .reader-content {
-          max-width: 90ch;
           width: 100%;
           margin: 0 auto;
           padding: 48px 24px 100px;
@@ -914,15 +1389,30 @@ export function ReaderPage() {
         }
 
         /* ── Chunk base ── */
-        .chunk { margin-bottom: 28px; }
+        /* Chunk wrapper — constrain ALL content (headings, paragraphs, figures)
+           to the same 85ch column. font-size:19px ensures ch is calculated at
+           the reading font size, matching calibration and adaptive mode exactly. */
+        .chunk {
+          margin-bottom: 28px;
+          max-width: 85ch;
+          font-size: 19px;
+          margin-left: auto;
+          margin-right: auto;
+        }
 
-        /* Text — larger, more readable */
+        /* Adaptive mode: left-align the chunk block flush against the panel */
+        .reader-body--adaptive .chunk {
+          margin-left: 0;
+          margin-right: 0;
+        }
+
+        /* Text */
         .chunk__p {
-          font-size: 18px;
+          font-size: 19px;
           line-height: 1.75;
           color: var(--text);
           margin: 0;
-          max-width: 75ch;
+          max-width: 100%;
         }
 
         /* Headings */

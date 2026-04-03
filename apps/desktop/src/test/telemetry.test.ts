@@ -12,6 +12,8 @@ import {
   findCurrentParagraphFromDOM,
   type Point,
   type IntersectionEntry,
+  type UiContext,
+  type InteractionZone,
 } from "../hooks/useTelemetry";
 
 // ─── Signed scroll sum helpers (inline, mirrors hook accumulator logic) ────────
@@ -405,5 +407,91 @@ describe("normalizedScrollVelocity", () => {
   it("proportional to scroll delta", () => {
     const vh = 800;
     expect(normalizedScrollVelocity(200, vh)).toBeCloseTo(2 * normalizedScrollVelocity(100, vh));
+  });
+});
+
+// ─── Phase 8: ui_context computation logic ────────────────────────────────────
+
+/**
+ * Mirror of the ui_context logic in useTelemetry flush().
+ * This is a pure helper extracted for testing.
+ */
+function computeUiContext(opts: {
+  sessionPaused: boolean;
+  panelInteractedInWindow: boolean;
+  panelOpen: boolean;
+}): UiContext {
+  if (opts.sessionPaused) return "USER_PAUSED";
+  if (opts.panelInteractedInWindow) return "PANEL_INTERACTING";
+  if (opts.panelOpen) return "PANEL_OPEN";
+  return "READ_MAIN";
+}
+
+describe("ui_context computation", () => {
+  it("defaults to READ_MAIN when session active and no panel", () => {
+    const ctx = computeUiContext({ sessionPaused: false, panelInteractedInWindow: false, panelOpen: false });
+    expect(ctx).toBe("READ_MAIN");
+  });
+
+  it("returns USER_PAUSED when session paused (regardless of panel state)", () => {
+    const ctx = computeUiContext({ sessionPaused: true, panelInteractedInWindow: true, panelOpen: true });
+    expect(ctx).toBe("USER_PAUSED");
+  });
+
+  it("returns PANEL_INTERACTING when user interacted in panel this window", () => {
+    const ctx = computeUiContext({ sessionPaused: false, panelInteractedInWindow: true, panelOpen: true });
+    expect(ctx).toBe("PANEL_INTERACTING");
+  });
+
+  it("returns PANEL_OPEN when panel is visible but no interaction this window", () => {
+    const ctx = computeUiContext({ sessionPaused: false, panelInteractedInWindow: false, panelOpen: true });
+    expect(ctx).toBe("PANEL_OPEN");
+  });
+
+  it("PANEL_INTERACTING takes priority over PANEL_OPEN", () => {
+    const ctx = computeUiContext({ sessionPaused: false, panelInteractedInWindow: true, panelOpen: true });
+    expect(ctx).toBe("PANEL_INTERACTING");
+  });
+
+  it("USER_PAUSED takes priority over everything", () => {
+    // Paused + panel open + interaction = still USER_PAUSED
+    const ctx = computeUiContext({ sessionPaused: true, panelInteractedInWindow: true, panelOpen: false });
+    expect(ctx).toBe("USER_PAUSED");
+  });
+});
+
+// ─── Phase 8: interaction_zone defaults ──────────────────────────────────────
+
+describe("interaction_zone type guard", () => {
+  it("reader is a valid InteractionZone", () => {
+    const zone: InteractionZone = "reader";
+    expect(zone).toBe("reader");
+  });
+
+  it("panel is a valid InteractionZone", () => {
+    const zone: InteractionZone = "panel";
+    expect(zone).toBe("panel");
+  });
+
+  it("other is a valid InteractionZone", () => {
+    const zone: InteractionZone = "other";
+    expect(zone).toBe("other");
+  });
+});
+
+// ─── Phase 8: ui_context type values ─────────────────────────────────────────
+
+describe("UiContext type values", () => {
+  const valid: UiContext[] = ["READ_MAIN", "PANEL_OPEN", "PANEL_INTERACTING", "USER_PAUSED"];
+
+  it("has exactly 4 valid values", () => {
+    expect(valid).toHaveLength(4);
+  });
+
+  it("baseline sessions use READ_MAIN when no panel", () => {
+    // Simulate baseline session: no panel, not paused
+    const ctx = computeUiContext({ sessionPaused: false, panelInteractedInWindow: false, panelOpen: false });
+    expect(ctx).toBe("READ_MAIN");
+    expect(valid).toContain(ctx);
   });
 });

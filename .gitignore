@@ -58,5 +58,18 @@ pdfs/
 # ── Training artifacts ────────────────────────────────────────────────────────
 training/checkpoints/
 training/data/raw/
+training/data/
+training/exports/
+training/Labelled/
+training/adapters/
 *.safetensors
 *.bin
+*.zip
+
+# ── Master training data (generated, never committed) ─────────────────────────
+# Keep README.md tracked; ignore all generated data files.
+TrainingData/unlabelled.jsonl
+TrainingData/baselines/
+TrainingData/_append_index.json
+TrainingData/.append.lock
+TrainingData/labelled.jsonl
