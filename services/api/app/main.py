@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import activity, auth, calibration, classification, documents, drift, exports, parsing, sessions, training_export
+from app.routers import activity, auth, calibration, classification, documents, drift, exports, interventions, parsing, sessions, training_export
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +105,7 @@ app.include_router(drift.router)
 app.include_router(exports.router)
 app.include_router(training_export.router)
 app.include_router(classification.router)
+app.include_router(interventions.router)
 
 
 @app.get("/health", tags=["meta"])

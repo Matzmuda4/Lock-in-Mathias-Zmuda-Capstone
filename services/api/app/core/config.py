@@ -39,9 +39,13 @@ class Settings(BaseSettings):
     classify_use_rf: bool = True
     rf_model_path: Path = _REPO_ROOT / "rf_classifier_v2.pkl"
 
-    # Legacy Ollama settings — retained for the intervention LLM (future work)
+    # Ollama — shared base URL for classifier (legacy) and intervention LLM
     ollama_url: str = "http://localhost:11434"
     ollama_classifier_model: str = "lock-in-classifier"
+
+    # Intervention LLM
+    intervention_model: str = "lockin-intervention"
+    intervention_cooldown_seconds: int = 90
 
     # File storage — relative to wherever the API process runs
     upload_dir: Path = Path("uploads")
