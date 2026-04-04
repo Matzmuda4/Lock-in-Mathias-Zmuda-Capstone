@@ -2,20 +2,52 @@
 intervention/engine.py
 ──────────────────────
 Calls the locally-running ``lockin-intervention`` Ollama model, parses its
-JSON response, and enforces session-level cooldowns.
+JSON response, and tracks per-session active intervention state.
 
 Single Responsibility:
-  This module owns ONLY Ollama I/O + response parsing + cooldown state.
+  This module owns ONLY Ollama I/O + response parsing + active state tracking.
   Prompt construction lives in prompt.py.
   DB writes + session ownership checks live in the router.
 
-Cooldown design:
-  An in-process dict maps session_id → last_fired_at (UTC datetime).
-  The router decides whether the cooldown is "clear" or "cooling" and passes
-  that status INTO the prompt so the LLM is aware.  The engine independently
-  enforces the cooldown for actual DB writes (i.e. it will return
-  intervene=True payloads even during cooldown so the frontend can pre-cache
-  the content, but the router only logs/fires when cooldown is truly clear).
+Active intervention model (agreed design):
+  ─────────────────────────────────────────
+  Intervention types are divided into five categories:
+
+  PASSIVE          gamification, ambient_sound
+                   → Fire freely; no slot constraint; run in the background.
+
+  INSTANT          chime
+                   → Fires and is immediately done; no UI slot consumed;
+                     subject only to the minimum 60-second gap.
+
+  TEXT_PROMPT      re_engagement, focus_point, section_summary,
+                   comprehension_check
+                   → Visible text cards on screen; max 2 simultaneously.
+
+  NON_TEXT_ACTIVE  text_reformat
+                   → Modifies the page visually; counts toward the 3-slot
+                     foreground cap but not toward the text-prompt cap.
+
+  NUCLEAR          break_suggestion
+                   → Auto-pauses the session; while active, nothing else fires.
+                     After the user resumes, a 5-minute post-break cooldown
+                     prevents any further fires.
+
+  Slot rules (applied in this order):
+    1. If break_suggestion is active → nothing fires (except it can be
+       acknowledged to end the break).
+    2. If type == break_suggestion AND time since last break_resume < 5 min
+       → cannot fire.
+    3. PASSIVE types fire freely (no slot check).
+    4. INSTANT types fire if minimum gap (60 s) has passed.
+    5. If this type is already active → skip (no duplicate types).
+    6. TEXT_PROMPT types: text_active < 2 AND foreground_active < 3.
+    7. NON_TEXT_ACTIVE / NUCLEAR: foreground_active < 3.
+    8. Minimum gap: time since last fire >= 60 s.
+
+  Auto-dismiss: text prompts that have been on screen unacknowledged for
+  > 60 s are silently removed before each gate check so they do not block
+  new interventions permanently.
 """
 
 from __future__ import annotations
@@ -29,28 +61,55 @@ from typing import Any
 
 import httpx
 
-from app.services.intervention.prompt import COOLDOWN_SECONDS
-
 log = logging.getLogger(__name__)
 
-# ── Response types ────────────────────────────────────────────────────────────
+# ── Intervention categories ───────────────────────────────────────────────────
 
-VALID_TYPES: frozenset[str] = frozenset({
+PASSIVE_TYPES: frozenset[str] = frozenset({
+    "gamification",
+    "ambient_sound",
+})
+
+INSTANT_TYPES: frozenset[str] = frozenset({
+    "chime",
+})
+
+TEXT_PROMPT_TYPES: frozenset[str] = frozenset({
     "re_engagement",
     "focus_point",
     "section_summary",
     "comprehension_check",
-    "break_suggestion",
-    "gamification",
-    "chime",
-    "ambient_sound",
+})
+
+NON_TEXT_ACTIVE_TYPES: frozenset[str] = frozenset({
     "text_reformat",
 })
+
+NUCLEAR_TYPES: frozenset[str] = frozenset({
+    "break_suggestion",
+})
+
+# All valid types (union of all categories)
+VALID_TYPES: frozenset[str] = (
+    PASSIVE_TYPES | INSTANT_TYPES | TEXT_PROMPT_TYPES |
+    NON_TEXT_ACTIVE_TYPES | NUCLEAR_TYPES
+)
 
 VALID_TIERS: frozenset[str] = frozenset({
     "none", "subtle", "moderate", "strong", "special",
 })
 
+# Slot limits
+MAX_TEXT_PROMPTS:      int = 2
+MAX_FOREGROUND_ACTIVE: int = 3
+
+# Default timing constants (overridden by config)
+DEFAULT_MIN_GAP_SECONDS:          int = 60
+DEFAULT_BREAK_COOLDOWN_SECONDS:   int = 300  # 5 minutes post-break
+DEFAULT_AUTO_DISMISS_SECONDS:     int = 60   # unacknowledged text prompt TTL
+
+
+# ── Response types ────────────────────────────────────────────────────────────
 
 @dataclass
 class InterventionResult:
@@ -58,13 +117,13 @@ class InterventionResult:
     Parsed output from one intervention LLM call.
 
     ``intervene`` is the LLM's recommendation.  The router layer makes the
-    final fire/skip decision based on cooldown and session state.
+    final fire/skip decision based on the active-intervention gate.
     """
     intervene:  bool
     tier:       str
     type:       str | None          # None when tier=="none"
     content:    dict[str, Any] | None
-    raw_json:   str                 # original model output string
+    raw_json:   str
     latency_ms: int
     parse_ok:   bool = True
 
@@ -73,20 +132,9 @@ class InterventionResult:
         return self.intervene and self.type is not None and self.content is not None
 
 
-@dataclass
-class _FallbackResult:
-    """Sentinel used when parsing fails — not exported."""
-    pass
-
-
 _PARSE_FALLBACK = InterventionResult(
-    intervene=False,
-    tier="none",
-    type=None,
-    content=None,
-    raw_json="",
-    latency_ms=0,
-    parse_ok=False,
+    intervene=False, tier="none", type=None,
+    content=None, raw_json="", latency_ms=0, parse_ok=False,
 )
 
 
@@ -94,8 +142,7 @@ def _parse_response(raw: str, latency_ms: int) -> InterventionResult:
     """
     Parse the LLM's single-line JSON output into an InterventionResult.
 
-    Tolerates leading/trailing whitespace and stops at the first complete
-    JSON object (handles any stray trailing tokens).
+    Tolerates leading/trailing whitespace and stray trailing tokens.
     """
     raw = raw.strip()
     start = raw.find("{")
@@ -115,19 +162,16 @@ def _parse_response(raw: str, latency_ms: int) -> InterventionResult:
     itype     = obj.get("type")
     content   = obj.get("content")
 
-    # Normalise tier
     if tier not in VALID_TIERS:
         log.warning("[intervention_engine] Unknown tier %r — treating as 'none'", tier)
         tier = "none"
 
-    # Normalise type
     if itype is not None:
         itype = str(itype).lower()
         if itype not in VALID_TYPES:
             log.warning("[intervention_engine] Unknown intervention type %r", itype)
             itype = None
 
-    # If tier is none, force intervene=False and content=None
     if tier == "none":
         intervene = False
         content   = None
@@ -144,77 +188,274 @@ def _parse_response(raw: str, latency_ms: int) -> InterventionResult:
     )
 
 
-# ── Cooldown tracker ──────────────────────────────────────────────────────────
+# ── Active intervention tracker ───────────────────────────────────────────────
 
-class CooldownTracker:
+@dataclass
+class ActiveIntervention:
+    """Represents a single intervention that is currently shown to the user."""
+    intervention_id: int
+    itype:           str
+    tier:            str
+    fired_at:        datetime
+
+
+@dataclass
+class FireDecision:
     """
-    In-process, per-session cooldown state.
+    Result of the gate check for a proposed intervention type.
 
-    Designed as a singleton (see module-level ``_cooldown_tracker``).
-    Thread-safe enough for asyncio single-thread use; no locking needed.
+    ``allowed``  — whether the type may fire right now.
+    ``reason``   — human-readable gate outcome:
+                     "clear"                  → allowed
+                     "type_already_active"    → same type on screen
+                     "text_slots_full"        → 2 text prompts already active
+                     "all_slots_full"         → 3 foreground items already active
+                     "min_gap"                → fired too recently (< 60 s ago)
+                     "break_active"           → break running; nothing fires
+                     "post_break_cooldown"    → within 5-min post-break window
+    """
+    allowed: bool
+    reason:  str
+
+    @property
+    def cooldown_status(self) -> str:
+        """'clear' or 'cooling' — matches the LLM training data vocabulary."""
+        return "clear" if self.allowed else "cooling"
+
+
+class ActiveInterventionTracker:
+    """
+    In-process, per-session intervention state machine.
+
+    Tracks what is currently active on screen so the gate can enforce:
+      • No duplicate types
+      • Max 2 text prompts simultaneously
+      • Max 3 foreground interventions simultaneously
+      • Break-suggestion exclusivity + 5-min post-break cooldown
+      • 60-second minimum gap between fires (safety floor)
+      • Auto-dismiss stale text prompts after 60 s (unacknowledged TTL)
+
+    Designed as a module-level singleton; asyncio single-thread safe.
     """
 
-    def __init__(self, cooldown_seconds: int = COOLDOWN_SECONDS) -> None:
-        self._cooldown_seconds = cooldown_seconds
+    def __init__(
+        self,
+        min_gap_seconds:        int = DEFAULT_MIN_GAP_SECONDS,
+        break_cooldown_seconds: int = DEFAULT_BREAK_COOLDOWN_SECONDS,
+        auto_dismiss_seconds:   int = DEFAULT_AUTO_DISMISS_SECONDS,
+    ) -> None:
+        self._min_gap        = min_gap_seconds
+        self._break_cooldown = break_cooldown_seconds
+        self._auto_dismiss   = auto_dismiss_seconds
+
+        # session_id → {itype: ActiveIntervention}
+        self._active: dict[int, dict[str, ActiveIntervention]] = {}
+        # session_id → UTC datetime of last fire (any type)
         self._last_fired: dict[int, datetime] = {}
+        # session_id → UTC datetime when the user resumed after a break
+        self._break_resume: dict[int, datetime] = {}
 
-    def status(self, session_id: int) -> str:
-        """Return 'clear' or 'cooling' for the given session."""
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _auto_dismiss_stale(self, session_id: int) -> None:
+        """
+        Remove TEXT_PROMPT interventions that have been unacknowledged for
+        longer than ``auto_dismiss_seconds``.  Called before every gate check.
+        """
+        active = self._active.get(session_id)
+        if not active:
+            return
+        now     = self._now()
+        expired = [
+            itype for itype, ai in active.items()
+            if itype in TEXT_PROMPT_TYPES
+            and (now - ai.fired_at).total_seconds() > self._auto_dismiss
+        ]
+        for itype in expired:
+            del active[itype]
+            log.info(
+                "[tracker] AUTO-DISMISSED session=%d type=%s (unacknowledged > %ds)",
+                session_id, itype, self._auto_dismiss,
+            )
+
+    def _foreground_active(self, session_id: int) -> dict[str, ActiveIntervention]:
+        """Non-passive active interventions for this session."""
+        return {
+            t: ai for t, ai in self._active.get(session_id, {}).items()
+            if t not in PASSIVE_TYPES
+        }
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def check(self, session_id: int, itype: str) -> FireDecision:
+        """
+        Gate check — returns a FireDecision describing whether ``itype``
+        may fire right now and the reason if not.
+        """
+        self._auto_dismiss_stale(session_id)
+        now = self._now()
+
+        # 1. Break active → nothing fires (break must be acknowledged first)
+        if "break_suggestion" in self._active.get(session_id, {}):
+            return FireDecision(False, "break_active")
+
+        # 2. Post-break cooldown for break_suggestion itself
+        if itype in NUCLEAR_TYPES:
+            resume = self._break_resume.get(session_id)
+            if resume is not None:
+                elapsed = (now - resume).total_seconds()
+                if elapsed < self._break_cooldown:
+                    return FireDecision(False, "post_break_cooldown")
+
+        # 3. Passive types — fire freely, no further checks
+        if itype in PASSIVE_TYPES:
+            return FireDecision(True, "clear")
+
+        # 4. Minimum gap floor (applies to instant, text, non-text, nuclear)
         last = self._last_fired.get(session_id)
-        if last is None:
-            return "clear"
-        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-        return "clear" if elapsed >= self._cooldown_seconds else "cooling"
+        if last is not None and (now - last).total_seconds() < self._min_gap:
+            return FireDecision(False, "min_gap")
+
+        # 5. Instant types — only subject to min gap (no slot consumed)
+        if itype in INSTANT_TYPES:
+            return FireDecision(True, "clear")
+
+        # 6. No duplicate types
+        if itype in self._active.get(session_id, {}):
+            return FireDecision(False, "type_already_active")
+
+        foreground = self._foreground_active(session_id)
+
+        # 7. Text-prompt cap
+        if itype in TEXT_PROMPT_TYPES:
+            text_count = sum(1 for t in foreground if t in TEXT_PROMPT_TYPES)
+            if text_count >= MAX_TEXT_PROMPTS:
+                return FireDecision(False, "text_slots_full")
+
+        # 8. Total foreground cap
+        if len(foreground) >= MAX_FOREGROUND_ACTIVE:
+            return FireDecision(False, "all_slots_full")
+
+        return FireDecision(True, "clear")
+
+    def mark_fired(
+        self,
+        session_id:      int,
+        intervention_id: int,
+        itype:           str,
+        tier:            str,
+    ) -> None:
+        """
+        Record that ``itype`` was just fired.
+
+        PASSIVE types go into their own registry but are never subject to
+        slot eviction.  INSTANT types update the last_fired clock only.
+        All other types occupy a foreground slot.
+        """
+        now = self._now()
+        self._last_fired[session_id] = now
+
+        if itype not in INSTANT_TYPES:
+            if session_id not in self._active:
+                self._active[session_id] = {}
+            self._active[session_id][itype] = ActiveIntervention(
+                intervention_id = intervention_id,
+                itype           = itype,
+                tier            = tier,
+                fired_at        = now,
+            )
+
+    def acknowledge(self, session_id: int, itype: str) -> None:
+        """
+        User has dismissed/acknowledged intervention of type ``itype``.
+
+        For break_suggestion, records the resume timestamp which starts the
+        5-minute post-break cooldown.
+        """
+        active = self._active.get(session_id, {})
+        if itype in active:
+            del active[itype]
+            if itype in NUCLEAR_TYPES:
+                self._break_resume[session_id] = self._now()
+            log.info(
+                "[tracker] ACKNOWLEDGED session=%d type=%s", session_id, itype,
+            )
+
+    def active_for_session(self, session_id: int) -> list[ActiveIntervention]:
+        """
+        Return currently active interventions (auto-dismisses stale text prompts
+        first).  Passive + foreground types are included.
+        """
+        self._auto_dismiss_stale(session_id)
+        return list(self._active.get(session_id, {}).values())
 
     def seconds_since_last(self, session_id: int) -> int | None:
-        """Seconds since the last fired intervention, or None if never fired."""
+        """Seconds since the last fired intervention (any type), or None."""
         last = self._last_fired.get(session_id)
         if last is None:
             return None
-        return int((datetime.now(timezone.utc) - last).total_seconds())
+        return int((self._now() - last).total_seconds())
 
-    def mark_fired(self, session_id: int) -> None:
-        """Record that an intervention was just fired for this session."""
-        self._last_fired[session_id] = datetime.now(timezone.utc)
+    def status(self, session_id: int) -> str:
+        """
+        Simplified 'clear'/'cooling' signal for the LLM prompt.
+
+        Computed using a representative text-prompt type so it reflects
+        the most common foreground gate.
+        """
+        return self.check(session_id, "re_engagement").cooldown_status
 
     def reset(self, session_id: int) -> None:
-        """Clear cooldown state for a session (e.g. on session end)."""
+        """Wipe all state for this session (call on session end)."""
+        self._active.pop(session_id, None)
         self._last_fired.pop(session_id, None)
+        self._break_resume.pop(session_id, None)
 
 
-# Module-level singleton — shared across all request handlers
-# Cooldown seconds are read from config on first access.
-_cooldown_tracker: CooldownTracker | None = None
+# Module-level singleton — lazily initialised from config on first access
+_tracker: ActiveInterventionTracker | None = None
 
 
-def get_cooldown_tracker() -> CooldownTracker:
-    """Dependency accessor; also enables easy test injection."""
-    global _cooldown_tracker
-    if _cooldown_tracker is None:
+def get_active_tracker() -> ActiveInterventionTracker:
+    """Return the shared ActiveInterventionTracker (lazy-initialised from config)."""
+    global _tracker
+    if _tracker is None:
         try:
             from app.core.config import settings
-            secs = settings.intervention_cooldown_seconds
+            _tracker = ActiveInterventionTracker(
+                min_gap_seconds        = settings.intervention_cooldown_seconds,
+                break_cooldown_seconds = settings.intervention_break_cooldown_seconds,
+                auto_dismiss_seconds   = settings.intervention_auto_dismiss_seconds,
+            )
         except Exception:
-            secs = COOLDOWN_SECONDS
-        _cooldown_tracker = CooldownTracker(cooldown_seconds=secs)
-    return _cooldown_tracker
+            _tracker = ActiveInterventionTracker()
+    return _tracker
+
+
+# Backward-compatible alias used by existing tests and any callers that
+# imported the old name.  Will be removed after full migration.
+def get_cooldown_tracker() -> ActiveInterventionTracker:
+    return get_active_tracker()
 
 
 # ── Ollama client ─────────────────────────────────────────────────────────────
 
 class InterventionEngine:
     """
-    Calls the ``lockin-intervention`` Ollama model via the /api/generate
-    endpoint with ``raw=true`` and the pre-formatted ChatML prompt string.
+    Calls the ``lockin-intervention`` Ollama model via /api/generate with
+    ``raw=true`` and the pre-formatted ChatML prompt string.
 
-    Open-Closed: sub-class or replace this class to swap the backend
-    (e.g. OpenAI API, a different local model) without touching the router.
+    Open-Closed: sub-class or replace to swap the backend without touching
+    the router.
     """
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
-        model:    str = "lockin-intervention",
+        base_url: str  = "http://localhost:11434",
+        model:    str  = "lockin-intervention",
         timeout:  float = 45.0,
     ) -> None:
         self._generate_url = f"{base_url}/api/generate"
@@ -226,8 +467,7 @@ class InterventionEngine:
         """
         Send the pre-built ChatML prompt and parse the JSON response.
 
-        Uses ``raw=true`` to bypass Ollama's template engine — mandatory
-        because the model was fine-tuned on explicit ChatML tokens.
+        Uses ``raw=true`` to bypass Ollama's template engine.
         ``num_predict=256`` caps output to keep latency under 10 seconds.
         """
         t0 = time.monotonic()
@@ -236,10 +476,10 @@ class InterventionEngine:
                 r = await client.post(
                     self._generate_url,
                     json={
-                        "model":       self._model,
-                        "prompt":      raw_chatml_prompt,
-                        "stream":      False,
-                        "raw":         True,
+                        "model":  self._model,
+                        "prompt": raw_chatml_prompt,
+                        "stream": False,
+                        "raw":    True,
                         "options": {
                             "temperature":    0.1,
                             "top_k":          20,

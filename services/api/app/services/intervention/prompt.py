@@ -19,6 +19,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+# Minimum gap between fires — 60 s (one RF window).
+# The primary gate is now slot-based (ActiveInterventionTracker); this is
+# only a safety floor to prevent burst firing.
+COOLDOWN_SECONDS: int = 60
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 # Must match the Modelfile SYSTEM block exactly (same wording as training).
 INTERVENTION_SYSTEM_PROMPT: str = (
@@ -38,9 +43,6 @@ INTERVENTION_SYSTEM_PROMPT: str = (
     "Respond with a single valid JSON object only — no prose, no markdown fences."
 )
 
-# Cooldown enforced between intervention fires (seconds).
-COOLDOWN_SECONDS: int = 90
-
 # Tier ordering for session-stage mapping.
 _SESSION_STAGE_MINUTES: tuple[tuple[float, str], ...] = (
     (5.0,  "early"),
@@ -58,41 +60,46 @@ def _session_stage(elapsed_minutes: float) -> str:
 
 def build_intervention_input(
     *,
-    elapsed_minutes: float,
-    attentional_window: list[dict[str, Any]],
-    drift_progression: dict[str, Any],
-    user_baseline: dict[str, Any],
-    text_window: list[str],
+    elapsed_minutes:         float,
+    attentional_window:      list[dict[str, Any]],
+    drift_progression:       dict[str, Any],
+    user_baseline:           dict[str, Any],
+    text_window:             list[str],
     current_paragraph_index: int | None,
-    xp: int,
-    badges_earned: list[str],
-    last_intervention: dict[str, Any] | None,
-    cooldown_status: str,
+    xp:                      int,
+    badges_earned:           list[str],
+    last_intervention:       dict[str, Any] | None,
+    cooldown_status:         str,
+    active_interventions:    list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Build the structured JSON dict that forms the user turn of the prompt.
 
     Parameters
     ----------
-    elapsed_minutes        : how long the session has been running
-    attentional_window     : last ≤3 RF classifier outputs (newest last)
-    drift_progression      : drift_level list, engagement_score list, drift_ema
-    user_baseline          : wpm_effective, idle_ratio_mean, etc.
-    text_window            : ≤3 paragraphs of text around current position
-    current_paragraph_index: DocumentChunk.chunk_index at current position
-    xp                     : accumulated XP for this session
-    badges_earned          : list of badge_id strings earned this session
-    last_intervention      : {type, tier, seconds_ago} or None
-    cooldown_status        : "clear" or "cooling"
+    elapsed_minutes         : how long the session has been running
+    attentional_window      : last ≤3 RF classifier outputs (newest last)
+    drift_progression       : drift_level list, engagement_score list, drift_ema
+    user_baseline           : wpm_effective, idle_ratio_mean, etc.
+    text_window             : ≤3 paragraphs of text around current position
+    current_paragraph_index : DocumentChunk.chunk_index at current position
+    xp                      : accumulated XP for this session
+    badges_earned           : list of badge_id strings earned this session
+    last_intervention       : {type, tier, seconds_ago} or None
+    cooldown_status         : "clear" or "cooling"
+    active_interventions    : list of {type, tier, seconds_active} currently on
+                              screen — lets the LLM avoid redundant suggestions
     """
     return {
         "session_context": {
-            "elapsed_minutes": round(elapsed_minutes, 2),
-            "session_stage":   _session_stage(elapsed_minutes),
-            "last_intervention": last_intervention,
-            "cooldown_status":   cooldown_status,
-            "xp":                xp,
-            "badges_earned":     badges_earned,
+            "elapsed_minutes":      round(elapsed_minutes, 2),
+            "session_stage":        _session_stage(elapsed_minutes),
+            "last_intervention":    last_intervention,
+            "cooldown_status":      cooldown_status,
+            "xp":                   xp,
+            "badges_earned":        badges_earned,
+            # What is currently visible to the user right now
+            "active_interventions": active_interventions or [],
         },
         "attentional_state_window": attentional_window,
         "drift_progression":        drift_progression,
