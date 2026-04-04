@@ -1,0 +1,20 @@
+# ── Large model weight files ───────────────────────────────────────
+# Base model download (~14 GB)
+Qwen2.5-7B-Instruct/
+
+# LoRA adapter weights — too large for GitHub (308 MB safetensors)
+# Store on Google Drive / HuggingFace Hub and re-download as needed
+lockin_intervention_adapter/adapter_model.safetensors
+lockin_intervention_adapter/tokenizer.json
+
+# Merged full-precision model (~14 GB)
+lockin_merged/
+
+# GGUF output files (~4.5 GB)
+lockin_gguf/
+
+# llama.cpp source clone used for convert_hf_to_gguf.py
+llama.cpp-src/
+
+# Python virtual environment
+.venv/
