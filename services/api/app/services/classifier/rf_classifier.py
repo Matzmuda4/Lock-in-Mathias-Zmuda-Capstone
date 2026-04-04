@@ -143,18 +143,60 @@ class RFClassifier:
         hyperfocused       = float(dist.get("hyperfocused",       0.0))
         cognitive_overload = float(dist.get("cognitive_overload", 0.0))
 
-        primary_state = max(dist, key=dist.get)  # type: ignore[arg-type]
+        # ── Engagement-context focused boosts ────────────────────────────────
+        # Three post-classification heuristic corrections that prevent the RF
+        # from misinterpreting deliberate system engagement as attentional drift.
+        # All are analogous to Bayesian prior updating (Hattie & Timperley, 2007):
+        # we inject domain knowledge to correct known training-distribution gaps
+        # without retraining the model.  Each boost is logged in the rationale.
+        ft: dict[str, Any] = packet_json.get("features") or {}
+
+        # 1. Panel interaction — idle-in-panel misread as drift
+        panel_share = float(ft.get("panel_interaction_share", 0.0))
+        focused, drifting, hyperfocused, cognitive_overload, boost_note = (
+            _apply_panel_boost(focused, drifting, hyperfocused, cognitive_overload, panel_share)
+        )
+
+        # 2. Section summary active — user is deliberately reading inline summary
+        if ft.get("section_summary_active"):
+            focused, drifting, hyperfocused, cognitive_overload, note = (
+                _apply_fixed_boost(
+                    focused, drifting, hyperfocused, cognitive_overload,
+                    boost=0.20, label="summary_active",
+                )
+            )
+            boost_note += note
+
+        # 3. Text reformat active — altered layout changes expected scroll patterns
+        if ft.get("text_reformat_active"):
+            focused, drifting, hyperfocused, cognitive_overload, note = (
+                _apply_fixed_boost(
+                    focused, drifting, hyperfocused, cognitive_overload,
+                    boost=0.12, label="reformat_active",
+                )
+            )
+            boost_note += note
+        # ─────────────────────────────────────────────────────────────────────
+
+        primary_state = max(
+            {"focused": focused, "drifting": drifting,
+             "hyperfocused": hyperfocused, "cognitive_overload": cognitive_overload},
+            key=lambda k: {"focused": focused, "drifting": drifting,
+                           "hyperfocused": hyperfocused, "cognitive_overload": cognitive_overload}[k],
+        )
 
         n_batches_norm = fvec[15]  # index 15 = n_batches_norm
+        conf = max(focused, drifting, hyperfocused, cognitive_overload)
         rationale = (
-            f"RF: {primary_state} {dist[primary_state]:.3f} | "
+            f"RF: {primary_state} {conf:.3f} | "
             f"window={round(n_batches_norm * 16)}/16 batches | "
             f"latency={latency_ms}ms"
+            f"{boost_note}"
         )
 
         log.debug(
-            "[rf_classify] primary=%s conf=%.3f latency=%dms",
-            primary_state, dist[primary_state], latency_ms,
+            "[rf_classify] primary=%s conf=%.3f panel_share=%.2f latency=%dms",
+            primary_state, conf, panel_share, latency_ms,
         )
 
         return ClassificationResult(
@@ -189,6 +231,123 @@ class RFClassifier:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _apply_panel_boost(
+    focused:             float,
+    drifting:            float,
+    hyperfocused:        float,
+    cognitive_overload:  float,
+    panel_interaction_share: float,
+) -> tuple[float, float, float, float, str]:
+    """
+    Post-classification probability adjustment for panel engagement.
+
+    Problem: the RF model was trained on data with very few panel-interaction
+    examples (the panel UI did not exist during most data collection).  As a
+    result, P(drifting) stays high when a user is actively reading the
+    assistant panel because the model interprets reduced scroll activity as
+    disengagement.
+
+    Fix: linearly boost P(focused) when ``panel_interaction_share`` exceeds a
+    threshold, redistributing the taken mass from the other three states
+    proportionally so the distribution always sums to 1.0.  The boost
+    disappears the moment the user scrolls back to the text.
+
+    Thesis defensibility:
+      Analogous to incorporating a Bayesian prior — we inject domain knowledge
+      (deliberate panel engagement is a form of cognitive engagement, not drift)
+      to correct a known training-distribution gap without retraining.
+      The magnitude (max 30 pp at full panel engagement) is conservative enough
+      to be overridden by strong drift signals in the other 18 features.
+
+    Parameters
+    ----------
+    panel_interaction_share : fraction of the 30 s window spent in
+                              PANEL_INTERACTING context (0.0 – 1.0).
+
+    Returns
+    -------
+    (focused, drifting, hyperfocused, cognitive_overload, boost_note_str)
+    """
+    # Boost only kicks in when at least 15 % of the window was panel-engaged
+    _THRESHOLD: float = 0.15
+    # Maximum probability points transferred to focused at full engagement
+    _MAX_BOOST: float = 0.30
+
+    if panel_interaction_share <= _THRESHOLD:
+        return focused, drifting, hyperfocused, cognitive_overload, ""
+
+    # Boost strength: 0 at threshold, 1 at full panel engagement
+    strength = min(
+        (panel_interaction_share - _THRESHOLD) / (1.0 - _THRESHOLD),
+        1.0,
+    )
+    add = strength * _MAX_BOOST
+
+    new_focused   = min(1.0, focused + add)
+    actual_added  = new_focused - focused   # may be < add if focused was near 1
+
+    # Remove the same mass from the other three states proportionally
+    other = drifting + hyperfocused + cognitive_overload
+    if other > 1e-9:
+        scale          = max(0.0, (other - actual_added) / other)
+        drifting           *= scale
+        hyperfocused       *= scale
+        cognitive_overload *= scale
+
+    # Re-normalise for floating-point safety
+    total = new_focused + drifting + hyperfocused + cognitive_overload
+    if total > 1e-9:
+        focused            = new_focused / total
+        drifting           = drifting    / total
+        hyperfocused       = hyperfocused / total
+        cognitive_overload = cognitive_overload / total
+    else:
+        focused, drifting, hyperfocused, cognitive_overload = 1.0, 0.0, 0.0, 0.0
+
+    boost_note = f" | panel_boost={panel_interaction_share:.2f} +{actual_added:.2f}→F"
+    return focused, drifting, hyperfocused, cognitive_overload, boost_note
+
+
+def _apply_fixed_boost(
+    focused:            float,
+    drifting:           float,
+    hyperfocused:       float,
+    cognitive_overload: float,
+    boost:              float,
+    label:              str,
+) -> tuple[float, float, float, float, str]:
+    """
+    Apply a fixed probability boost to P(focused) when a boolean context flag
+    is True (e.g. section_summary_active, text_reformat_active).
+
+    Unlike _apply_panel_boost (which uses a graduated share), this applies a
+    constant ``boost`` amount regardless of magnitude — the flag is binary.
+
+    The same proportional redistribution and re-normalisation as the panel
+    boost is used to guarantee the distribution sums to 1.0.
+    """
+    new_focused  = min(1.0, focused + boost)
+    actual_added = new_focused - focused
+
+    other = drifting + hyperfocused + cognitive_overload
+    if other > 1e-9:
+        scale          = max(0.0, (other - actual_added) / other)
+        drifting           *= scale
+        hyperfocused       *= scale
+        cognitive_overload *= scale
+
+    total = new_focused + drifting + hyperfocused + cognitive_overload
+    if total > 1e-9:
+        focused            = new_focused / total
+        drifting           = drifting    / total
+        hyperfocused       = hyperfocused / total
+        cognitive_overload = cognitive_overload / total
+    else:
+        focused, drifting, hyperfocused, cognitive_overload = 1.0, 0.0, 0.0, 0.0
+
+    return focused, drifting, hyperfocused, cognitive_overload, f" | {label}+{actual_added:.2f}→F"
+
 
 def _make_fallback(rationale: str) -> ClassificationResult:
     """Uniform fallback when the model cannot produce a result."""

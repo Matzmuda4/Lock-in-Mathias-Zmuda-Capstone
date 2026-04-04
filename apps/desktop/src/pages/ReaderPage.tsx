@@ -1,13 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { useTelemetry } from "../hooks/useTelemetry";
-import { activityService } from "../services/activityService";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { documentService, type Chunk } from "../services/documentService";
 import { sessionService, type Session, type SessionReaderData } from "../services/sessionService";
 import { driftService, driftColor, type DriftState, type DriftDebug } from "../services/driftService";
 import { classificationService, STATE_COLORS, STATE_LABELS, type AttentionalState } from "../services/classificationService";
+import { interventionService, type ActiveIntervention, type InterventionTier, type InterventionType } from "../services/interventionService";
+import { InterventionList } from "../components/interventions/InterventionList";
+import { SectionSummaryCard } from "../components/interventions/SectionSummaryCard";
+import { TextReformatBanner } from "../components/interventions/TextReformatBanner";
+import JourneyWidget from "../components/interventions/JourneyWidget";
+import BreakSuggestionOverlay from "../components/interventions/BreakSuggestionOverlay";
+import AudioscapeWidget from "../components/interventions/AudioscapeWidget";
+import ChimeWidget from "../components/interventions/ChimeWidget";
+import BadgePopup from "../components/interventions/BadgePopup";
+import { BADGE_DEFS, type BadgeDef, type BadgeId } from "../types/badges";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -30,6 +39,11 @@ function calcInitialSeconds(session: Session): number {
   return session.elapsed_seconds + Math.max(0, Math.floor(intervalMs / 1000));
 }
 
+/**
+ * Single-tick timer that returns BOTH a display string (MM:SS) and raw
+ * seconds.  Replaces the previous two separate 1-second intervals that were
+ * causing two ReaderPage re-renders per second.
+ */
 function useElapsedTimer(session: Session | null) {
   const [seconds, setSeconds] = useState(() =>
     session ? calcInitialSeconds(session) : 0,
@@ -46,9 +60,13 @@ function useElapsedTimer(session: Session | null) {
     return () => clearInterval(id);
   }, [running]);
 
-  const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
-  const ss = String(seconds % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
+  const display = useMemo(() => {
+    const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
+    const ss = String(seconds % 60).padStart(2, "0");
+    return `${mm}:${ss}`;
+  }, [seconds]);
+
+  return { display, seconds };
 }
 
 // ─── Auth-aware asset data URL loader ────────────────────────────────────────
@@ -193,7 +211,10 @@ function TableChunk({ chunk, docId, token }: { chunk: Chunk; docId: number; toke
   );
 }
 
-function ChunkCard({
+// memo: chunk props never change during a session (only on loadMore), so this
+// component skips re-rendering on every timer tick / drift poll / intervention
+// update — the most expensive re-render cycle in the document view.
+const ChunkCard = memo(function ChunkCard({
   chunk,
   chunkIndex,
   docId,
@@ -208,7 +229,7 @@ function ChunkCard({
   if (ct === "image") return <ImageChunk chunk={chunk} docId={docId} token={token} />;
   if (ct === "table") return <TableChunk chunk={chunk} docId={docId} token={token} />;
   return <TextChunk chunk={chunk} chunkIndex={chunkIndex} />;
-}
+});
 
 // ─── Session controls ────────────────────────────────────────────────────────
 
@@ -393,24 +414,70 @@ function ExportCsvButton({ sessionId, token }: { sessionId: number; token: strin
 }
 
 // ─── Adaptive assistant panel shell (adaptive mode only) ─────────────────────
+// memo: the panel only needs to re-render when interventions, XP, or open state
+// changes — not on every 1-second timer tick or 5-second drift poll.
 
 interface AssistantPanelProps {
-  panelRef: React.RefObject<HTMLDivElement>;
-  open: boolean;
-  onToggle: () => void;
-  onInteract: () => void;
+  panelRef:             React.RefObject<HTMLDivElement>;
+  open:                 boolean;
+  onToggle:             () => void;
+  activeInterventions:  ActiveIntervention[];
+  onDismissIntervention:(id: number) => void;
+  /** Dev/test only — fire any intervention type directly. */
+  onManualFire:         (type: InterventionType, tier: InterventionTier) => void;
+  /** Dev/test only — award a specific badge immediately for testing. */
+  onDevBadge:           (badgeId: BadgeId) => void;
+  /** Accumulated XP — fed to the journey widget when gamification fires. */
+  sessionXP:            number;
+  /** True once the session has ended — advances journey to final checkpoint. */
+  sessionEnded:         boolean;
+  /** Badges already earned this session — shown as mini-icons in the journey widget. */
+  earnedBadges:         BadgeDef[];
+  /** Whether a break is currently in progress — pauses the audioscape. */
+  breakActive:          boolean;
 }
 
-function AssistantPanel({ panelRef, open, onToggle, onInteract }: AssistantPanelProps) {
-  const [interactCount, setInteractCount] = useState(0);
-  const [flash, setFlash] = useState(false);
+const AssistantPanel = memo(function AssistantPanel({
+  panelRef,
+  open,
+  onToggle,
+  activeInterventions,
+  onDismissIntervention,
+  onManualFire,
+  onDevBadge,
+  sessionXP,
+  sessionEnded,
+  earnedBadges,
+  breakActive,
+}: AssistantPanelProps) {
+  // Dev test controls
+  const [devType, setDevType] = useState<InterventionType>("focus_point");
+  const [devTier, setDevTier] = useState<InterventionTier>("moderate");
+  const [devFiring, setDevFiring] = useState(false);
 
-  const handleInteract = () => {
-    setInteractCount((c) => c + 1);
-    setFlash(true);
-    setTimeout(() => setFlash(false), 400);
-    onInteract();
+  const handleDevFire = async () => {
+    setDevFiring(true);
+    await onManualFire(devType, devTier);
+    setDevFiring(false);
   };
+
+  // Text-prompt interventions rendered in this panel
+  const textPromptInterventions = activeInterventions.filter((i) =>
+    ["focus_point", "re_engagement", "comprehension_check"].includes(i.type ?? ""),
+  );
+  const textReformatInterventions = activeInterventions.filter(
+    (i) => i.type === "text_reformat",
+  );
+  // Journey widget — only when gamification intervention is active
+  const gamificationIntervention = activeInterventions.find((i) => i.type === "gamification") ?? null;
+  // Audioscape widget — only when ambient_sound intervention is active
+  const ambientSoundIntervention = activeInterventions.find((i) => i.type === "ambient_sound") ?? null;
+  // break_suggestion is rendered as a full-screen overlay, not here
+  const hasVisibleInterventions =
+    textPromptInterventions.length > 0 ||
+    textReformatInterventions.length > 0 ||
+    gamificationIntervention !== null ||
+    ambientSoundIntervention !== null;
 
   return (
     <aside
@@ -422,7 +489,7 @@ function AssistantPanel({ panelRef, open, onToggle, onInteract }: AssistantPanel
     >
       <div className="assistant-panel__header">
         <span className="assistant-panel__title">
-          {open ? "Assistant" : ""}
+          {open ? "Lock-in Assistant" : ""}
         </span>
         <button
           className="assistant-panel__toggle"
@@ -433,38 +500,153 @@ function AssistantPanel({ panelRef, open, onToggle, onInteract }: AssistantPanel
           {open ? "›" : "‹"}
         </button>
       </div>
+
       {open && (
         <div className="assistant-panel__body">
-          {/* ── Interaction button ───────────────────────────────────────── */}
-          <div className="panel-section">
-            <p className="panel-section__label">Panel Interaction</p>
-            <p className="panel-section__hint">
-              Press when you are actively engaging with the system — this
-              tells the model that idle time here is intentional, not drift.
-            </p>
-            <button
-              type="button"
-              className={`panel-interact-btn${flash ? " panel-interact-btn--flash" : ""}`}
-              onClick={handleInteract}
-            >
-              ⚡ Interaction
-              {interactCount > 0 && (
-                <span className="panel-interact-btn__count">{interactCount}</span>
-              )}
-            </button>
-          </div>
 
-          {/* ── Placeholder for future interventions ─────────────────────── */}
-          <div className="panel-section panel-section--muted">
-            <p className="assistant-panel__placeholder">
-              Interventions will appear here.
-            </p>
-          </div>
+          {/* ── Journey widget — only when a gamification intervention is active ── */}
+          {gamificationIntervention && (
+            <JourneyWidget
+              intervention={gamificationIntervention}
+              xp={sessionXP}
+              sessionEnded={sessionEnded}
+              earnedBadges={earnedBadges}
+            />
+          )}
+
+          {/* ── Audioscape — only when ambient_sound intervention is active ── */}
+          {ambientSoundIntervention && (
+            <AudioscapeWidget
+              intervention={ambientSoundIntervention}
+              onDismiss={onDismissIntervention}
+              forcePause={breakActive}
+            />
+          )}
+
+          {/* ── Text reformat banner ─────────────────────────────────────── */}
+          {textReformatInterventions.length > 0 && (
+            <div className="panel-section">
+              <p className="panel-section__label">Text Adaptation</p>
+              {textReformatInterventions.map((i) => (
+                <TextReformatBanner
+                  key={i.intervention_id}
+                  intervention={i}
+                  onStop={onDismissIntervention}
+                />
+              ))}
+            </div>
+          )}
+
+          {/* ── Active text-prompt interventions ─────────────────────────── */}
+          {textPromptInterventions.length > 0 && (
+            <div className="panel-section">
+              <p className="panel-section__label">Active</p>
+              <InterventionList
+                interventions={textPromptInterventions}
+                onDismiss={onDismissIntervention}
+              />
+            </div>
+          )}
+
+          {/* ── Dev: manual fire ─────────────────────────────────────────── */}
+          {DEV && (
+            <div className="panel-section">
+              <p className="panel-section__label" style={{ color: "#f59e0b" }}>
+                🧪 Dev — Test Intervention
+              </p>
+              <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
+                <select
+                  value={devType}
+                  onChange={(e) => setDevType(e.target.value as InterventionType)}
+                  style={{
+                    flex: 1, fontSize: "12px", padding: "5px 8px",
+                    border: "1px solid var(--border)", borderRadius: "6px",
+                    background: "var(--bg-surface)", color: "var(--text)",
+                  }}
+                >
+                  <option value="focus_point">Focus Point</option>
+                  <option value="re_engagement">Re-engagement</option>
+                  <option value="comprehension_check">Comprehension</option>
+                  <option value="section_summary">Section Summary</option>
+                  <option value="text_reformat">Text Reformat</option>
+                  <option value="break_suggestion">Break Suggestion</option>
+                  <option value="chime">Chime</option>
+                  <option value="gamification">Gamification (badge)</option>
+                  <option value="ambient_sound">Audioscape (ambient)</option>
+                </select>
+                <select
+                  value={devTier}
+                  onChange={(e) => setDevTier(e.target.value as InterventionTier)}
+                  style={{
+                    width: "96px", fontSize: "12px", padding: "5px 8px",
+                    border: "1px solid var(--border)", borderRadius: "6px",
+                    background: "var(--bg-surface)", color: "var(--text)",
+                  }}
+                >
+                  <option value="subtle">Subtle</option>
+                  <option value="moderate">Moderate</option>
+                  <option value="strong">Strong</option>
+                  <option value="special">Special</option>
+                </select>
+              </div>
+              <button
+                type="button"
+                onClick={handleDevFire}
+                disabled={devFiring}
+                style={{
+                  width: "100%", padding: "8px 12px",
+                  background: devFiring ? "var(--bg)" : "rgba(245,158,11,0.12)",
+                  border: "1.5px solid rgba(245,158,11,0.4)",
+                  borderRadius: "7px",
+                  color: "#b45309", fontSize: "12px", fontWeight: 700,
+                  cursor: devFiring ? "wait" : "pointer",
+                }}
+              >
+                {devFiring ? "Firing…" : "▶ Fire Intervention"}
+              </button>
+
+              {/* Dev badge awards — only relevant when gamification is active */}
+              <p style={{ margin: "10px 0 4px", fontSize: "10px", fontWeight: 700, color: "#7c3aed" }}>
+                🏅 Award Badge (dev)
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                {BADGE_DEFS.map((b) => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    onClick={() => onDevBadge(b.id)}
+                    style={{
+                      width: "100%", padding: "5px 8px",
+                      background: "rgba(124,58,237,0.08)",
+                      border: "1px solid rgba(124,58,237,0.3)",
+                      borderRadius: "6px",
+                      color: "#6d28d9", fontSize: "11px", fontWeight: 600,
+                      cursor: "pointer", textAlign: "left",
+                      display: "flex", alignItems: "center", gap: "6px",
+                    }}
+                  >
+                    <img src={b.icon} alt="" style={{ width: "14px", height: "14px", objectFit: "contain" }} />
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Placeholder when nothing is active and not in dev mode ──── */}
+          {!hasVisibleInterventions && !DEV && (
+            <div className="panel-section panel-section--muted">
+              <p className="assistant-panel__placeholder">
+                Interventions will appear here.
+              </p>
+            </div>
+          )}
+
         </div>
       )}
     </aside>
   );
-}
+});
 
 // ─── Dev-only Export Bundle button ───────────────────────────────────────────
 
@@ -601,7 +783,8 @@ function DebugPanel({
 
 // ─── Drift meter ─────────────────────────────────────────────────────────────
 
-function DriftMeter({
+// memo: only re-renders when drift state actually changes (every 5 s)
+const DriftMeter = memo(function DriftMeter({
   drift,
   showConfidence,
 }: {
@@ -638,7 +821,7 @@ function DriftMeter({
       )}
     </div>
   );
-}
+});
 
 // ─── Attentional state meter ──────────────────────────────────────────────────
 
@@ -650,7 +833,8 @@ function DriftMeter({
  * The primary state label is highlighted.  A spinner is shown while the
  * first full-window packet has not yet been classified (< ~30 s).
  */
-function AttentionalStateMeter({
+// memo: only re-renders when the RF classification changes (every 10 s)
+const AttentionalStateMeter = memo(function AttentionalStateMeter({
   state,
 }: {
   state: AttentionalState | null;
@@ -705,7 +889,7 @@ function AttentionalStateMeter({
       </span>
     </div>
   );
-}
+});
 
 // ─── Drift debug panel (DEV only) ────────────────────────────────────────────
 
@@ -825,24 +1009,42 @@ export function ReaderPage() {
   // Attentional state — polled every 10 s (matches classifier cadence)
   const [attentionalState, setAttentionalState] = useState<AttentionalState | null>(null);
 
-  const timerDisplay = useElapsedTimer(data?.session ?? null);
-  // Raw seconds for calibration finish-condition logic
-  const [timerSeconds, setTimerSeconds] = useState(0);
-  useEffect(() => {
-    const session = data?.session;
-    if (!session) return;
-    const calc = () => {
-      if (session.status === "ended" || session.status === "completed")
-        return session.duration_seconds ?? session.elapsed_seconds;
-      if (session.status === "paused") return session.elapsed_seconds;
-      const ms = Date.now() - new Date(session.started_at).getTime();
-      return session.elapsed_seconds + Math.max(0, Math.floor(ms / 1000));
-    };
-    setTimerSeconds(calc());
-    if (session.status !== "active") return;
-    const id = setInterval(() => setTimerSeconds(calc()), 1000);
-    return () => clearInterval(id);
-  }, [data?.session?.status, data?.session?.elapsed_seconds, data?.session?.started_at]);
+  // Active interventions — polled every 10 s while session is active
+  const [activeInterventions, setActiveInterventions] = useState<ActiveIntervention[]>([]);
+
+  // XP accumulated this session (focused = +10, hyperfocused = +20 per window)
+  const [sessionXP, setSessionXP] = useState(0);
+  const lastXpSeqRef = useRef<number | null>(null);
+
+  // Becomes true after the first RF classification — used to gate the LLM trigger poll
+  const [hasFirstClassification, setHasFirstClassification] = useState(false);
+
+  // ── Badge system ──────────────────────────────────────────────────────────
+  // earnedBadges: ordered list of badges already collected this session
+  const [earnedBadges, setEarnedBadges]   = useState<BadgeDef[]>([]);
+  // pendingBadge: badge whose popup is currently showing (null = no popup)
+  const [pendingBadge, setPendingBadge]   = useState<BadgeDef | null>(null);
+  const earnedIdsRef         = useRef<Set<BadgeId>>(new Set());
+  const consecutiveFocusRef  = useRef(0);  // consecutive focused OR hyperfocused windows
+  const consecutiveHyperRef  = useRef(0);  // consecutive hyperfocused-only windows
+  const consecutiveCleanRef  = useRef(0);  // consecutive non-drifting windows
+  const prevAttStateRef      = useRef<string | null>(null);
+
+  // ── Break-active flag (pauses audioscape during a break) ─────────────────
+  const [breakActive, setBreakActive] = useState(false);
+
+  // Section-summary insertion points: intervention_id → chunk index where the
+  // card should appear (after that chunk index in the document).
+  // Populated when a new section_summary enters activeInterventions —
+  // either from the backend _chunk_index field or the current scroll position.
+  const [summaryInsertions, setSummaryInsertions] = useState<Map<number, number>>(new Map());
+
+  // Tracks the chunk index that's at the top of the viewport (scroll tracking).
+  const viewportChunkIdxRef = useRef(0);
+
+  // Single timer — provides both the formatted display string and raw seconds.
+  // Replaces two separate 1-second intervals that used to cause 2 re-renders/sec.
+  const { display: timerDisplay, seconds: timerSeconds } = useElapsedTimer(data?.session ?? null);
 
   // Ref for the scrollable content area — passed to useTelemetry
   const contentRef = useRef<HTMLDivElement>(null);
@@ -852,19 +1054,12 @@ export function ReaderPage() {
   // Adaptive panel state (only meaningful in adaptive mode)
   const isAdaptive = data?.session?.mode === "adaptive";
   const [panelOpen, setPanelOpen] = useState(true);
+  const handlePanelToggle = useCallback(() => setPanelOpen((o) => !o), []);
 
   // Telemetry — active only while the session is in "active" status
   const isActive = data?.session?.status === "active";
   const isPaused = data?.session?.status === "paused";
 
-  // Panel interaction handler — fires a named event so the drift model
-  // can recognise that idle time during panel engagement is intentional.
-  const handlePanelInteract = useCallback(() => {
-    if (!token || !isActive) return;
-    activityService.postEvent(token, sessionId, "panel_interaction", {
-      panel_open: panelOpen,
-    });
-  }, [token, sessionId, isActive, panelOpen]);
   const { lastBatch, collecting, warnings } = useTelemetry({
     sessionId,
     token,
@@ -894,7 +1089,7 @@ export function ReaderPage() {
       if (state) setDriftState(state);
     };
     poll();
-    const id = setInterval(poll, 3000);
+    const id = setInterval(poll, 5000);
     return () => clearInterval(id);
   }, [token, sessionId, isActive]);
 
@@ -915,6 +1110,242 @@ export function ReaderPage() {
     const id = setInterval(poll, 10_000);
     return () => { clearTimeout(initialDelay); clearInterval(id); };
   }, [token, sessionId, isActive]);
+
+  // Poll active interventions every 10 s while session is active.
+  // The backend fires interventions autonomously; we just poll to discover them.
+  useEffect(() => {
+    if (!token || !isAdaptive || !isActive) return;
+    const poll = () =>
+      interventionService.getActive(token, sessionId).then(setActiveInterventions);
+    poll();
+    const id = setInterval(poll, 10_000);
+    return () => clearInterval(id);
+  }, [token, sessionId, isAdaptive, isActive]);
+
+  // Track which chunk is near the top of the viewport so section summaries
+  // fire at the user's current reading position, not the top of the document.
+  useEffect(() => {
+    const container = contentRef.current;
+    if (!container || !isAdaptive) return;
+    const onScroll = () => {
+      // Approximate: progress through scroll height → chunk index
+      const progress = container.scrollTop /
+        Math.max(1, container.scrollHeight - container.clientHeight);
+      const chunkCount = data?.chunks?.length ?? 1;
+      viewportChunkIdxRef.current = Math.max(
+        0,
+        Math.floor(progress * chunkCount) - 1,
+      );
+    };
+    container.addEventListener("scroll", onScroll, { passive: true });
+    return () => container.removeEventListener("scroll", onScroll);
+  }, [isAdaptive, data?.chunks?.length]);
+
+  // ── Badge award helper (stable — no deps, reads/writes only refs and setters) ──
+  const awardBadge = useCallback((badgeId: BadgeId) => {
+    if (earnedIdsRef.current.has(badgeId)) return; // already earned
+    const def = BADGE_DEFS.find((b) => b.id === badgeId);
+    if (!def) return;
+    earnedIdsRef.current.add(badgeId);
+    setSessionXP((p) => p + def.xp);        // bonus XP
+    setEarnedBadges((prev) => [...prev, def]);
+    setPendingBadge(def);                    // triggers popup
+  }, []);
+
+  // Accumulate XP from each new attentional-state window.
+  // Tracks consecutive focus / non-distraction streaks and awards badges.
+  // Badges only matter when gamification is active (checked via ref to avoid
+  // stale closure issues with frequent state reads).
+  const gamificationActiveRef = useRef(false);
+  useEffect(() => {
+    gamificationActiveRef.current = activeInterventions.some((i) => i.type === "gamification");
+  }, [activeInterventions]);
+
+  useEffect(() => {
+    if (!attentionalState) return;
+    const seq = attentionalState.packet_seq;
+    if (seq === lastXpSeqRef.current) return;
+    lastXpSeqRef.current = seq;
+
+    const state = attentionalState.primary_state;
+    const isFocused  = state === "focused" || state === "hyperfocused";
+    const isDrifting = state === "drifting" || state === "cognitive_overload";
+    const prevState  = prevAttStateRef.current;
+
+    // XP from reading (3–5 focused, 5–8 hyperfocused)
+    if (state === "focused")
+      setSessionXP((p) => p + 3 + Math.floor(Math.random() * 3));
+    else if (state === "hyperfocused")
+      setSessionXP((p) => p + 5 + Math.floor(Math.random() * 4));
+
+    if (!hasFirstClassification) setHasFirstClassification(true);
+
+    // ── Badge tracking (only when gamification intervention is running) ────
+    if (gamificationActiveRef.current) {
+      const isHyper = state === "hyperfocused";
+
+      if (isFocused) {
+        consecutiveFocusRef.current++;
+        consecutiveCleanRef.current++;
+      } else {
+        consecutiveFocusRef.current = 0;
+        if (isDrifting) consecutiveCleanRef.current = 0;
+      }
+
+      if (isHyper) {
+        consecutiveHyperRef.current++;
+      } else {
+        consecutiveHyperRef.current = 0;
+      }
+
+      // Streak badges (each fires exactly once at its threshold)
+      if (consecutiveFocusRef.current === 3)  awardBadge("first_focus_streak");
+      if (consecutiveFocusRef.current === 5)  awardBadge("deep_reader");
+      // focus_master: 3 consecutive *hyperfocused* windows
+      if (consecutiveHyperRef.current  === 3)  awardBadge("focus_master");
+
+      // No-distraction: 10 consecutive non-drifting windows
+      if (consecutiveCleanRef.current === 10) awardBadge("no_distraction");
+
+      // Comeback kid: was drifting/overloaded, now focused
+      if (
+        isFocused &&
+        prevState &&
+        (prevState === "drifting" || prevState === "cognitive_overload")
+      ) {
+        awardBadge("comeback_kid");
+      }
+    }
+
+    prevAttStateRef.current = state;
+  }, [attentionalState, hasFirstClassification, awardBadge]);
+
+  // Reading Marathon: award when the session timer reaches 10 minutes (600 s).
+  // Uses timerSeconds so it fires regardless of whether the user has been
+  // focused — it just requires staying in the session for that long.
+  useEffect(() => {
+    if (timerSeconds >= 600 && gamificationActiveRef.current) {
+      awardBadge("reading_marathon");
+    }
+  }, [timerSeconds, awardBadge]);
+
+  // Call the LLM trigger endpoint every 30 s once the first classification is ready.
+  // After each call, refresh the active interventions list so new ones appear immediately.
+  useEffect(() => {
+    if (!token || !isAdaptive || !isActive || !hasFirstClassification) return;
+    const triggerAndRefresh = async () => {
+      try {
+        await interventionService.trigger(token, sessionId);
+        const active = await interventionService.getActive(token, sessionId);
+        setActiveInterventions(active);
+      } catch {
+        // Non-critical — LLM trigger failure must never crash the reading session
+      }
+    };
+    triggerAndRefresh();
+    const id = setInterval(triggerAndRefresh, 30_000);
+    return () => clearInterval(id);
+  }, [token, sessionId, isAdaptive, isActive, hasFirstClassification]);
+
+  // Record where each new section_summary should be injected.
+  // Uses content._chunk_index when available (set by trigger endpoint),
+  // falling back to the current viewport position.
+  useEffect(() => {
+    const summaries = activeInterventions.filter((i) => i.type === "section_summary");
+    setSummaryInsertions((prev) => {
+      const next = new Map(prev);
+      // Add new entries
+      for (const s of summaries) {
+        const id = s.intervention_id!;
+        if (!next.has(id)) {
+          const backendIdx = (s.content as Record<string, unknown> | null)
+            ?._chunk_index as number | undefined;
+          next.set(id, backendIdx ?? viewportChunkIdxRef.current);
+        }
+      }
+      // Prune dismissed entries
+      const activeIds = new Set(summaries.map((s) => s.intervention_id!));
+      for (const id of next.keys()) {
+        if (!activeIds.has(id)) next.delete(id);
+      }
+      return next;
+    });
+  }, [activeInterventions]);
+
+  // User dismissed an intervention card — acknowledge on backend and remove from local state.
+  const handleDismissIntervention = useCallback(async (interventionId: number) => {
+    if (!token) return;
+    // Optimistic removal first so the card disappears immediately
+    setActiveInterventions((prev) => prev.filter((i) => i.intervention_id !== interventionId));
+    await interventionService.acknowledge(token, sessionId, interventionId);
+  }, [token, sessionId]);
+
+  // ── Break suggestion handlers ──────────────────────────────────────────────
+  //
+  // IMPORTANT: we do NOT acknowledge the break_suggestion when the user confirms.
+  // Acknowledging at confirm time would remove it from the backend's active list,
+  // which would drop it from our local state poll and close the overlay mid-break.
+  // Instead we acknowledge only when the break actually ends (auto-resume or dismiss).
+
+  // User confirmed the break → pause session only; do NOT acknowledge yet.
+  // Also sets breakActive so the audioscape is paused for the duration.
+  const handleBreakConfirm = useCallback(async (_interventionId: number) => {
+    if (!token) return;
+    setBreakActive(true);
+    try {
+      const updated = await sessionService.pause(token, sessionId);
+      setData((prev) => prev ? { ...prev, session: updated } : prev);
+    } catch (e) {
+      console.error("Break confirm failed:", e);
+    }
+  }, [token, sessionId]);
+
+  // User dismissed the overlay without taking a break → acknowledge + close.
+  const handleBreakDismiss = useCallback((interventionId: number) => {
+    if (!token) return;
+    setBreakActive(false);
+    setActiveInterventions((prev) => prev.filter((i) => i.intervention_id !== interventionId));
+    interventionService.acknowledge(token, sessionId, interventionId);
+  }, [token, sessionId]);
+
+  // Break timer finished or "I'm ready" → acknowledge (starts cooldown) + resume.
+  const handleBreakAutoResume = useCallback(async (interventionId: number) => {
+    if (!token) return;
+    setBreakActive(false);
+    setActiveInterventions((prev) => prev.filter((i) => i.intervention_id !== interventionId));
+    try {
+      await interventionService.acknowledge(token, sessionId, interventionId);
+      const updated = await sessionService.resume(token, sessionId);
+      setData((prev) => prev ? { ...prev, session: updated } : prev);
+    } catch (e) {
+      console.error("Break auto-resume failed:", e);
+    }
+  }, [token, sessionId]);
+
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Dev/test: immediately award any badge (for UI testing).
+  const handleDevBadge = useCallback((badgeId: BadgeId) => {
+    awardBadge(badgeId);
+  }, [awardBadge]);
+
+  // Dev/test: fire any intervention type manually, then immediately refresh the active list.
+  const handleManualFire = useCallback(async (
+    type: InterventionType,
+    tier: InterventionTier,
+  ) => {
+    if (!token) return;
+    try {
+      const fired = await interventionService.manualTrigger(token, sessionId, type, tier);
+      setActiveInterventions((prev) => {
+        // Avoid duplicates in local state if the poll already picked it up
+        if (prev.some((i) => i.intervention_id === fired.intervention_id)) return prev;
+        return [fired, ...prev];
+      });
+    } catch (err) {
+      console.error("Manual intervention fire failed:", err);
+    }
+  }, [token, sessionId]);
 
   const loadMore = useCallback(async () => {
     if (!token || !data) return;
@@ -996,6 +1427,10 @@ export function ReaderPage() {
   const parseFailed = effectiveParseStatus === "failed";
   const isCalibration = session.mode === "calibration";
 
+  // Derive break overlay and journey state
+  const breakIntervention = activeInterventions.find((i) => i.type === "break_suggestion") ?? null;
+  const sessionEnded = session.status === "ended" || session.status === "completed";
+
   // Show baseline summary overlay once calibration is complete
   if (isCalibration && calibDone && calibBaseline) {
     return (
@@ -1066,7 +1501,15 @@ export function ReaderPage() {
         data-testid="reader-root"
         className={`reader-body${isAdaptive ? " reader-body--adaptive" : ""}`}
       >
-        <main className="reader-content" ref={contentRef}>
+        <main
+          className={[
+            "reader-content",
+            isAdaptive && activeInterventions.some((i) => i.type === "text_reformat")
+              ? "reader-content--chunked"
+              : "",
+          ].filter(Boolean).join(" ")}
+          ref={contentRef}
+        >
           {isParsing && (
             <div className="reader-notice">
               <span className="spinner" />
@@ -1083,13 +1526,28 @@ export function ReaderPage() {
           )}
 
           {chunks.map((chunk, idx) => (
-            <ChunkCard
-              key={chunk.id}
-              chunk={chunk}
-              chunkIndex={idx}
-              docId={document_id}
-              token={token}
-            />
+            <div key={chunk.id} data-chunk-idx={idx}>
+              <ChunkCard
+                chunk={chunk}
+                chunkIndex={idx}
+                docId={document_id}
+                token={token}
+              />
+              {/* ── Section summary cards injected after their target chunk ── */}
+              {isAdaptive && activeInterventions
+                .filter(
+                  (i) =>
+                    i.type === "section_summary" &&
+                    summaryInsertions.get(i.intervention_id!) === idx,
+                )
+                .map((i) => (
+                  <SectionSummaryCard
+                    key={i.intervention_id}
+                    intervention={i}
+                    onDismiss={handleDismissIntervention}
+                  />
+                ))}
+            </div>
           ))}
 
           {!allLoaded && !isParsing && (
@@ -1112,8 +1570,45 @@ export function ReaderPage() {
           <AssistantPanel
             panelRef={panelRef}
             open={panelOpen}
-            onToggle={() => setPanelOpen((o) => !o)}
-            onInteract={handlePanelInteract}
+            onToggle={handlePanelToggle}
+            activeInterventions={activeInterventions}
+            onDismissIntervention={handleDismissIntervention}
+            onManualFire={handleManualFire}
+            onDevBadge={handleDevBadge}
+            sessionXP={sessionXP}
+            sessionEnded={sessionEnded}
+            earnedBadges={earnedBadges}
+            breakActive={breakActive}
+          />
+        )}
+
+        {/* Chime toast — floats in the viewport for ~5 s then auto-dismisses */}
+        {isAdaptive && activeInterventions
+          .filter((i) => i.type === "chime")
+          .map((i) => (
+            <ChimeWidget
+              key={i.intervention_id}
+              intervention={i}
+              onDismiss={handleDismissIntervention}
+            />
+          ))
+        }
+
+        {/* Break suggestion full-screen overlay — rendered outside the panel */}
+        {isAdaptive && breakIntervention && (
+          <BreakSuggestionOverlay
+            intervention={breakIntervention}
+            onConfirm={handleBreakConfirm}
+            onDismiss={handleBreakDismiss}
+            onAutoResume={handleBreakAutoResume}
+          />
+        )}
+
+        {/* Badge popup — shown when a badge is earned, stays on top of everything */}
+        {isAdaptive && pendingBadge && (
+          <BadgePopup
+            badge={pendingBadge}
+            onDismiss={() => setPendingBadge(null)}
           />
         )}
       </div>
@@ -1137,8 +1632,9 @@ export function ReaderPage() {
 
         /* ── Adaptive assistant panel ── */
         .assistant-panel {
-          width: 400px;
-          min-width: 400px;
+          width: 490px;
+          min-width: 490px;
+          height: calc(100vh - 56px);
           background: var(--bg-surface);
           border-left: 1px solid var(--border);
           display: flex;
@@ -1379,6 +1875,24 @@ export function ReaderPage() {
         .btn--accent { background:var(--accent); color:#fff; border-color:var(--accent); }
         .btn--accent:hover { opacity:0.88; }
 
+        /* ── Adaptive text chunking mode ── */
+        /* Applied when a text_reformat intervention is active.
+           Increases visual separation between paragraphs and adds a subtle
+           left accent to each chunk — reduces visual density and supports
+           chunked information processing (Mayer, 2009 Cognitive Theory of
+           Multimedia Learning). Reverts automatically when intervention is
+           acknowledged / dismissed. */
+        .reader-content--chunked .chunk {
+          margin-bottom: 44px;
+          padding-left: 14px;
+          border-left: 3px solid rgba(79,110,247,0.25);
+          transition: border-left 0.3s ease, padding-left 0.3s ease;
+        }
+        .reader-content--chunked .chunk__p {
+          line-height: 2.0;
+          letter-spacing: 0.012em;
+        }
+
         /* ── Content column ── */
         .reader-content {
           width: 100%;
@@ -1404,6 +1918,19 @@ export function ReaderPage() {
         .reader-body--adaptive .chunk {
           margin-left: 0;
           margin-right: 0;
+        }
+
+        /* Section summary card — same width/margin rules as .chunk */
+        .section-summary-card {
+          max-width: 85ch;
+          font-size: 19px;
+          margin-left: auto;
+          margin-right: auto;
+        }
+        .reader-body--adaptive .section-summary-card {
+          margin-left: 0;
+          margin-right: 0;
+          max-width: none;
         }
 
         /* Text */

@@ -83,7 +83,7 @@ MANUAL_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 
     "ambient_sound": {
-        "sound":    "ambient_shift",
+        "sound":    "nature",
         "profile":  "focus",
         "note":     "background audio shifted to low-stimulation profile",
     },

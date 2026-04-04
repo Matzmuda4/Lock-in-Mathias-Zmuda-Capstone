@@ -229,6 +229,26 @@ async def _recompute_and_save(
         batches=batches,
     )
 
+    # ── Inject active-intervention flags for classifier awareness ─────────────
+    # When specific interventions are currently on-screen, the user's behavioural
+    # patterns deviate from the trained distribution in predictable ways:
+    #   section_summary — user is deliberately reading inline system content
+    #   text_reformat   — altered layout changes expected scroll/pace patterns
+    # Injecting these boolean flags lets the RF post-processor apply focused-state
+    # boosts that prevent these intentional pauses from being classified as drift.
+    if packet_info is not None:
+        try:
+            from app.services.intervention.engine import get_active_tracker
+            _active_types = {
+                ai["type"]
+                for ai in get_active_tracker().active_for_session(session.id)
+            }
+            _feat = packet_info.packet_json.setdefault("features", {})
+            _feat["section_summary_active"] = "section_summary" in _active_types
+            _feat["text_reformat_active"]   = "text_reformat"   in _active_types
+        except Exception:
+            pass  # never block drift computation on tracker state failures
+
     # ── Fire classifier when a full-window state packet was written ────────────
     # packet_info is non-None every ~10 s (every 5th telemetry batch at 2 s cadence).
     # Full-window gate: only classify when n_batches >= 14 (≈ 28-second window).

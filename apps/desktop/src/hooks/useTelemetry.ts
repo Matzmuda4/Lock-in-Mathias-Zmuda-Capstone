@@ -292,6 +292,8 @@ export function useTelemetry({
   const windowStart = useRef<number>(Date.now());
 
   const mousePoints = useRef<Point[]>([]);
+  // Throttle: max one mouse-point sample per 50 ms (≤ 20/s vs. potential 100-200/s raw)
+  const lastMouseSample = useRef<number>(0);
 
   const windowFocused = useRef(true);
 
@@ -519,8 +521,13 @@ export function useTelemetry({
 
     const onMouseMove = (e: MouseEvent) => {
       if (!activeRef.current) return;
-      lastInteraction.current = Date.now();
-      mousePoints.current.push({ x: e.clientX, y: e.clientY });
+      const now = Date.now();
+      lastInteraction.current = now;
+      // Sample at most once per 50 ms — reduces allocations from ~150/s to ~20/s
+      if (now - lastMouseSample.current >= 50) {
+        mousePoints.current.push({ x: e.clientX, y: e.clientY });
+        lastMouseSample.current = now;
+      }
     };
 
     const onKeyDown = () => {

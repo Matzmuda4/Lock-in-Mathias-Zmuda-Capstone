@@ -317,6 +317,22 @@ async def trigger_intervention(
         final_status = decision.reason
 
         if decision.allowed:
+            # Attach the current reading position to section_summary content so
+            # the frontend can render the card inline at the right chunk, not the
+            # top of the document.  Uses "_chunk_index" (underscore prefix) to
+            # distinguish metadata from LLM-generated display fields.
+            if result.type == "section_summary" and chunk_index is not None:
+                content_with_pos = dict(result.content or {})
+                content_with_pos["_chunk_index"] = chunk_index
+                result = result.__class__(
+                    intervene  = result.intervene,
+                    tier       = result.tier,
+                    type       = result.type,
+                    content    = content_with_pos,
+                    raw_json   = result.raw_json,
+                    latency_ms = result.latency_ms,
+                    parse_ok   = result.parse_ok,
+                )
             logged  = await _log_intervention(session_id, result, db)
             await db.commit()
             tracker.mark_fired(session_id, logged.id, result.type, result.tier)  # type: ignore[arg-type]
