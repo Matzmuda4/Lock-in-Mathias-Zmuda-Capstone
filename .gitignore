@@ -73,3 +73,29 @@ TrainingData/baselines/
 TrainingData/_append_index.json
 TrainingData/.append.lock
 TrainingData/labelled.jsonl
+
+# ── Intermediate training datasets (labelling pipeline artefacts) ──────────────
+# KEEP: intervention_train_v2.jsonl, intervention_eval_v2.jsonl,
+#       intervention_training_v2_labelled.jsonl (final train/eval + base)
+TrainingData/batches/
+TrainingData/intervention_training_v2_skeletons.jsonl
+TrainingData/intervention_training_v2_prelabelled.jsonl
+TrainingData/intervention_training_raw.jsonl
+TrainingData/intervention_training_labeled.jsonl
+TrainingData/intervention_training_final.jsonl
+TrainingData/supervised.jsonl
+TrainingData/supervised_v2_backup.jsonl
+TrainingData/intervention_eval.jsonl
+TrainingData/intervention_train.jsonl
+TrainingData/build_intervention_dataset.py
+TrainingData/generate_synthetic.py
+TrainingData/merge_supervised.py
+TrainingData/eda.py
+
+# ── LLM model weights and build artefacts (too large for git) ─────────────────
+# adapter_model.safetensors is already covered by *.safetensors above
+# tokenizer.json is large (~11 MB) but committed; only the binary weights are ignored
+InterventionLLM/lockin_gguf/
+InterventionLLM/lockin_merged/
+InterventionLLM/llama.cpp-src/
+InterventionLLM/Qwen2.5-7B-Instruct/

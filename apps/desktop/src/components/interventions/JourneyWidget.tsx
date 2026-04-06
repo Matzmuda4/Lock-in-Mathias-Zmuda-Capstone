@@ -2,17 +2,19 @@
  * JourneyWidget — "The Walk of Words"
  *
  * Appears only when a `gamification` intervention fires (not by default).
- * Stays pinned in the panel for the rest of the session — no dismiss button.
+ * Stays pinned in the panel until the mountain peak is reached, at which point
+ * a congratulations overlay is shown, and then the widget hides permanently.
  *
  * Layout: horizontal track at top; checkpoint icons hang below on stems.
  * The yellow user-dot and the fill line are always in the same coordinate
  * space, so they move in perfect sync.
  *
- * XP thresholds: 0 / 25 / 50 / 75 / 100
- * Per-window XP: focused ≈ 3–5 · hyperfocused ≈ 5–8 · badges add bonus
+ * XP thresholds: 0 / 75 / 150 / 225 / 300
+ * Per-window XP (when gamification is active):
+ *   focused ≈ 3–5 · hyperfocused ≈ 5–8 · badge bonus = +10 each
  */
 
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { ActiveIntervention, GamificationContent } from "../../services/interventionService";
 import type { BadgeDef } from "../../types/badges";
 
@@ -20,10 +22,10 @@ import type { BadgeDef } from "../../types/badges";
 
 const CHECKPOINTS = [
   { icon: "/GamifiedIcons/WakeupIcon.png",   label: "Start",          xp: 0   },
-  { icon: "/GamifiedIcons/HikeIcon.png",     label: "Walking Along",  xp: 25  },
-  { icon: "/GamifiedIcons/TreeIcon.webp",    label: "Tree of Life",   xp: 50  },
-  { icon: "/GamifiedIcons/LakeIcon.png",     label: "Lake of Wisdom", xp: 75  },
-  { icon: "/GamifiedIcons/MountainIcon.jpg", label: "Mountain Peak",  xp: 100 },
+  { icon: "/GamifiedIcons/HikeIcon.png",     label: "Walking Along",  xp: 75  },
+  { icon: "/GamifiedIcons/TreeIcon.webp",    label: "Tree of Life",   xp: 150 },
+  { icon: "/GamifiedIcons/LakeIcon.png",     label: "Lake of Wisdom", xp: 225 },
+  { icon: "/GamifiedIcons/MountainIcon.jpg", label: "Mountain Peak",  xp: 300 },
 ] as const;
 
 const TOTAL     = CHECKPOINTS.length;
@@ -37,6 +39,8 @@ export interface JourneyWidgetProps {
   sessionEnded?: boolean;
   /** Badges already earned this session — shown as mini-icons beside the title. */
   earnedBadges?: BadgeDef[];
+  /** Called once when the user reaches Mountain Peak and dismisses the congrats overlay. */
+  onComplete?:   () => void;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -88,18 +92,57 @@ export default function JourneyWidget({
   xp,
   sessionEnded = false,
   earnedBadges = [],
+  onComplete,
 }: JourneyWidgetProps) {
-  const idx      = reachedIndex(xp, sessionEnded);
+  const [showCongrats, setShowCongrats] = useState(false);
+  const completedRef = useRef(false);
+
+  const isComplete = xp >= MAX_XP;
+
+  // Fire the congrats overlay exactly once when the student reaches Mountain Peak.
+  useEffect(() => {
+    if (isComplete && !completedRef.current) {
+      completedRef.current = true;
+      setShowCongrats(true);
+    }
+  }, [isComplete]);
+
+  const handleCongratsClose = () => {
+    setShowCongrats(false);
+    onComplete?.();
+  };
+
+  const idx      = reachedIndex(xp, sessionEnded || isComplete);
   const frac     = segFrac(xp, idx);
   const dispXP   = Math.min(xp, MAX_XP);
   const content  = intervention.content as GamificationContent | null;
   const badgeMsg = content?.message;
 
   // Track progress: 0 → 1 across all checkpoints.
-  // All positions (fill, dot, checkpoint nodes) reference this single value.
-  const trackProg = sessionEnded ? 1 : (idx + frac) / (TOTAL - 1);
+  const trackProg = (sessionEnded || isComplete) ? 1 : (idx + frac) / (TOTAL - 1);
 
   return (
+    <>
+    {/* ── Congratulations overlay ── */}
+    {showCongrats && (
+      <div style={s.congratsBackdrop}>
+        <div style={s.congratsCard}>
+          <img
+            src="/GamifiedIcons/MountainIcon.jpg"
+            alt="Mountain Peak"
+            style={s.congratsIcon}
+          />
+          <p style={s.congratsTitle}>You reached the Mountain Peak! 🏔️</p>
+          <p style={s.congratsBody}>
+            Incredible effort — you walked the full path and proved your focus.
+            Your session journey is complete.
+          </p>
+          <button style={s.congratsBtn} onClick={handleCongratsClose}>
+            Amazing!
+          </button>
+        </div>
+      </div>
+    )}
     <div style={s.card}>
 
       {/* Header */}
@@ -200,6 +243,7 @@ export default function JourneyWidget({
         </div>
       </div>
     </div>
+    </>
   );
 }
 
@@ -369,6 +413,61 @@ const s: Record<string, React.CSSProperties> = {
     textAlign: "center",
     whiteSpace: "nowrap",
     lineHeight: 1.2,
+  },
+
+  // ── Congratulations overlay ──
+  congratsBackdrop: {
+    position: "fixed" as const,
+    inset: 0,
+    background: "rgba(15, 23, 42, 0.55)",
+    zIndex: 2000,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  congratsCard: {
+    background: "#fff",
+    borderRadius: "18px",
+    padding: "32px 28px 24px",
+    maxWidth: "340px",
+    width: "90%",
+    textAlign: "center" as const,
+    boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
+    display: "flex",
+    flexDirection: "column" as const,
+    alignItems: "center",
+    gap: "12px",
+  },
+  congratsIcon: {
+    width: "96px",
+    height: "96px",
+    borderRadius: "50%",
+    objectFit: "cover" as const,
+    border: "3px solid #3b82f6",
+  },
+  congratsTitle: {
+    margin: 0,
+    fontSize: "20px",
+    fontWeight: 800,
+    color: "#1e3a5f",
+    lineHeight: 1.25,
+  },
+  congratsBody: {
+    margin: 0,
+    fontSize: "13.5px",
+    color: "#475569",
+    lineHeight: 1.6,
+  },
+  congratsBtn: {
+    marginTop: "4px",
+    padding: "10px 28px",
+    background: "#3b82f6",
+    color: "#fff",
+    border: "none",
+    borderRadius: "10px",
+    fontSize: "14px",
+    fontWeight: 700,
+    cursor: "pointer",
   },
 };
 

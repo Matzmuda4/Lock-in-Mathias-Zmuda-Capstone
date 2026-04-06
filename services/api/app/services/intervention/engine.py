@@ -104,9 +104,11 @@ MAX_TEXT_PROMPTS:      int = 2
 MAX_FOREGROUND_ACTIVE: int = 3
 
 # Default timing constants (overridden by config)
-DEFAULT_MIN_GAP_SECONDS:          int = 60
+# Min-gap is kept very small (10 s) just to prevent burst-firing on the same
+# window.  The LLM is the primary pacing mechanism — no hard cooldown floor.
+DEFAULT_MIN_GAP_SECONDS:          int = 10
 DEFAULT_BREAK_COOLDOWN_SECONDS:   int = 300  # 5 minutes post-break
-DEFAULT_AUTO_DISMISS_SECONDS:     int = 60   # unacknowledged text prompt TTL
+DEFAULT_AUTO_DISMISS_SECONDS:     int = 90   # unacknowledged text prompt TTL
 
 
 # ── Response types ────────────────────────────────────────────────────────────
@@ -138,21 +140,54 @@ _PARSE_FALLBACK = InterventionResult(
 )
 
 
+def _extract_first_json(raw: str) -> str | None:
+    """
+    Find and return the first complete, balanced JSON object in ``raw``.
+
+    Uses brace-depth tracking so appended user-input content after the
+    closing ``}`` does not corrupt the parse.  Returns None if not found.
+    """
+    for start in range(len(raw)):
+        if raw[start] != "{":
+            continue
+        depth, in_str, escape = 0, False, False
+        for end in range(start, len(raw)):
+            ch = raw[end]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start : end + 1]
+    return None
+
+
 def _parse_response(raw: str, latency_ms: int) -> InterventionResult:
     """
-    Parse the LLM's single-line JSON output into an InterventionResult.
+    Parse the LLM's JSON output into an InterventionResult.
 
-    Tolerates leading/trailing whitespace and stray trailing tokens.
+    Uses balanced-brace extraction so trailing user-input echo or stray
+    tokens after the closing ``}`` do not corrupt the parse.
     """
     raw = raw.strip()
-    start = raw.find("{")
-    end   = raw.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    candidate = _extract_first_json(raw)
+    if candidate is None:
         log.warning("[intervention_engine] No JSON object found in output: %r", raw[:200])
         return InterventionResult(**{**_PARSE_FALLBACK.__dict__, "raw_json": raw, "latency_ms": latency_ms})
 
     try:
-        obj: dict[str, Any] = json.loads(raw[start:end + 1])
+        obj: dict[str, Any] = json.loads(candidate)
     except json.JSONDecodeError as exc:
         log.warning("[intervention_engine] JSON decode error — %s. Raw: %r", exc, raw[:200])
         return InterventionResult(**{**_PARSE_FALLBACK.__dict__, "raw_json": raw, "latency_ms": latency_ms})
@@ -182,7 +217,7 @@ def _parse_response(raw: str, latency_ms: int) -> InterventionResult:
         tier       = tier,
         type       = itype,
         content    = content if isinstance(content, (dict, type(None))) else {"raw": content},
-        raw_json   = raw[start:end + 1],
+        raw_json   = candidate,
         latency_ms = latency_ms,
         parse_ok   = True,
     )
@@ -290,10 +325,19 @@ class ActiveInterventionTracker:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def check(self, session_id: int, itype: str) -> FireDecision:
+    def check(
+        self,
+        session_id:    int,
+        itype:         str,
+        primary_state: str = "focused",
+    ) -> FireDecision:
         """
         Gate check — returns a FireDecision describing whether ``itype``
         may fire right now and the reason if not.
+
+        ``primary_state`` is used to set the effective minimum gap dynamically:
+          - drifting / cognitive_overload → 0 s  (intervene freely)
+          - focused / hyperfocused         → self._min_gap  (preserve focus)
         """
         self._auto_dismiss_stale(session_id)
         now = self._now()
@@ -310,16 +354,23 @@ class ActiveInterventionTracker:
                 if elapsed < self._break_cooldown:
                     return FireDecision(False, "post_break_cooldown")
 
-        # 3. Passive types — fire freely, no further checks
+        # 3. Passive types — always fire freely
         if itype in PASSIVE_TYPES:
             return FireDecision(True, "clear")
 
-        # 4. Minimum gap floor (applies to instant, text, non-text, nuclear)
+        # 4. Dynamic minimum gap:
+        #    • 0 s when student is drifting/overloaded — speed of response matters
+        #    • self._min_gap when student is focused — avoid interrupting good flow
+        if primary_state in ("drifting", "cognitive_overload"):
+            effective_gap = 0
+        else:
+            effective_gap = self._min_gap
+
         last = self._last_fired.get(session_id)
-        if last is not None and (now - last).total_seconds() < self._min_gap:
+        if effective_gap > 0 and last is not None and (now - last).total_seconds() < effective_gap:
             return FireDecision(False, "min_gap")
 
-        # 5. Instant types — only subject to min gap (no slot consumed)
+        # 5. Instant types — subject only to the global min gap
         if itype in INSTANT_TYPES:
             return FireDecision(True, "clear")
 
@@ -399,14 +450,14 @@ class ActiveInterventionTracker:
             return None
         return int((self._now() - last).total_seconds())
 
-    def status(self, session_id: int) -> str:
+    def status(self, session_id: int, primary_state: str = "focused") -> str:
         """
         Simplified 'clear'/'cooling' signal for the LLM prompt.
 
         Computed using a representative text-prompt type so it reflects
         the most common foreground gate.
         """
-        return self.check(session_id, "re_engagement").cooldown_status
+        return self.check(session_id, "re_engagement", primary_state).cooldown_status
 
     def reset(self, session_id: int) -> None:
         """Wipe all state for this session (call on session end)."""
@@ -456,7 +507,7 @@ class InterventionEngine:
         self,
         base_url: str  = "http://localhost:11434",
         model:    str  = "lockin-intervention",
-        timeout:  float = 45.0,
+        timeout:  float = 60.0,
     ) -> None:
         self._generate_url = f"{base_url}/api/generate"
         self._health_url   = f"{base_url}/api/tags"
@@ -468,7 +519,15 @@ class InterventionEngine:
         Send the pre-built ChatML prompt and parse the JSON response.
 
         Uses ``raw=true`` to bypass Ollama's template engine.
-        ``num_predict=256`` caps output to keep latency under 10 seconds.
+        ``num_ctx=4096`` overrides the Modelfile default (2048) — required
+        because the full prompt (system ~662t + dense text window ~800t +
+        session JSON ~300t) can exceed 2048 tokens, causing silent failures.
+        ``num_predict=220`` covers the longest trained output type (section_summary
+        ~150 tokens) with headroom, and saves ~6 s vs 350 at 23 tok/s on Metal.
+        ``temperature=0.5`` gives enough freedom to select minority types
+        (chime, text_reformat, ambient_sound) that have lower learned priors.
+        ``timeout=60s`` is conservative for ~14 s typical call (4 s prefill +
+        9.5 s generation at 23 tok/s Metal); catches genuine hangs quickly.
         """
         t0 = time.monotonic()
         try:
@@ -481,11 +540,12 @@ class InterventionEngine:
                         "stream": False,
                         "raw":    True,
                         "options": {
-                            "temperature":    0.1,
-                            "top_k":          20,
-                            "top_p":          0.9,
-                            "repeat_penalty": 1.1,
-                            "num_predict":    256,
+                            "num_ctx":        4096,
+                            "temperature":    0.5,
+                            "top_k":          50,
+                            "top_p":          0.95,
+                            "repeat_penalty": 1.05,
+                            "num_predict":    220,
                         },
                     },
                 )
@@ -500,8 +560,12 @@ class InterventionEngine:
             )
 
         latency_ms = int((time.monotonic() - t0) * 1000)
-        raw_text   = r.json().get("response", "")
-        result     = _parse_response(raw_text, latency_ms)
+        raw_continuation = r.json().get("response", "")
+        # The prompt seeds the assistant turn with {"intervene": so Ollama
+        # returns only the continuation (e.g. `true,"type":"chime",...}`).
+        # Prepend the seeded prefix to reconstruct the complete JSON object.
+        raw_text = '{"intervene":' + raw_continuation
+        result   = _parse_response(raw_text, latency_ms)
 
         log.info(
             "[intervention_engine] intervene=%s tier=%s type=%s latency=%dms parse_ok=%s",

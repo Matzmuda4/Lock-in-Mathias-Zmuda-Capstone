@@ -4,14 +4,12 @@ intervention/prompt.py
 Assembles the exact ChatML-formatted raw prompt string the intervention LLM
 expects.  This is a pure function module — no network, no DB, no FastAPI.
 
-The prompt format mirrors the training data produced by
-  TrainingData/build_intervention_dataset.py
-and the validated inference call confirmed at 17-19 tok/s on Apple M3 Metal.
-
-Key design decisions (Single Responsibility / Open-Closed):
-  • This module owns ONLY prompt construction.
-  • All DB queries live in the router layer.
-  • Changing the prompt structure never touches the engine or router.
+Key design decisions:
+  • Uses raw=true on Ollama /api/generate, bypassing the baked-in Modelfile
+    SYSTEM block so we can evolve the runtime system prompt independently of
+    the GGUF.  Validated inference path: 17-19 tok/s, correct JSON output.
+  • INTERVENTION_SYSTEM_PROMPT is the authoritative runtime system prompt.
+    The Modelfile SYSTEM block is used only when GGUF was created.
 """
 
 from __future__ import annotations
@@ -19,29 +17,54 @@ from __future__ import annotations
 import json
 from typing import Any
 
-# Minimum gap between fires — 60 s (one RF window).
-# The primary gate is now slot-based (ActiveInterventionTracker); this is
-# only a safety floor to prevent burst firing.
-COOLDOWN_SECONDS: int = 60
-
 # ── System prompt ─────────────────────────────────────────────────────────────
-# Must match the Modelfile SYSTEM block exactly (same wording as training).
-INTERVENTION_SYSTEM_PROMPT: str = (
-    "You are an adaptive reading assistant engine embedded in a digital reading "
-    "tool called Lock-in. Every 10 seconds you receive a 30-second window of "
-    "signals about a student's attentional state, drift trajectory, and the text "
-    "they are currently reading. Your task is to: "
-    "(1) identify the most appropriate intervention type and tier "
-    "(subtle | moderate | strong | special) based on the signals, and always "
-    "generate its content; "
-    "(2) set 'intervene' to true only when cooldown_status is 'clear' — "
-    "if cooldown_status is 'cooling', set 'intervene' to false but still output "
-    "the full content of what you would have fired, so the system can schedule it "
-    "for the next clear window; "
-    "(3) if no intervention is warranted at all (tier='none'), set 'intervene' to "
-    "false and 'content' to null. "
-    "Respond with a single valid JSON object only — no prose, no markdown fences."
-)
+#
+# This prompt is the authoritative runtime anchor for the fine-tuned model.
+# It matches the training-time instruction field in intervention_training_v2_skeletons.jsonl
+# and adds:
+#   - Per-type content schemas (JSON shapes) — reduces format errors
+#   - High-signal decision rules — steers minority types (chime, ambient_sound)
+#   - "Never copy verbatim" constraint — reinforces dataset-level quality rules
+#   - active_interventions check — prevents redundant concurrent suggestions
+#
+# Target: ~300 tokens. Beyond ~400 tokens diminishing returns set in quickly
+# as the system turn competes with the user message for model attention.
+#
+INTERVENTION_SYSTEM_PROMPT: str = """\
+You are an adaptive reading assistant engine embedded in a digital reading tool called \
+Lock-in. Every ~30 seconds you receive a window of signals about a student's attentional \
+state, drift trajectory, and the text they are currently reading. Your task is to decide: \
+(1) which intervention type and tier is most appropriate RIGHT NOW; \
+(2) generate contextually specific content grounded in what the student is reading.
+
+Output a single valid JSON object — no prose, no markdown fences, no code blocks:
+{"intervene": true|false, "type": "<type>", "tier": "subtle|moderate|strong|none", "content": {...}|null}
+
+Intervention types and required content shapes:
+- none           : content null  — ONLY when drift_ema < 0.10 AND state is focused or hyperfocused
+- chime          : {"sound": "chime", "note": "attention cue"}
+- ambient_sound  : {"sound": "nature|pink_noise|brown_noise", "note": "<why>"}
+- text_reformat  : {"mode": "spaced|chunked", "note": "<why>"}
+- gamification   : {"event": "journey_start|milestone|xp_boost", "message": "<specific to text>"}
+- focus_point    : {"headline": "<curiosity hook from text>", "body": "<1-2 sentences from text>", "cta": "Keep reading"}
+- re_engagement  : {"headline": "<direct pull-back hook>", "body": "<what they're missing in text>", "cta": "Jump back in"}
+- section_summary: {"title": "<descriptive>", "summary": "<synthesise — never quote verbatim>", "key_point": "<one key insight>"}
+- comprehension_check: {"type": "true_false", "question": "<testable claim>", "answer": true|false, "explanation": "<why>"}
+- break_suggestion: {"headline": "Take a breather", "message": "<what they read + why a break helps>", "duration_minutes": 5}
+
+STRICT decision rules — follow exactly:
+- drift_ema < 0.10 AND focused/hyperfocused   → none (genuine focus, do not disturb)
+- drift_ema 0.10–0.25 AND focused              → chime or focus_point (earliest nudge)
+- drift_ema 0.10–0.25 AND hyperfocused         → comprehension_check (verify encoding)
+- drift_ema 0.25–0.50 AND focused/drifting     → focus_point, re_engagement, or ambient_sound
+- drift_ema > 0.50 AND drifting                → re_engagement or section_summary
+- drift_ema > 0.65 AND cognitive_overload      → text_reformat or section_summary
+- drift_ema > 0.80 AND sustained overload      → break_suggestion
+- gamification: fire when focused progress is sustained (drift_ema < 0.20, consecutive focus)
+- NEVER fire the same type that is already in active_interventions
+- NEVER return none if drift_ema > 0.15 — always choose the most appropriate type
+- Always ground text-generative content in text_window. Never copy sentences verbatim.\
+"""
 
 # Tier ordering for session-stage mapping.
 _SESSION_STAGE_MINUTES: tuple[tuple[float, str], ...] = (
@@ -98,7 +121,6 @@ def build_intervention_input(
             "cooldown_status":      cooldown_status,
             "xp":                   xp,
             "badges_earned":        badges_earned,
-            # What is currently visible to the user right now
             "active_interventions": active_interventions or [],
         },
         "attentional_state_window": attentional_window,
@@ -115,13 +137,34 @@ def build_raw_chatml_prompt(input_dict: dict[str, Any]) -> str:
     """
     Wrap the structured input dict in the ChatML tokens the model was trained on.
 
+    The user message leads with the reading text explicitly so the model cannot
+    miss it, then provides the structured JSON data.
+
     Using ``raw=true`` in the Ollama API call bypasses Ollama's template engine,
-    so we must supply the full ChatML string ourselves.  This was validated as the
-    correct inference path (17-19 tok/s, correct JSON output).
+    so we supply the full ChatML string ourselves.
     """
-    user_content = json.dumps(input_dict, ensure_ascii=False, separators=(",", ":"))
+    # Hoist text_window to the very top so the model grounds in it first
+    reading_ctx = input_dict.get("reading_context", {})
+    text_window: list[str] = reading_ctx.get("text_window") or []
+    text_block = ""
+    if text_window:
+        paragraphs = "\n\n".join(text_window)
+        text_block = (
+            "READING TEXT (what the student is reading right now):\n"
+            "---\n"
+            f"{paragraphs}\n"
+            "---\n\n"
+        )
+
+    data_content = json.dumps(input_dict, ensure_ascii=False, separators=(",", ":"))
+    user_message = f"{text_block}SESSION DATA:\n{data_content}"
+
+    # Seed the assistant turn with the opening token so the model cannot
+    # echo the user-input JSON back.  All training outputs start with
+    # {"intervene":  — seeding this forces the model onto the correct path.
+    # engine.py prepends this prefix back before parsing the response.
     return (
         f"<|im_start|>system\n{INTERVENTION_SYSTEM_PROMPT}<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        f"<|im_start|>user\n{user_message}<|im_end|>\n"
+        '<|im_start|>assistant\n{"intervene":'
     )

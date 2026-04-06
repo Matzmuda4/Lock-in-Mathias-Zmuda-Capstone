@@ -435,6 +435,10 @@ interface AssistantPanelProps {
   earnedBadges:         BadgeDef[];
   /** Whether a break is currently in progress — pauses the audioscape. */
   breakActive:          boolean;
+  /** True once the journey has been completed (Mountain Peak reached + congrats dismissed). */
+  journeyCompleted:     boolean;
+  /** Callback to mark the journey as completed from within the journey widget. */
+  onJourneyComplete:    () => void;
 }
 
 const AssistantPanel = memo(function AssistantPanel({
@@ -449,11 +453,26 @@ const AssistantPanel = memo(function AssistantPanel({
   sessionEnded,
   earnedBadges,
   breakActive,
+  journeyCompleted,
+  onJourneyComplete,
 }: AssistantPanelProps) {
   // Dev test controls
   const [devType, setDevType] = useState<InterventionType>("focus_point");
   const [devTier, setDevTier] = useState<InterventionTier>("moderate");
   const [devFiring, setDevFiring] = useState(false);
+
+  // Dev panel visibility — persisted in localStorage so it survives refreshes.
+  // Toggle off to observe natural LLM behaviour without test buttons.
+  const [showDev, setShowDev] = useState<boolean>(() => {
+    try { return localStorage.getItem("lockin_dev_open") !== "false"; } catch { return true; }
+  });
+  const handleToggleDev = useCallback(() => {
+    setShowDev((prev) => {
+      const next = !prev;
+      try { localStorage.setItem("lockin_dev_open", String(next)); } catch {}
+      return next;
+    });
+  }, []);
 
   const handleDevFire = async () => {
     setDevFiring(true);
@@ -491,26 +510,53 @@ const AssistantPanel = memo(function AssistantPanel({
         <span className="assistant-panel__title">
           {open ? "Lock-in Assistant" : ""}
         </span>
-        <button
-          className="assistant-panel__toggle"
-          type="button"
-          aria-label={open ? "Collapse panel" : "Expand panel"}
-          onClick={onToggle}
-        >
-          {open ? "›" : "‹"}
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+          {/* Dev mode toggle — only visible in Vite dev builds */}
+          {DEV && open && (
+            <button
+              type="button"
+              onClick={handleToggleDev}
+              title={showDev ? "Hide dev tools" : "Show dev tools"}
+              style={{
+                background:   showDev ? "rgba(245,158,11,0.15)" : "rgba(0,0,0,0.06)",
+                border:       `1px solid ${showDev ? "rgba(245,158,11,0.5)" : "rgba(0,0,0,0.1)"}`,
+                borderRadius: "5px",
+                color:        showDev ? "#b45309" : "#94a3b8",
+                fontSize:     "10px",
+                fontWeight:   700,
+                padding:      "2px 6px",
+                cursor:       "pointer",
+                lineHeight:   1.4,
+                letterSpacing:"0.02em",
+                transition:   "background 0.15s, color 0.15s",
+              }}
+            >
+              {showDev ? "🧪 DEV" : "DEV"}
+            </button>
+          )}
+          <button
+            className="assistant-panel__toggle"
+            type="button"
+            aria-label={open ? "Collapse panel" : "Expand panel"}
+            onClick={onToggle}
+          >
+            {open ? "›" : "‹"}
+          </button>
+        </div>
       </div>
 
       {open && (
         <div className="assistant-panel__body">
 
-          {/* ── Journey widget — only when a gamification intervention is active ── */}
-          {gamificationIntervention && (
+          {/* ── Journey widget — only when a gamification intervention is active
+                 and the journey hasn't been completed yet ── */}
+          {gamificationIntervention && !journeyCompleted && (
             <JourneyWidget
               intervention={gamificationIntervention}
               xp={sessionXP}
               sessionEnded={sessionEnded}
               earnedBadges={earnedBadges}
+              onComplete={onJourneyComplete}
             />
           )}
 
@@ -548,8 +594,8 @@ const AssistantPanel = memo(function AssistantPanel({
             </div>
           )}
 
-          {/* ── Dev: manual fire ─────────────────────────────────────────── */}
-          {DEV && (
+          {/* ── Dev: manual fire (hidden when showDev is off) ────────────── */}
+          {DEV && showDev && (
             <div className="panel-section">
               <p className="panel-section__label" style={{ color: "#f59e0b" }}>
                 🧪 Dev — Test Intervention
@@ -633,8 +679,8 @@ const AssistantPanel = memo(function AssistantPanel({
             </div>
           )}
 
-          {/* ── Placeholder when nothing is active and not in dev mode ──── */}
-          {!hasVisibleInterventions && !DEV && (
+          {/* ── Placeholder when nothing is active and dev tools are hidden ── */}
+          {!hasVisibleInterventions && (!DEV || !showDev) && (
             <div className="panel-section panel-section--muted">
               <p className="assistant-panel__placeholder">
                 Interventions will appear here.
@@ -1029,6 +1075,13 @@ export function ReaderPage() {
   const consecutiveHyperRef  = useRef(0);  // consecutive hyperfocused-only windows
   const consecutiveCleanRef  = useRef(0);  // consecutive non-drifting windows
   const prevAttStateRef      = useRef<string | null>(null);
+  // Track how many consecutive drifting windows before comeback_kid
+  const consecutiveDriftRef  = useRef(0);
+
+  // ── Journey completion — hide widget after "Amazing!" but allow restart ─
+  const [journeyCompleted, setJourneyCompleted] = useState(false);
+  // Track the last gamification intervention id so we know when a NEW one fires
+  const lastGamificationIdRef = useRef<number | null>(null);
 
   // ── Break-active flag (pauses audioscape during a break) ─────────────────
   const [breakActive, setBreakActive] = useState(false);
@@ -1159,7 +1212,20 @@ export function ReaderPage() {
   const gamificationActiveRef = useRef(false);
   useEffect(() => {
     gamificationActiveRef.current = activeInterventions.some((i) => i.type === "gamification");
-  }, [activeInterventions]);
+
+    // When a NEW gamification intervention fires (different id from last seen),
+    // restart the journey: reset XP and clear the completed flag so widget shows.
+    const current = activeInterventions.find((i) => i.type === "gamification");
+    if (current && current.intervention_id !== lastGamificationIdRef.current) {
+      const isFirstEver = lastGamificationIdRef.current === null;
+      lastGamificationIdRef.current = current.intervention_id;
+      // If this is a re-fire (not first time), restart the journey
+      if (!isFirstEver) {
+        setJourneyCompleted(false);
+        setSessionXP(0);
+      }
+    }
+  }, [activeInterventions]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!attentionalState) return;
@@ -1170,15 +1236,18 @@ export function ReaderPage() {
     const state = attentionalState.primary_state;
     const isFocused  = state === "focused" || state === "hyperfocused";
     const isDrifting = state === "drifting" || state === "cognitive_overload";
-    const prevState  = prevAttStateRef.current;
-
-    // XP from reading (3–5 focused, 5–8 hyperfocused)
-    if (state === "focused")
-      setSessionXP((p) => p + 3 + Math.floor(Math.random() * 3));
-    else if (state === "hyperfocused")
-      setSessionXP((p) => p + 5 + Math.floor(Math.random() * 4));
 
     if (!hasFirstClassification) setHasFirstClassification(true);
+
+    // XP only accumulates once gamification is active (Journey has started).
+    // This means the XP counter starts at 0 and builds from the moment the
+    // gamification intervention fires.
+    if (gamificationActiveRef.current) {
+      if (state === "focused")
+        setSessionXP((p) => p + 3 + Math.floor(Math.random() * 3));
+      else if (state === "hyperfocused")
+        setSessionXP((p) => p + 5 + Math.floor(Math.random() * 4));
+    }
 
     // ── Badge tracking (only when gamification intervention is running) ────
     if (gamificationActiveRef.current) {
@@ -1187,9 +1256,17 @@ export function ReaderPage() {
       if (isFocused) {
         consecutiveFocusRef.current++;
         consecutiveCleanRef.current++;
+        // Comeback kid: only after 3+ consecutive drifting/overload windows
+        if (consecutiveDriftRef.current >= 3) {
+          awardBadge("comeback_kid");
+        }
+        consecutiveDriftRef.current = 0;
       } else {
         consecutiveFocusRef.current = 0;
-        if (isDrifting) consecutiveCleanRef.current = 0;
+        if (isDrifting) {
+          consecutiveCleanRef.current = 0;
+          consecutiveDriftRef.current++;
+        }
       }
 
       if (isHyper) {
@@ -1198,52 +1275,51 @@ export function ReaderPage() {
         consecutiveHyperRef.current = 0;
       }
 
-      // Streak badges (each fires exactly once at its threshold)
-      if (consecutiveFocusRef.current === 3)  awardBadge("first_focus_streak");
-      if (consecutiveFocusRef.current === 5)  awardBadge("deep_reader");
-      // focus_master: 3 consecutive *hyperfocused* windows
-      if (consecutiveHyperRef.current  === 3)  awardBadge("focus_master");
-
-      // No-distraction: 10 consecutive non-drifting windows
-      if (consecutiveCleanRef.current === 10) awardBadge("no_distraction");
-
-      // Comeback kid: was drifting/overloaded, now focused
-      if (
-        isFocused &&
-        prevState &&
-        (prevState === "drifting" || prevState === "cognitive_overload")
-      ) {
-        awardBadge("comeback_kid");
-      }
+      // Streak badges — fire exactly once at each threshold
+      // first_focus_streak: 5 consecutive focused/hyperfocused
+      if (consecutiveFocusRef.current === 5)  awardBadge("first_focus_streak");
+      // deep_reader: 8 consecutive focused/hyperfocused
+      if (consecutiveFocusRef.current === 8)  awardBadge("deep_reader");
+      // focus_master: 4 consecutive hyperfocused windows
+      if (consecutiveHyperRef.current  === 4)  awardBadge("focus_master");
+      // no_distraction: 12 consecutive non-drifting windows
+      if (consecutiveCleanRef.current === 12) awardBadge("no_distraction");
     }
 
     prevAttStateRef.current = state;
   }, [attentionalState, hasFirstClassification, awardBadge]);
 
-  // Reading Marathon: award when the session timer reaches 10 minutes (600 s).
+  // Reading Marathon: award when the session timer reaches 15 minutes (900 s).
   // Uses timerSeconds so it fires regardless of whether the user has been
   // focused — it just requires staying in the session for that long.
   useEffect(() => {
-    if (timerSeconds >= 600 && gamificationActiveRef.current) {
+    if (timerSeconds >= 900 && gamificationActiveRef.current) {
       awardBadge("reading_marathon");
     }
   }, [timerSeconds, awardBadge]);
 
-  // Call the LLM trigger endpoint every 30 s once the first classification is ready.
+  // Call the LLM trigger endpoint every 10 s once the first classification is ready.
   // After each call, refresh the active interventions list so new ones appear immediately.
+  // Uses a "skip if already running" guard so slow LLM responses (20-30 s on low-end
+  // hardware) never queue up concurrent calls.
   useEffect(() => {
     if (!token || !isAdaptive || !isActive || !hasFirstClassification) return;
+    let inflight = false;
     const triggerAndRefresh = async () => {
+      if (inflight) return;
+      inflight = true;
       try {
         await interventionService.trigger(token, sessionId);
         const active = await interventionService.getActive(token, sessionId);
         setActiveInterventions(active);
       } catch {
         // Non-critical — LLM trigger failure must never crash the reading session
+      } finally {
+        inflight = false;
       }
     };
     triggerAndRefresh();
-    const id = setInterval(triggerAndRefresh, 30_000);
+    const id = setInterval(triggerAndRefresh, 10_000);
     return () => clearInterval(id);
   }, [token, sessionId, isAdaptive, isActive, hasFirstClassification]);
 
@@ -1286,6 +1362,9 @@ export function ReaderPage() {
   // Acknowledging at confirm time would remove it from the backend's active list,
   // which would drop it from our local state poll and close the overlay mid-break.
   // Instead we acknowledge only when the break actually ends (auto-resume or dismiss).
+
+  // Journey complete — called by JourneyWidget after user dismisses the congrats overlay.
+  const handleJourneyComplete = useCallback(() => setJourneyCompleted(true), []);
 
   // User confirmed the break → pause session only; do NOT acknowledge yet.
   // Also sets breakActive so the audioscape is paused for the duration.
@@ -1579,6 +1658,8 @@ export function ReaderPage() {
             sessionEnded={sessionEnded}
             earnedBadges={earnedBadges}
             breakActive={breakActive}
+            journeyCompleted={journeyCompleted}
+            onJourneyComplete={handleJourneyComplete}
           />
         )}
 

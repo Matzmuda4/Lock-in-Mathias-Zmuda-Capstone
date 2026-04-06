@@ -44,6 +44,7 @@ from app.services.intervention.engine import (
     get_active_tracker,
     get_engine,
 )
+from app.services.intervention import rules as intervention_rules
 from app.services.intervention.prompt import build_intervention_input, build_raw_chatml_prompt
 from app.services.intervention.templates import MANUAL_TEMPLATES
 
@@ -101,6 +102,7 @@ def _build_attentional_window_list(
         {
             "primary_state": row.primary_state,
             "confidence":    round(row.confidence, 4),
+            "drift_ema":     round(row.drift_ema or 0.0, 4),
             "distribution": {
                 "focused":            round(row.prob_focused or 0.0, 4),
                 "drifting":           round(row.prob_drifting or 0.0, 4),
@@ -238,13 +240,11 @@ async def trigger_intervention(
     """
     Full LLM pipeline trigger.
 
-    Gate logic (in order):
-      1. Fetch last 3 attentional-state rows — 422 if none exist yet.
-      2. Check ActiveInterventionTracker gate for the incoming LLM suggestion.
-      3. Build ChatML prompt (includes what's currently on screen).
-      4. Call the intervention LLM.
-      5. Re-check gate for the specific type the LLM returned.
-      6. If gate is clear AND LLM says intervene=True → log to DB + mark fired.
+    1. Fetch last 3 attentional-state rows — 422 if none exist yet.
+    2. Build ChatML prompt with full session context.
+    3. Call the intervention LLM.
+    4. Gate check for the type the LLM returned.
+    5. If gate is clear AND LLM says intervene=True → log to DB + mark fired.
     """
     session = await _get_owned_session(session_id, current_user.id, db)
     tracker = get_active_tracker()
@@ -269,9 +269,10 @@ async def trigger_intervention(
     baseline_json: dict = baseline_row.baseline_json if baseline_row else {}
 
     # ── 2. Build prompt context ───────────────────────────────────────────────
-    elapsed_min  = _elapsed_minutes(session)
-    active_now   = tracker.active_for_session(session_id)
-    gate_overall = tracker.check(session_id, "re_engagement")  # representative check
+    elapsed_min   = _elapsed_minutes(session)
+    active_now    = tracker.active_for_session(session_id)
+    primary_state = rows[-1].primary_state or "focused"
+    gate_overall  = tracker.check(session_id, "re_engagement", primary_state)
 
     last_row = (
         await db.execute(
@@ -306,21 +307,23 @@ async def trigger_intervention(
 
     # ── 3. Call LLM ───────────────────────────────────────────────────────────
     result = await engine.call(prompt)
+    log.info(
+        "[interventions] LLM session=%d type=%s tier=%s intervene=%s",
+        session_id, result.type, result.tier, result.intervene,
+    )
 
-    # ── 4. Gate check for the specific type the LLM returned ─────────────────
-    intervention_id: int | None   = None
+    # ── 4. Gate check for the type the LLM returned ───────────────────────────
+    intervention_id: int | None      = None
     fired_at:        datetime | None = None
     final_status = "not_actionable"
 
     if result.is_actionable():
-        decision = tracker.check(session_id, result.type)  # type: ignore[arg-type]
+        decision = tracker.check(session_id, result.type, primary_state)  # type: ignore[arg-type]
         final_status = decision.reason
 
         if decision.allowed:
-            # Attach the current reading position to section_summary content so
-            # the frontend can render the card inline at the right chunk, not the
-            # top of the document.  Uses "_chunk_index" (underscore prefix) to
-            # distinguish metadata from LLM-generated display fields.
+            # Attach reading position to section_summary so the frontend can
+            # render the card inline at the right chunk in the document.
             if result.type == "section_summary" and chunk_index is not None:
                 content_with_pos = dict(result.content or {})
                 content_with_pos["_chunk_index"] = chunk_index
@@ -347,6 +350,34 @@ async def trigger_intervention(
                 "[interventions] SKIP session=%d reason=%s type=%s tier=%s",
                 session_id, decision.reason, result.type, result.tier,
             )
+
+    # ── 5. Backend supplementary rules ───────────────────────────────────────
+    # chime and text_reformat are rarely selected by the LLM due to gradient
+    # imbalance during training.  These lightweight rules fire them when the
+    # signals clearly call for them, independent of what the LLM decided.
+    #
+    # chime  — fires as a supplement alongside the LLM result (INSTANT type,
+    #          no UI slot consumed).  Signals: drift rising noticeably.
+    #
+    # text_reformat — fires only when the LLM produced nothing actionable and
+    #                 the student is clearly in sustained cognitive overload.
+
+    await intervention_rules.maybe_fire_chime(
+        session_id    = session_id,
+        rows          = rows,
+        primary_state = primary_state,
+        tracker       = tracker,
+        db            = db,
+    )
+
+    if not result.is_actionable():
+        await intervention_rules.maybe_fire_text_reformat(
+            session_id    = session_id,
+            rows          = rows,
+            primary_state = primary_state,
+            tracker       = tracker,
+            db            = db,
+        )
 
     return InterventionPayload(
         intervention_id = intervention_id,
@@ -500,8 +531,6 @@ async def get_pending_intervention(
         session_id=session_id, current_user=current_user, db=db,
     )
     if not active_list:
-        # Fall back to the most recent DB row so there's always *something*
-        # to show on first load (before anything has been acknowledged).
         tracker = get_active_tracker()
         row = (
             await db.execute(
@@ -525,7 +554,6 @@ async def get_pending_intervention(
             cooldown_status = tracker.status(session_id),
             fired_at        = row.created_at,
         )
-    # Return the most recently fired of the active ones
     return sorted(active_list, key=lambda p: p.fired_at or datetime.min.replace(tzinfo=timezone.utc))[-1]
 
 

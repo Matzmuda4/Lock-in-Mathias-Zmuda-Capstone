@@ -41,15 +41,37 @@ type, tier, and generates the intervention content in a single inference pass.
 | `break_suggestion` | System-driven | Selects duration + message | Frontend auto-pauses |
 | `gamification` | System-driven | Selects badge/XP event + message | Frontend updates XP/badges |
 
-### 2.3 Cooldown Logic
+### 2.3 Cooldown & Gate Logic
 
 The LLM outputs `intervene: true | false` on every call:
-- `intervene: true` — cooldown is clear, fire the intervention now
-- `intervene: false` (tier ≠ none) — cooldown active, content is generated but suppressed; system schedules for next clear window
+- `intervene: true` — fire the intervention now (subject to backend gate check)
+- `intervene: false` (tier ≠ none) — cooldown active; content is generated but suppressed
 - `intervene: false` (tier = none) — no intervention warranted
 
 The `session_context.cooldown_status` in the input prompt tells the model the
-current cooldown state. The backend enforces it independently.
+current gate state (`"clear"` or `"cooling"`). The backend enforces gate rules
+independently via `ActiveInterventionTracker` in `engine.py`.
+
+#### Backend gate rules (applied in order)
+
+| Rule | Condition | Effect |
+|------|-----------|--------|
+| 1 | `break_suggestion` is active | Nothing else fires until break is acknowledged |
+| 2 | `break_suggestion` requested AND < 5 min since last break resumed | `break_suggestion` blocked |
+| 3 | Type is `gamification` or `ambient_sound` (PASSIVE) | Always fires freely — no slot or gap check |
+| 4 | **Minimum gap** — dynamically set by attentional state: `drifting`/`cognitive_overload` → **0 s**; `focused`/`hyperfocused` → **10 s** | Prevents burst-firing on the same window during focus; allows rapid response during drift |
+| 5 | Type is `chime` (INSTANT) | Subject only to rule 4 — fires and disappears; consumes no UI slot |
+| 6 | Same type already on screen | Blocked — no duplicate types simultaneously |
+| 7 | Type is a text prompt AND 2 text prompts already on screen | Blocked — max 2 text prompts simultaneously |
+| 8 | 3 or more foreground items already on screen | Blocked — max 3 foreground interventions |
+
+**Auto-dismiss:** Text prompts unacknowledged for > 90 s are silently removed,
+freeing their slot for new interventions. This prevents permanently blocked slots
+if a user ignores a card.
+
+**Post-break cooldown:** After the user resumes from a break suggestion, only
+`break_suggestion` is blocked for 5 minutes. All other intervention types are
+free to fire immediately.
 
 ---
 
@@ -180,39 +202,48 @@ The LLM outputs:
 
 ### 5.1 Source Data
 
-Real reading sessions from `supervised.jsonl` (1,500 sessions, RF classifier
-training data). Each window maps to a `SessionStatePacket`; `activity_events`
-are queried by timestamp to recover `current_chunk_index` and look up real
-paragraph text from `document_chunks`.
+Real reading sessions from `supervised.jsonl`. Signal blocks (attentional states,
+drift progression, text windows, session context) are drawn from genuine session
+data where available, with synthetic context rows used only to fill gaps for
+types that had insufficient real examples.
 
-- **69%** of examples use exact real paragraph text (DB lookup)
-- **12%** use approximate position (fallback midpoint)
-- **19%** use synthetic text templates (DB unreachable for that session)
+- **82%** of examples use real session signal blocks (genuine RF classifier
+  outputs, real transition patterns, real `last_intervention` history)
+- **18%** use synthetic context rows (programmatically generated state/drift
+  combinations used to reach the 80-per-type target for underrepresented types)
 
-### 5.2 Dataset Statistics
+For system-driven intervention types (`chime`, `text_reformat`, `ambient_sound`,
+`none`), real session signal blocks were reused with content assigned
+deterministically from `primary_state` and `drift_ema`. No labelling required
+for these types.
+
+### 5.2 Dataset Statistics (V2)
 
 | Metric | Value |
 |---|---|
-| Total examples | 1,455 |
-| Training split | 1,310 (90%) |
-| Evaluation split | 145 (10%, stratified by type) |
-| Avg sequence length | ~990 tokens |
-| Max sequence length | ~1,770 tokens (fits within 2048) |
+| Total examples | 800 |
+| Per-type count | Exactly 80 per type (stratified) |
+| Real signal rows | 656 (82%) |
+| Synthetic context rows | 144 (18%) |
+| Pre-labelled (system-driven) | 320 — no ChatGPT labelling needed |
+| Pending ChatGPT labelling | 480 — text-generative types |
+| Training split | ~720 (90%, stratified) |
+| Evaluation split | ~80 (10%, stratified by type) |
 
-### 5.3 Intervention Type Distribution
+### 5.3 Intervention Type Distribution (V2 — balanced)
 
-| Type | Count | % |
-|---|---|---|
-| section_summary | 466 | 32.0% |
-| comprehension_check | 224 | 15.4% |
-| re_engagement | 188 | 12.9% |
-| gamification | 129 | 8.9% |
-| focus_point | 118 | 8.1% |
-| break_suggestion | 117 | 8.0% |
-| none | 114 | 7.8% |
-| chime | 44 | 3.0% |
-| text_reformat | 33 | 2.3% |
-| ambient_sound | 22 | 1.5% |
+| Type | Count | Source | Labelling |
+|---|---|---|---|
+| `focus_point` | 80 | 69 real + 11 synthetic context | ChatGPT |
+| `section_summary` | 80 | 80 real | ChatGPT |
+| `comprehension_check` | 80 | 80 real | ChatGPT |
+| `re_engagement` | 80 | 67 real + 13 synthetic context | ChatGPT |
+| `gamification` | 80 | 60 real + 20 synthetic context | ChatGPT |
+| `break_suggestion` | 80 | 46 real + 34 synthetic context | ChatGPT |
+| `chime` | 80 | 80 real signal blocks reused | Pre-labelled (deterministic) |
+| `text_reformat` | 80 | 80 real signal blocks reused | Pre-labelled (deterministic) |
+| `ambient_sound` | 80 | 52 real + 28 synthetic context | Pre-labelled (deterministic) |
+| `none` | 80 | 42 real + 38 synthetic context | Pre-labelled (content = null) |
 
 ### 5.4 Label Logic (Cooldown Rule)
 
@@ -227,15 +258,18 @@ The labelling rule ensures maximum content exposure for the fine-tuned model:
 Cooling examples still have full content so the model learns intervention
 generation in all contexts, while learning to suppress via `intervene: false`.
 
-### 5.5 Dataset Files
+### 5.5 Dataset Files (V2)
 
 | File | Description |
 |---|---|
-| `intervention_training_raw.jsonl` | Rule-based tier/type hints, no labels |
-| `intervention_training_labeled.jsonl` | ChatGPT-labelled (raw, with metadata) |
-| `intervention_training_final.jsonl` | Cleaned: correct output schema, fixed duplicate Qs, diversified content |
-| `intervention_train.jsonl` | ChatML-formatted, 1,310 examples — feed to QLoRA |
-| `intervention_eval.jsonl` | ChatML-formatted, 145 examples — evaluation split |
+| `intervention_training_raw.jsonl` | Original rule-based skeletons (v1, 1,455 rows) |
+| `intervention_training_v2_skeletons.jsonl` | Clean v2 skeletons — 800 rows, 80/type, pre-labelled system rows included |
+| `intervention_training_v2_prelabelled.jsonl` | The 320 pre-labelled system-driven rows (chime, text_reformat, ambient_sound, none) |
+| `batches/batch_NNN.json` | 12 labelling batches (40 rows each) — paste ChatGPT labels directly into these files |
+| `intervention_training_v2_labelled.jsonl` | Final merged dataset — produced by `merge_labels.py` after labelling |
+| `intervention_train_v2.jsonl` | ChatML-formatted training split — feed to QLoRA |
+| `intervention_eval_v2.jsonl` | ChatML-formatted evaluation split |
+| `LABELLING_PROMPT_V2.md` | Full labelling instructions and content schemas for ChatGPT |
 
 ---
 
@@ -313,12 +347,29 @@ for post-session analysis and the cooldown tracker.
 
 ---
 
-## 8. What Remains for Phase 9 (Next)
+## 8. Implementation Status
 
-The training data pipeline and model configuration are complete. The following
-must be implemented before the system is end-to-end functional:
+All core system components are implemented and functional:
 
-1. **Intervention service** (`services/api/app/services/intervention/`) — Ollama client, prompt assembler (reads last 3 `session_attentional_states` rows), cooldown tracker, gamification/XP state
-2. **Intervention router** (`routers/intervention.py`) — endpoints for the frontend to receive intervention decisions and acknowledge completion
-3. **Frontend intervention components** — panel overlays, badge modals, comprehension check UI, break suggestion auto-pause, ambient sound player
-4. **Cooldown enforcement** — in-memory per-session cooldown clock, backed by `interventions` table for persistence across reconnects
+| Component | Status | Location |
+|---|---|---|
+| Intervention service (Ollama client) | ✅ Done | `services/intervention/engine.py` |
+| Prompt assembler | ✅ Done | `services/intervention/prompt.py` |
+| Active intervention tracker / gate | ✅ Done | `engine.py → ActiveInterventionTracker` |
+| Intervention router (trigger, manual fire, acknowledge) | ✅ Done | `routers/interventions.py` |
+| Frontend: Focus Point, Re-engagement, Comprehension Check | ✅ Done | `components/interventions/` |
+| Frontend: Section Summary, Text Reformat | ✅ Done | `components/interventions/` |
+| Frontend: Journey Widget (gamification) | ✅ Done | `JourneyWidget.tsx` |
+| Frontend: Break Suggestion overlay | ✅ Done | `BreakSuggestionOverlay.tsx` |
+| Frontend: Audioscape (ambient sound) | ✅ Done | `AudioscapeWidget.tsx` |
+| Frontend: Chime notification | ✅ Done | `ChimeWidget.tsx` |
+| Frontend: Badge system | ✅ Done | `BadgePopup.tsx`, `ReaderPage.tsx` |
+| Panel interaction boost (RF classifier) | ✅ Done | `rf_classifier.py → _apply_panel_boost` |
+| Text-modification down-weighting | ✅ Done | `drift.py → _recompute_and_save` |
+
+## 9. Remaining Work
+
+1. **Complete ChatGPT labelling** — 12 batches × 40 rows in `batches/` need labels for the 6 text-generative types. Paste ChatGPT responses directly into each `batch_NNN.json`, then run `merge_labels.py` and `format_for_training.py`.
+2. **Retrain the LLM** — upload `intervention_train_v2.jsonl` to Colab and run the QLoRA fine-tuning notebook (`train_lockin_llm.ipynb`).
+3. **Merge adapter + update Ollama** — run `run_merge_and_convert.sh` locally, then `ollama create lockin-intervention -f Modelfile` to replace the current model.
+4. **System prompt** — once the retrained model is deployed, tune `INTERVENTION_SYSTEM_PROMPT` in `prompt.py` based on observed intervention balance during test sessions.

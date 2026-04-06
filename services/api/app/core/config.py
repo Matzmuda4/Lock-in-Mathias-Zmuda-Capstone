@@ -45,12 +45,12 @@ class Settings(BaseSettings):
 
     # Intervention LLM
     intervention_model: str = "lockin-intervention"
-    # Minimum gap between any two fires (safety floor, not the primary gate)
-    intervention_cooldown_seconds: int = 60
+    # Minimum gap between fires — kept tiny so the LLM is the pacing mechanism
+    intervention_cooldown_seconds: int = 10
     # How long after a break_suggestion is acknowledged before another break fires
     intervention_break_cooldown_seconds: int = 300
     # Unacknowledged text-prompt TTL — auto-dismissed after this many seconds
-    intervention_auto_dismiss_seconds: int = 60
+    intervention_auto_dismiss_seconds: int = 90
 
     # File storage — relative to wherever the API process runs
     upload_dir: Path = Path("uploads")

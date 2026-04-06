@@ -27,7 +27,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 HERE         = os.path.dirname(os.path.abspath(__file__))
-ADAPTER_PATH = os.path.join(HERE, "lockin_intervention_adapter")
+ADAPTER_PATH = os.path.join(HERE, "Lockin_adapter_final")
 MERGED_PATH  = os.path.join(HERE, "lockin_merged")
 # Use the locally-downloaded model to avoid re-downloading from HuggingFace
 _local_base  = os.path.join(HERE, "Qwen2.5-7B-Instruct")

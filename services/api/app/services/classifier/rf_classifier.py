@@ -64,6 +64,27 @@ class RFClassifier:
 
     # ── Initialisation ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _set_n_jobs_1(estimator: Any) -> None:
+        """
+        Recursively set n_jobs=1 on every estimator in the pipeline so that
+        sklearn/joblib never spawns multiprocessing workers from inside an
+        asyncio.to_thread call.  This prevents the "leaked semaphore" warning
+        that appears on clean process shutdown.
+        """
+        if hasattr(estimator, "n_jobs"):
+            estimator.n_jobs = 1
+        # CalibratedClassifierCV wraps an inner estimator
+        for attr in ("estimator", "base_estimator", "calibrated_classifiers"):
+            inner = getattr(estimator, attr, None)
+            if inner is None:
+                continue
+            if isinstance(inner, list):
+                for item in inner:
+                    RFClassifier._set_n_jobs_1(item)
+            else:
+                RFClassifier._set_n_jobs_1(inner)
+
     def _load(self) -> None:
         """Load the pkl bundle.  Logs an error but never raises."""
         if not _SKLEARN_AVAILABLE:
@@ -84,6 +105,11 @@ class RFClassifier:
         try:
             bundle = joblib.load(self._model_path)
             self._clf = bundle["calibrated_clf"]
+
+            # Force n_jobs=1 on all estimators so joblib never spawns
+            # multiprocessing workers inside an asyncio thread.  This eliminates
+            # the "leaked semaphore objects" UserWarning on process shutdown.
+            self._set_n_jobs_1(self._clf)
 
             # Sanity-check feature column order matches what we compute live
             bundle_cols = list(bundle.get("feature_cols", []))
