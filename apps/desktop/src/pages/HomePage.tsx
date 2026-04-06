@@ -538,6 +538,14 @@ export function HomePage() {
           <span className="home-header__username">{user?.username}</span>
           <button
             className="btn btn--ghost btn--sm"
+            onClick={() => navigate("/study")}
+            type="button"
+            title="Open user study examination flow"
+          >
+            🔬 User Study
+          </button>
+          <button
+            className="btn btn--ghost btn--sm"
             onClick={logout}
             type="button"
           >

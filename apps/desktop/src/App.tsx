@@ -6,6 +6,7 @@ import { CalibrationReaderPage } from "./pages/CalibrationReaderPage";
 import { LoginPage } from "./pages/LoginPage";
 import { HomePage } from "./pages/HomePage";
 import { ReaderPage } from "./pages/ReaderPage";
+import { UserStudyPage } from "./pages/UserStudyPage";
 
 export function App() {
   return (
@@ -42,6 +43,14 @@ export function App() {
             element={
               <ProtectedRoute>
                 <CalibrationReaderPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/study"
+            element={
+              <ProtectedRoute>
+                <UserStudyPage />
               </ProtectedRoute>
             }
           />
