@@ -248,7 +248,7 @@ class AttentionalStateHistoryResponse(BaseModel):
 )
 async def get_attentional_state_history(
     session_id: int,
-    limit: int = Query(default=10, ge=1, le=100, description="Number of recent records (newest first)"),
+    limit: int = Query(default=10, ge=1, le=2000, description="Number of records (newest first). Use limit=2000 for full-session export."),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AttentionalStateHistoryResponse:

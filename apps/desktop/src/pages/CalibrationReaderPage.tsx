@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { useTelemetry } from "../hooks/useTelemetry";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
 import { sessionService, type Session } from "../services/sessionService";
 import { apiRequest } from "../services/apiClient";
+
+// localStorage is shared across tabs — required so the calibration tab
+// (opened via window.open) can read the participant token written by the study tab.
+const STUDY_TOKEN_KEY = "study_participant_token";
 
 const DEV = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV ?? false;
 const CALIB_MIN_SECONDS = 10;
@@ -50,8 +54,17 @@ function fmt(s: number) {
 export function CalibrationReaderPage() {
   const { id } = useParams<{ id: string }>();
   const sessionId = Number(id);
-  const { token } = useAuth();
+  const { token: authToken } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  // When opened from the user study (?study_mode=true), use the participant's
+  // token from sessionStorage so telemetry and calibration are saved to the
+  // correct (participant) account, not the researcher's.
+  const isStudyMode = searchParams.get("study_mode") === "true";
+  const token = isStudyMode
+    ? (localStorage.getItem(STUDY_TOKEN_KEY) ?? authToken)
+    : authToken;
 
   const [session, setSession] = useState<Session | null>(null);
   const [paragraphs, setParagraphs] = useState<string[]>([]);
@@ -207,12 +220,21 @@ export function CalibrationReaderPage() {
               ))}
             </div>
             <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <button
-                style={{ ...s.btn, padding: "10px 28px", fontSize: 15 }}
-                onClick={() => navigate("/", { replace: true })}
-              >
-                Go to Dashboard
-              </button>
+              {isStudyMode ? (
+                <button
+                  style={{ ...s.btn, padding: "10px 28px", fontSize: 15 }}
+                  onClick={() => window.close()}
+                >
+                  Close tab &amp; return to study →
+                </button>
+              ) : (
+                <button
+                  style={{ ...s.btn, padding: "10px 28px", fontSize: 15 }}
+                  onClick={() => navigate("/", { replace: true })}
+                >
+                  Go to Dashboard
+                </button>
+              )}
             </div>
           </div>
         </div>

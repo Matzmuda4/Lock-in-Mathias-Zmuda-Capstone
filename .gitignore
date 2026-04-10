@@ -99,3 +99,9 @@ InterventionLLM/lockin_gguf/
 InterventionLLM/lockin_merged/
 InterventionLLM/llama.cpp-src/
 InterventionLLM/Qwen2.5-7B-Instruct/
+
+# ── Experiment results (raw participant data, never committed) ─────────────────
+experimentresults/
+lockin_P*_study.json
+lockin_P*_adaptive_telemetry.csv
+lockin_P*_baseline_telemetry.csv

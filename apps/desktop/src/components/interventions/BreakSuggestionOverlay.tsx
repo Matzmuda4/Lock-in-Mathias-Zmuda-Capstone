@@ -106,6 +106,17 @@ export default function BreakSuggestionOverlay({
 
   useEffect(() => () => clearTimer(), [clearTimer]);
 
+  // Escape key — skip/dismiss from any phase instantly
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (phase === "prompt")   { onDismiss(id); return; }
+      if (phase === "breaking" || phase === "resuming") { clearTimer(); onAutoResume(id); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [phase, id, onDismiss, onAutoResume, clearTimer]);
+
   // Backdrop only dismisses during prompt phase
   const handleBackdrop = useCallback(() => {
     if (phase === "prompt") onDismiss(id);
@@ -119,16 +130,17 @@ export default function BreakSuggestionOverlay({
     <div style={styles.backdrop} onClick={handleBackdrop} role="dialog" aria-modal>
         <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
 
-          {/* Close — prompt only */}
-          {phase === "prompt" && (
-            <button
-              className="break-close"
-              style={styles.closeBtn}
-              onClick={() => onDismiss(id)}
-              type="button"
-              aria-label="Dismiss break suggestion"
-            >✕</button>
-          )}
+          {/* Close — always visible; during break/resuming it skips immediately */}
+          <button
+            className="break-close"
+            style={styles.closeBtn}
+            onClick={() => {
+              if (phase === "prompt") { onDismiss(id); }
+              else { clearTimer(); onAutoResume(id); }
+            }}
+            type="button"
+            aria-label="Dismiss break suggestion"
+          >✕</button>
 
           {/* Icon */}
           <img src="/GamifiedIcons/BreakIcon.png" alt="Break" style={styles.icon} />
@@ -141,21 +153,21 @@ export default function BreakSuggestionOverlay({
               <p style={styles.body}>{body}</p>
               <div style={styles.btnCol}>
                 <button
-                  className="break-btn-confirm"
+                  className="break-btn-skip"
                   style={{ ...styles.btnBase, background: G600, color: "#fff" }}
+                  type="button"
+                  onClick={() => onDismiss(id)}
+                >
+                  Keep Reading  <span style={{ opacity: 0.7, fontSize: "11px", fontWeight: 400 }}>(Esc)</span>
+                </button>
+                <button
+                  className="break-btn-confirm"
+                  style={{ ...styles.btnBase, background: "transparent", color: MUTED, border: `1.5px solid #e2e8f0` }}
                   type="button"
                   onClick={handleConfirm}
                   disabled={confirming}
                 >
                   {confirming ? "Starting break…" : "Take a 5-Minute Break"}
-                </button>
-                <button
-                  className="break-btn-skip"
-                  style={{ ...styles.btnBase, background: "transparent", color: MUTED, border: `1.5px solid #e2e8f0` }}
-                  type="button"
-                  onClick={() => onDismiss(id)}
-                >
-                  Keep Reading
                 </button>
               </div>
             </>
@@ -169,14 +181,24 @@ export default function BreakSuggestionOverlay({
               <p style={styles.body}>
                 Rest up — step away from the screen.
               </p>
-              <button
-                className="break-btn-ready"
-                style={{ ...styles.btnBase, background: BLUE, color: "#fff", marginTop: "4px" }}
-                type="button"
-                onClick={handleReady}
-              >
-                I'm ready to get back
-              </button>
+              <div style={styles.btnCol}>
+                <button
+                  className="break-btn-ready"
+                  style={{ ...styles.btnBase, background: BLUE, color: "#fff" }}
+                  type="button"
+                  onClick={handleReady}
+                >
+                  I'm ready to get back
+                </button>
+                <button
+                  className="break-btn-skip"
+                  style={{ ...styles.btnBase, background: "transparent", color: MUTED, border: `1.5px solid #e2e8f0`, fontSize: "12px" }}
+                  type="button"
+                  onClick={handleReady}
+                >
+                  Skip break  <span style={{ opacity: 0.6, fontSize: "10px" }}>(Esc)</span>
+                </button>
+              </div>
             </>
           )}
 

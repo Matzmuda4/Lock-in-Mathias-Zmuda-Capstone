@@ -1,11 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { calibrationService, type CalibrationStatus } from "../services/calibrationService";
 
+// localStorage is shared across tabs — required so the calibration tab
+// (opened via window.open) can read the participant token written by the study tab.
+const STUDY_TOKEN_KEY = "study_participant_token";
+
 export function CalibrationPage() {
-  const { token } = useAuth();
+  const { token: authToken } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  const isStudyMode = searchParams.get("study_mode") === "true";
+  const token = isStudyMode
+    ? (localStorage.getItem(STUDY_TOKEN_KEY) ?? authToken)
+    : authToken;
 
   const [status, setStatus] = useState<CalibrationStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -31,12 +41,13 @@ export function CalibrationPage() {
     setError(null);
     try {
       const { session_id } = await calibrationService.start(token);
-      navigate(`/sessions/${session_id}/calibration-reader`);
+      const dest = `/sessions/${session_id}/calibration-reader${isStudyMode ? "?study_mode=true" : ""}`;
+      navigate(dest);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to start calibration");
       setStarting(false);
     }
-  }, [token, navigate]);
+  }, [token, navigate, isStudyMode]);
 
   // Text-file calibration: no parse job — start is always instant once the
   // file exists on disk.  "pending"/"running" states no longer occur.

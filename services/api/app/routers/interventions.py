@@ -601,3 +601,48 @@ async def acknowledge_intervention(
         session_id, intervention_id, row.type,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── Intervention history (for study export) ────────────────────────────────────
+
+class InterventionHistoryItem(BaseModel):
+    id:           int
+    type:         str
+    intensity:    str
+    created_at:   Any
+    content:      dict[str, Any] | None = None
+
+
+@router.get(
+    "/sessions/{session_id}/interventions/history",
+    response_model=list[InterventionHistoryItem],
+)
+async def get_intervention_history(
+    session_id:   int,
+    current_user: User        = Depends(get_current_user),
+    db:           AsyncSession = Depends(get_db),
+) -> list[InterventionHistoryItem]:
+    """
+    Return every intervention that was fired during a session, oldest first.
+
+    Used by the study-export pipeline to build the combined timeline CSV.
+    """
+    await _get_owned_session(session_id, current_user.id, db)
+
+    rows_result = await db.execute(
+        select(Intervention)
+        .where(Intervention.session_id == session_id)
+        .order_by(Intervention.created_at.asc())
+    )
+    rows = list(rows_result.scalars().all())
+
+    return [
+        InterventionHistoryItem(
+            id=row.id,
+            type=row.type,
+            intensity=row.intensity,
+            created_at=row.created_at,
+            content=(row.payload or {}).get("content"),
+        )
+        for row in rows
+    ]

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { useTelemetry } from "../hooks/useTelemetry";
 import { calibrationService, type BaselineData } from "../services/calibrationService";
@@ -439,6 +439,11 @@ interface AssistantPanelProps {
   journeyCompleted:     boolean;
   /** Callback to mark the journey as completed from within the journey widget. */
   onJourneyComplete:    () => void;
+  /** Controlled dev panel visibility — lifted up so the hidden study trigger can set it. */
+  showDev:              boolean;
+  onToggleDev:          () => void;
+  /** When set, hides the DEV button from the panel header (use hidden arrow trigger instead). */
+  studyMode:            "baseline" | "adaptive" | null;
 }
 
 const AssistantPanel = memo(function AssistantPanel({
@@ -455,24 +460,14 @@ const AssistantPanel = memo(function AssistantPanel({
   breakActive,
   journeyCompleted,
   onJourneyComplete,
+  showDev,
+  onToggleDev: handleToggleDev,
+  studyMode,
 }: AssistantPanelProps) {
   // Dev test controls
   const [devType, setDevType] = useState<InterventionType>("focus_point");
   const [devTier, setDevTier] = useState<InterventionTier>("moderate");
   const [devFiring, setDevFiring] = useState(false);
-
-  // Dev panel visibility — persisted in localStorage so it survives refreshes.
-  // Toggle off to observe natural LLM behaviour without test buttons.
-  const [showDev, setShowDev] = useState<boolean>(() => {
-    try { return localStorage.getItem("lockin_dev_open") !== "false"; } catch { return true; }
-  });
-  const handleToggleDev = useCallback(() => {
-    setShowDev((prev) => {
-      const next = !prev;
-      try { localStorage.setItem("lockin_dev_open", String(next)); } catch {}
-      return next;
-    });
-  }, []);
 
   const handleDevFire = async () => {
     setDevFiring(true);
@@ -496,7 +491,8 @@ const AssistantPanel = memo(function AssistantPanel({
     textPromptInterventions.length > 0 ||
     textReformatInterventions.length > 0 ||
     gamificationIntervention !== null ||
-    ambientSoundIntervention !== null;
+    ambientSoundIntervention !== null ||
+    activeInterventions.some((i) => i.type === "section_summary");
 
   return (
     <aside
@@ -511,8 +507,8 @@ const AssistantPanel = memo(function AssistantPanel({
           {open ? "Lock-in Assistant" : ""}
         </span>
         <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-          {/* Dev mode toggle — only visible in Vite dev builds */}
-          {DEV && open && (
+          {/* Dev mode toggle — hidden in study mode (use hidden arrow trigger instead) */}
+          {DEV && open && !studyMode && (
             <button
               type="button"
               onClick={handleToggleDev}
@@ -1036,8 +1032,48 @@ function DriftDebugPanel({
 export function ReaderPage() {
   const { id } = useParams<{ id: string }>();
   const sessionId = Number(id);
-  const { token } = useAuth();
+  const { token: authToken } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  // Study mode: "baseline" | "adaptive" | null
+  // When set, reader enters participant-facing mode:
+  //   - uses participant token from sessionStorage
+  //   - hides debug panels, attentional state meter, mode badge
+  //   - baseline: no dev tools; adaptive: hidden ▶ arrow reveals dev panel
+  const studyMode = (searchParams.get("study_mode") ?? null) as "baseline" | "adaptive" | null;
+  const token = (studyMode
+    ? (localStorage.getItem("study_participant_token") ?? authToken)
+    : authToken) as string | null;
+
+  // showDev is lifted here so the hidden study trigger button can control it.
+  // In non-study mode this is still set from localStorage (normal behaviour).
+  const [showDev, setShowDev] = useState<boolean>(() => {
+    if (studyMode) return false;  // always start hidden in study
+    try { return localStorage.getItem("lockin_dev_open") !== "false"; } catch { return true; }
+  });
+  const handleToggleDev = useCallback(() => {
+    setShowDev((prev) => {
+      const next = !prev;
+      if (!studyMode) {
+        try { localStorage.setItem("lockin_dev_open", String(next)); } catch {}
+      }
+      return next;
+    });
+  }, [studyMode]);
+
+  // Ctrl+Shift+D keyboard shortcut to reveal dev tools in adaptive study mode
+  useEffect(() => {
+    if (!DEV) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key === "D") {
+        e.preventDefault();
+        setShowDev((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   const [data, setData] = useState<SessionReaderData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1174,6 +1210,19 @@ export function ReaderPage() {
     const id = setInterval(poll, 10_000);
     return () => clearInterval(id);
   }, [token, sessionId, isAdaptive, isActive]);
+
+  // Auto-open panel when foreground interventions arrive so text prompts are
+  // always visible even if the participant had collapsed the panel.
+  const prevInterventionCountRef = useRef(0);
+  useEffect(() => {
+    const foregroundCount = activeInterventions.filter(
+      (i) => !["chime"].includes(i.type ?? ""),
+    ).length;
+    if (foregroundCount > prevInterventionCountRef.current && foregroundCount > 0) {
+      setPanelOpen(true);
+    }
+    prevInterventionCountRef.current = foregroundCount;
+  }, [activeInterventions]);
 
   // Track which chunk is near the top of the viewport so section summaries
   // fire at the user's current reading position, not the top of the document.
@@ -1545,13 +1594,17 @@ export function ReaderPage() {
         <div className="reader-bar__center">
           <span className="reader-bar__title">{session.name}</span>
           <span className={`badge badge--${session.status}`}>{session.status}</span>
-          {!isCalibration && <span className="reader-bar__mode">{session.mode}</span>}
+          {!isCalibration && !studyMode && <span className="reader-bar__mode">{session.mode}</span>}
         </div>
 
         <div className="reader-bar__right">
           <span className="reader-bar__timer">{timerDisplay}</span>
-          <DriftMeter drift={driftState} showConfidence={DEV} />
-          {!isCalibration && (
+          {/* Show meters in non-study mode always, or in adaptive study mode when
+              the researcher has revealed dev tools via Ctrl+Shift+D */}
+          {(!studyMode || (studyMode === "adaptive" && showDev)) && (
+            <DriftMeter drift={driftState} showConfidence={DEV} />
+          )}
+          {!isCalibration && (!studyMode || (studyMode === "adaptive" && showDev)) && (
             <AttentionalStateMeter state={attentionalState} />
           )}
           {DEV && (
@@ -1660,6 +1713,9 @@ export function ReaderPage() {
             breakActive={breakActive}
             journeyCompleted={journeyCompleted}
             onJourneyComplete={handleJourneyComplete}
+            showDev={showDev}
+            onToggleDev={handleToggleDev}
+            studyMode={studyMode}
           />
         )}
 
@@ -1694,9 +1750,52 @@ export function ReaderPage() {
         )}
       </div>
 
-      {/* Dev debug panels */}
-      {DEV && <DebugPanel batch={lastBatch} warnings={warnings} />}
-      {DEV && <DriftDebugPanel token={token} sessionId={sessionId} />}
+      {/* Dev debug panels:
+          • In non-study mode: always visible.
+          • In adaptive study mode: shown when researcher has revealed dev tools
+            (Ctrl+Shift+D or the hidden bottom-right dot). Never shown in
+            baseline mode so the control condition stays clean. */}
+      {DEV && !studyMode && <DebugPanel batch={lastBatch} warnings={warnings} />}
+      {DEV && !studyMode && <DriftDebugPanel token={token} sessionId={sessionId} />}
+      {DEV && studyMode === "adaptive" && showDev && (
+        <DebugPanel batch={lastBatch} warnings={warnings} />
+      )}
+      {DEV && studyMode === "adaptive" && showDev && (
+        <DriftDebugPanel token={token} sessionId={sessionId} />
+      )}
+
+      {/* Researcher state indicator — always visible in adaptive study mode.
+          Shows a live coloured dot reflecting the current attentional state.
+          Click (or Ctrl+Shift+D) to reveal the full dev overlay. */}
+      {studyMode === "adaptive" && DEV && !showDev && (() => {
+        const stateColors: Record<string, string> = {
+          focused:            "#22c55e",
+          hyperfocused:       "#a855f7",
+          drifting:           "#f59e0b",
+          cognitive_overload: "#ef4444",
+        };
+        const st  = attentionalState?.primary_state ?? null;
+        const col = st ? (stateColors[st] ?? "#94a3b8") : "rgba(0,0,0,0.18)";
+        return (
+          <button
+            type="button"
+            onClick={() => { setShowDev(true); }}
+            title={`[Researcher] ${st ?? "waiting for data…"} — Ctrl+Shift+D for full dev tools`}
+            style={{
+              position: "fixed", bottom: 12, right: 12, zIndex: 200,
+              width: 24, height: 24, borderRadius: "50%",
+              background: `${col}33`,
+              border: `2px solid ${col}`,
+              color: col, fontSize: 9, cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              padding: 0, lineHeight: 1, userSelect: "none",
+              transition: "background 0.4s, border-color 0.4s",
+            }}
+          >
+            ●
+          </button>
+        );
+      })()}
 
       <style>{`
         /* ── Layout ── */

@@ -109,6 +109,7 @@ MAX_FOREGROUND_ACTIVE: int = 3
 DEFAULT_MIN_GAP_SECONDS:          int = 10
 DEFAULT_BREAK_COOLDOWN_SECONDS:   int = 300  # 5 minutes post-break
 DEFAULT_AUTO_DISMISS_SECONDS:     int = 90   # unacknowledged text prompt TTL
+CHIME_DISPLAY_SECONDS:            int = 12   # how long the chime toast stays visible
 
 
 # ── Response types ────────────────────────────────────────────────────────────
@@ -297,8 +298,12 @@ class ActiveInterventionTracker:
 
     def _auto_dismiss_stale(self, session_id: int) -> None:
         """
-        Remove TEXT_PROMPT interventions that have been unacknowledged for
-        longer than ``auto_dismiss_seconds``.  Called before every gate check.
+        Remove stale interventions from the active registry:
+          • TEXT_PROMPT types older than auto_dismiss_seconds (unacknowledged).
+          • INSTANT types (chime) older than CHIME_DISPLAY_SECONDS — these are
+            short-lived toasts that auto-dismiss on the frontend but we also
+            clean them here so they don't block the gate.
+        Called before every gate check and before returning active list.
         """
         active = self._active.get(session_id)
         if not active:
@@ -306,14 +311,19 @@ class ActiveInterventionTracker:
         now     = self._now()
         expired = [
             itype for itype, ai in active.items()
-            if itype in TEXT_PROMPT_TYPES
-            and (now - ai.fired_at).total_seconds() > self._auto_dismiss
+            if (
+                itype in TEXT_PROMPT_TYPES
+                and (now - ai.fired_at).total_seconds() > self._auto_dismiss
+            ) or (
+                itype in INSTANT_TYPES
+                and (now - ai.fired_at).total_seconds() > CHIME_DISPLAY_SECONDS
+            )
         ]
         for itype in expired:
             del active[itype]
             log.info(
-                "[tracker] AUTO-DISMISSED session=%d type=%s (unacknowledged > %ds)",
-                session_id, itype, self._auto_dismiss,
+                "[tracker] AUTO-DISMISSED session=%d type=%s (stale)",
+                session_id, itype,
             )
 
     def _foreground_active(self, session_id: int) -> dict[str, ActiveIntervention]:
@@ -354,8 +364,12 @@ class ActiveInterventionTracker:
                 if elapsed < self._break_cooldown:
                     return FireDecision(False, "post_break_cooldown")
 
-        # 3. Passive types — always fire freely
+        # 3. Passive types — fire freely, but not if the same type is already
+        #    active (gamification / ambient_sound are session-persistent widgets;
+        #    re-firing them while they are already on screen is redundant).
         if itype in PASSIVE_TYPES:
+            if itype in self._active.get(session_id, {}):
+                return FireDecision(False, "type_already_active")
             return FireDecision(True, "clear")
 
         # 4. Dynamic minimum gap:
@@ -370,8 +384,11 @@ class ActiveInterventionTracker:
         if effective_gap > 0 and last is not None and (now - last).total_seconds() < effective_gap:
             return FireDecision(False, "min_gap")
 
-        # 5. Instant types — subject only to the global min gap
+        # 5. Instant types — subject only to the global min gap, but also blocked
+        #    if the same chime is still showing (within CHIME_DISPLAY_SECONDS).
         if itype in INSTANT_TYPES:
+            if itype in self._active.get(session_id, {}):
+                return FireDecision(False, "type_already_active")
             return FireDecision(True, "clear")
 
         # 6. No duplicate types
@@ -409,15 +426,18 @@ class ActiveInterventionTracker:
         now = self._now()
         self._last_fired[session_id] = now
 
-        if itype not in INSTANT_TYPES:
-            if session_id not in self._active:
-                self._active[session_id] = {}
-            self._active[session_id][itype] = ActiveIntervention(
-                intervention_id = intervention_id,
-                itype           = itype,
-                tier            = tier,
-                fired_at        = now,
-            )
+        # All types — including INSTANT (chime) — are tracked in _active so the
+        # frontend polling /active can see them.  Chime is auto-expired after
+        # CHIME_DISPLAY_SECONDS by _auto_dismiss_stale; all others stay until
+        # acknowledged or their own TTL.
+        if session_id not in self._active:
+            self._active[session_id] = {}
+        self._active[session_id][itype] = ActiveIntervention(
+            intervention_id = intervention_id,
+            itype           = itype,
+            tier            = tier,
+            fired_at        = now,
+        )
 
     def acknowledge(self, session_id: int, itype: str) -> None:
         """
