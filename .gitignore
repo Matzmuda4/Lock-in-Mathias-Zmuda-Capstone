@@ -100,6 +100,9 @@ InterventionLLM/lockin_merged/
 InterventionLLM/llama.cpp-src/
 InterventionLLM/Qwen2.5-7B-Instruct/
 
+# ── Miscellaneous large/temp files ───────────────────────────────────────────
+ziUIOguE
+
 # ── Experiment results (raw participant data, never committed) ─────────────────
 experimentresults/
 lockin_P*_study.json
